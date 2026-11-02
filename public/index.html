@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#080a12">
+  <meta name="description" content="Arcane 2D — онлайн-арена магов, где заклинания пишутся на Python прямо в браузере.">
+  <title>Arcane 2D — арена пишущих магов</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/pixelify-sans-400.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/pixelify-sans-700.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/press-start-2p.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <main class="layout" id="layout">
+      <section class="stage" id="stage" aria-label="Арена Arcane 2D">
+        <canvas id="gameCanvas"></canvas>
+        <div class="stage-vignette" aria-hidden="true"></div>
+        <div class="damage-vignette" id="damageVignette" aria-hidden="true"></div>
+        <div class="stage-grain" aria-hidden="true"></div>
+
+        <header class="topbar">
+          <div class="brand">
+            <div class="brand-sigil" aria-hidden="true">
+              <span>✦</span>
+            </div>
+            <div class="brand-copy">
+              <h1>ARCANE <span>2D</span></h1>
+              <p>АРЕНА ПИШУЩИХ МАГОВ</p>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <div class="online-pill" id="onlinePill" title="Маги на арене">
+              <span class="status-dot"></span>
+              <span id="onlineCount">—</span>
+              <span class="online-label">в сети</span>
+            </div>
+            <button class="icon-button" id="soundToggle" type="button" title="Звук" aria-label="Включить или выключить звук">♪</button>
+            <button class="icon-button panel-toggle" id="panelToggle" type="button" title="Открыть гримуар" aria-label="Открыть гримуар">
+              <span aria-hidden="true">◈</span>
+            </button>
+          </div>
+        </header>
+
+        <div class="connection-banner" id="connectionBanner" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="connectionText">Восстанавливаю портал…</span>
+        </div>
+
+        <aside class="scoreboard" id="scoreboard" aria-label="Таблица магов">
+          <div class="scoreboard-head">
+            <span>ХРОНИКА АРЕНЫ</span>
+            <span class="scoreboard-live">LIVE</span>
+          </div>
+          <ol class="score-list" id="scoreList"></ol>
+        </aside>
+
+        <div class="killfeed" id="killfeed" aria-live="polite"></div>
+
+        <div class="local-hud" id="localHud">
+          <div class="portrait" aria-hidden="true">
+            <span class="portrait-rune">ᛉ</span>
+          </div>
+          <div class="hud-main">
+            <div class="hud-name-row">
+              <span class="hud-name" id="hudName">Безымянный</span>
+              <span class="hud-alive" id="hudAlive">В БОЮ</span>
+            </div>
+            <div class="bar hp-bar">
+              <div class="bar-fill" id="hpFill"></div>
+              <span class="bar-label">ЖИЗНЬ</span>
+              <span class="bar-value" id="hpText">100</span>
+            </div>
+            <div class="bar mana-bar">
+              <div class="bar-fill" id="manaFill"></div>
+              <span class="bar-label">МАНА</span>
+              <span class="bar-value" id="manaText">100</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="respawn-overlay" id="respawnOverlay" hidden>
+          <div class="respawn-sigil" aria-hidden="true">✦</div>
+          <p>ДУША ВОЗНОСИТСЯ</p>
+          <strong id="respawnTimer">3.0</strong>
+          <span>Возрождение через</span>
+        </div>
+
+        <div class="hotbar" id="hotbar" aria-label="Боевые руны"></div>
+
+        <div class="stage-hint" id="stageHint">
+          <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> движение</span>
+          <span><span class="mouse-icon"></span> прицел · ЛКМ каст</span>
+          <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> заклинание</span>
+          <span><kbd>Shift</kbd> перекат <span class="roll-hint" id="rollHint">готов</span></span>
+          <span><kbd>Ctrl</kbd>+<kbd>↵</kbd> сотворить</span>
+        </div>
+
+        <div class="toasts" id="toasts" aria-live="polite"></div>
+      </section>
+
+      <aside class="grimoire" id="grimoire" aria-label="Гримуар заклинаний">
+        <header class="grimoire-head">
+          <div class="grimoire-title">
+            <span class="grimoire-sigil" aria-hidden="true">◈</span>
+            <div>
+              <h2>ГРИМУАР</h2>
+              <p>магия — это код</p>
+            </div>
+          </div>
+          <button class="icon-button small" id="panelClose" type="button" title="Свернуть гримуар" aria-label="Свернуть гримуар">×</button>
+        </header>
+
+        <nav class="spell-tabs" id="spellTabs" aria-label="Слоты заклинаний">
+          <button class="spell-tab active" data-slot="0" type="button">
+            <span class="tab-rune">I</span>
+            <span class="tab-label">Пламя</span>
+          </button>
+          <button class="spell-tab" data-slot="1" type="button">
+            <span class="tab-rune">II</span>
+            <span class="tab-label">Иней</span>
+          </button>
+          <button class="spell-tab" data-slot="2" type="button">
+            <span class="tab-rune">III</span>
+            <span class="tab-label">Оберег</span>
+          </button>
+        </nav>
+
+        <div class="spell-meta">
+          <label for="spellName">НАЗВАНИЕ ЗАКЛИНАНИЯ</label>
+          <input id="spellName" class="spell-name" maxlength="28" value="Пламя охотника" autocomplete="off" spellcheck="false">
+          <span class="spell-file">spell_01.py</span>
+        </div>
+
+        <div class="code-shell">
+          <div class="code-toolbar">
+            <span class="code-dots"><i></i><i></i><i></i></span>
+            <span id="codeFilename">spell_01.py</span>
+            <span class="code-lang">PYTHON</span>
+          </div>
+          <div class="code-body">
+            <pre class="line-numbers" id="lineNumbers" aria-hidden="true">1</pre>
+            <textarea id="codeInput" aria-label="Код заклинания" wrap="off" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+          </div>
+        </div>
+
+        <div class="editor-tools">
+          <label class="select-wrap" title="Загрузить свиток-пример">
+            <span class="select-icon" aria-hidden="true">≋</span>
+            <select id="exampleSelect" aria-label="Примеры заклинаний">
+              <option value="">Свитки-примеры…</option>
+            </select>
+          </label>
+          <button class="text-button" id="apiButton" type="button">API заклинаний</button>
+        </div>
+
+        <div class="console" aria-label="Печать заклинания">
+          <div class="console-head">
+            <span>ПЕЧАТЬ</span>
+            <span id="consoleStatus">готов</span>
+          </div>
+          <div class="console-body" id="consoleOutput">
+            <p class="console-idle">Напишите заклинание и нажмите «Сотворить».</p>
+          </div>
+        </div>
+
+        <footer class="cast-footer">
+          <div class="cast-status">
+            <span id="cooldownLabel">Гримуар готов</span>
+            <div class="cooldown-track"><div class="cooldown-fill" id="cooldownFill"></div></div>
+          </div>
+          <button class="cast-button" id="castButton" type="button">
+            <span class="cast-button-glow" aria-hidden="true"></span>
+            <span class="cast-button-copy">
+              <strong>СОТВОРИТЬ</strong>
+              <small><kbd>Ctrl</kbd> + <kbd>↵</kbd></small>
+            </span>
+            <span class="cast-star" aria-hidden="true">✦</span>
+          </button>
+        </footer>
+      </aside>
+      <div class="panel-scrim" id="panelScrim" hidden></div>
+    </main>
+  </div>
+
+  <div class="login-overlay" id="loginOverlay">
+    <div class="login-aura aura-one" aria-hidden="true"></div>
+    <div class="login-aura aura-two" aria-hidden="true"></div>
+    <div class="login-card" id="loginCard">
+      <div class="login-sigil" aria-hidden="true">
+        <div class="sigil-ring"></div>
+        <span>✦</span>
+      </div>
+      <p class="login-eyebrow">ОНЛАЙН-АРЕНА МАГОВ</p>
+      <h2 class="login-title">ARCANE <em>2D</em></h2>
+      <p class="login-subtitle">Здесь магия не заучивается.<br><strong>Она пишется на Python.</strong></p>
+
+      <form id="loginForm" class="login-form" novalidate>
+        <label for="nameInput">ИМЯ МАГА</label>
+        <div class="name-field">
+          <span class="name-glyph" aria-hidden="true">ᛉ</span>
+          <input id="nameInput" name="name" type="text" maxlength="16" minlength="2" placeholder="Введите имя" autocomplete="nickname" spellcheck="false">
+        </div>
+        <button class="enter-button" id="joinButton" type="submit">
+          <span>Войти в арену</span>
+          <span class="enter-arrow" aria-hidden="true">→</span>
+        </button>
+        <p class="login-error" id="loginError" role="alert"></p>
+      </form>
+
+      <div class="login-features">
+        <div><span>⌁</span><p><strong>Живой PvP</strong>Дуэли в реальном времени</p></div>
+        <div><span>⌘</span><p><strong>Python</strong>Настоящие циклы и условия</p></div>
+        <div><span>◈</span><p><strong>3 руны</strong>Соберите свой арсенал</p></div>
+      </div>
+
+      <div class="login-footer">
+        <span class="status-dot"></span>
+        <span id="lobbyStatus">Портал открывается…</span>
+        <span class="login-divider"></span>
+        <span>WASD + мышь</span>
+      </div>
+    </div>
+    <p class="login-footnote">Сервер исполняет заклинания в безопасной песочнице. <button type="button" id="loginApiButton">Как это работает?</button></p>
+  </div>
+
+  <div class="modal-layer" id="apiModal" hidden>
+    <div class="modal-backdrop" data-close-modal></div>
+    <article class="api-modal" role="dialog" aria-modal="true" aria-labelledby="apiTitle">
+      <header class="api-head">
+        <div>
+          <p>КНИГА ЗАКЛИНАНИЙ</p>
+          <h2 id="apiTitle">Пиши магию на Python</h2>
+        </div>
+        <button class="icon-button" id="apiClose" type="button" aria-label="Закрыть">×</button>
+      </header>
+
+      <div class="api-intro">
+        <p>Каждое заклинание — это Python-сценарий. Сервер исполняет его в изолированной песочнице: без импортов, файлов и сети. Доступны переменные, <code>if</code>, <code>for</code>, <code>while</code>, <code>def</code>, списки, словари и f-строки.</p>
+        <div class="api-flow"><span>код</span><i>→</i><span>мана</span><i>→</i><span>эффект</span></div>
+      </div>
+
+      <div class="api-grid">
+        <section class="api-section">
+          <h3><span>01</span> Чувства мага</h3>
+          <dl>
+            <dt><code>me()</code></dt><dd>Ваше состояние: <code>.x .y .hp .max_hp .mana .max_mana .shield .aim</code></dd>
+            <dt><code>aim()</code></dt><dd>Угол прицела мыши или джойстика в радианах.</dd>
+            <dt><code>cursor()</code></dt><dd>Точка под курсором или <code>None</code>: <code>.x .y .dist</code>.</dd>
+            <dt><code>direction(x, y)</code></dt><dd>Угол от вашего мага к точке.</dd>
+            <dt><code>distance(x1, y1, x2, y2)</code></dt><dd>Расстояние между точками.</dd>
+          </dl>
+          <p class="api-note">Автонаводки нет. <code>aim()</code> и <code>cursor()</code> дают только ручной прицел: каждую атаку нужно направлять самостоятельно.</p>
+        </section>
+
+        <section class="api-section">
+          <h3><span>02</span> Боевые руны</h3>
+          <dl>
+            <dt><code>fireball(angle, speed=1.0)</code><span class="cost">11</span></dt><dd>Огненный снаряд: 16 урона.</dd>
+            <dt><code>frostbolt(angle)</code><span class="cost">9</span></dt><dd>Ледяное копьё: 10 урона и замедление.</dd>
+            <dt><code>dash(angle, dist=170)</code><span class="cost">10</span></dt><dd>Рывок сквозь магов, но не сквозь руины.</dd>
+            <dt><code>blink(x, y)</code><span class="cost">17</span></dt><dd>Мгновенный перенос в свободную точку.</dd>
+            <dt><code>shield()</code><span class="cost">17</span></dt><dd>Щит на 38 единиц. Перезарядка 3 сек.</dd>
+            <dt><code>heal()</code><span class="cost">24</span></dt><dd>Восстанавливает 30 здоровья. Перезарядка 4,5 сек.</dd>
+            <dt><code>nova(radius=150)</code><span class="cost">21</span></dt><dd>Взрыв вокруг вас: 15 урона и отброс.</dd>
+            <dt><code>beam(angle, length=780, width=96)</code><span class="cost">50</span></dt><dd>Огромный синий энергетический луч: 34 урона всем в широкой полосе. Пробивает укрытия.</dd>
+            <dt><code>emp(x, y)</code><span class="cost">36</span></dt><dd>E.M.P. с осколком Аганима: через 1 сек. притягивает врагов к центру, а через 1,5 сек. взрывается, сжигая до 35 маны и нанося 1 урон за каждую сожжённую единицу. Радиус 190, дальность 560. Один раз за каст.</dd>
+            <dt><code>spark_volley(angle, count=8, spread=1.1)</code><span class="cost">25</span></dt><dd>Веер из 8 разноцветных искр: по 5 урона каждая. Один раз за каст.</dd>
+            <dt><code>chain_lightning(angle, targets=3)</code><span class="cost">34</span></dt><dd>Молния бьёт первую цель на линии, затем перескакивает на ближайших врагов. Урон 30 / 24 / 18, дальность 680, прыжок 300. Один раз за каст.</dd>
+            <dt><code>lightning_strike(angle)</code><span class="cost">32</span></dt><dd>Небесная кара: бьёт первого врага в узкой полосе по направлению прицела на 28 урона и оглушает на 0,5 сек. Дальность 760, промах возможен. Игнорирует укрытия. Один раз за каст.</dd>
+            <dt><code>meteor(x, y, radius=120)</code><span class="cost">38</span></dt><dd>Через 1,15 сек. в точку падают три метеора: по 14 урона (всего до 42) в радиусе 80–160 каждый, дальность 620. Один раз за каст.</dd>
+            <dt><code>siphon(angle, length=380, width=64)</code><span class="cost">28</span></dt><dd>Луч похищения жизни: 18 урона и лечение на 60% фактически отнятого здоровья (до 18 HP), проходит сквозь укрытия. Один раз за каст.</dd>
+            <dt><code>poison_cloud(x, y, radius=110)</code><span class="cost">30</span></dt><dd>Ядовитое облако на 4,2 сек.: 6 урона каждые 0,75 сек. (до 5 тиков) в радиусе 70–150, дальность 520. Один раз за каст.</dd>
+            <dt><code>ward(x, y)</code><span class="cost">15</span></dt><dd>Рунная мина. Максимум две, радиус взрыва 118.</dd>
+          </dl>
+          <p class="api-note"><kbd>Shift</kbd> — бесплатный перекат: 165 единиц, неуязвимость 0,22 сек., перезарядка 1,6 сек. Направление берётся из движения, а если маг стоит — из прицела. Это не руна <code>dash()</code>.</p>
+        </section>
+
+        <section class="api-section">
+          <h3><span>03</span> Слова и числа</h3>
+          <dl>
+            <dt><code>log(value, ...)</code></dt><dd>Вывести сообщение в печать под редактором.</dd>
+            <dt><code>say("текст")</code></dt><dd>Произнести фразу над магом. До двух за заклинание.</dd>
+            <dt><code>rand(a, b) / randi(a, b)</code></dt><dd>Случайное число.</dd>
+            <dt><code>range, len, abs, min, max, sum</code></dt><dd>Обычные помощники Python.</dd>
+            <dt><code>sin, cos, sqrt, atan2, hypot, PI</code></dt><dd>Математика для прицеливания и манёвров.</dd>
+            <dt><code>clamp(value, low, high)</code></dt><dd>Ограничить число диапазоном.</dd>
+          </dl>
+          <p class="api-note">За одно заклинание — не больше 7 действий. Между заклинаниями гримуар перезаряжается 0,72 сек. Мана восстанавливается сама.</p>
+        </section>
+
+        <section class="api-section example-section">
+          <h3><span>04</span> Пример</h3>
+          <pre><code># Ручной прицел: снаряд летит на курсор
+fireball(aim())
+
+if me().hp &lt; 45:
+    shield()</code></pre>
+          <p class="api-warning">Ошибки не наказываются, но мана уже потраченная не возвращается. Читайте печать.</p>
+        </section>
+      </div>
+
+      <footer class="api-footer">
+        <span>✦</span>
+        <p>Импорт, файлы, сеть и доступ к серверу запрещены на уровне интерпретатора.</p>
+        <button class="text-button" id="apiDone" type="button">К гримуару</button>
+      </footer>
+    </article>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
