@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from arcane.game import TICK_RATE, Arena
+from arcane.game import SPELL_COSTS, TICK_RATE, Arena
+from arcane.interpreter import SpellError, mana_estimate, validate_source
 from arcane.net import (
     ProtocolError,
     WebSocket,
@@ -30,6 +31,11 @@ ROOT = Path(__file__).resolve().parent
 PUBLIC_DIR = ROOT / "public"
 MAX_CLIENTS = 24
 MAX_JOIN_NAME = 16
+MAX_CHECKS_PER_SECOND = 6
+MAX_CLIENT_BACKLOG = 256 * 1024
+MAX_STALL_SECONDS = 8.0
+MAX_PENDING_EVENTS = 512
+AUTO_FILL_MAGES = 4
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -63,6 +69,9 @@ class Client:
         "connected_at",
         "message_times",
         "cast_times",
+        "check_times",
+        "pending_events",
+        "stalled_since",
     )
 
     def __init__(self, ws: WebSocket) -> None:
@@ -71,6 +80,11 @@ class Client:
         self.connected_at = time.monotonic()
         self.message_times: deque[float] = deque()
         self.cast_times: deque[float] = deque()
+        self.check_times: deque[float] = deque()
+        # Events survive a skipped snapshot: positions go stale, but a missed
+        # death or explosion would simply never be shown.
+        self.pending_events: deque[dict[str, Any]] = deque(maxlen=MAX_PENDING_EVENTS)
+        self.stalled_since: float | None = None
 
     @property
     def joined(self) -> bool:
@@ -78,8 +92,8 @@ class Client:
 
 
 class ArcaneServer:
-    def __init__(self, *, bots: int) -> None:
-        self.arena = Arena(bots=bots)
+    def __init__(self, *, bots: int, fill_to: int = 0) -> None:
+        self.arena = Arena(bots=bots, fill_to=fill_to)
         self.clients: set[Client] = set()
         self.started_at = time.monotonic()
 
@@ -234,25 +248,13 @@ class ArcaneServer:
                 "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
                 "connect-src 'self' ws: wss:; font-src 'self'"
             )
-        payload = content if method == "GET" else b""
-        if method == "HEAD":
-            # Content-Length should reflect the resource, not the omitted body.
-            await writer.write(
-                (
-                    "HTTP/1.1 200 OK\r\n"
-                    f"Content-Type: {content_type}\r\n"
-                    f"Content-Length: {len(content)}\r\n"
-                    "Cache-Control: no-store\r\n"
-                    "Connection: close\r\n\r\n"
-                ).encode("utf-8")
-            )
-            try:
-                await writer.drain()
-            except (ConnectionError, RuntimeError):
-                pass
-            return
         await write_http_response(
-            writer, 200, payload, content_type=content_type, extra_headers=extra_headers
+            writer,
+            200,
+            content,
+            content_type=content_type,
+            extra_headers=extra_headers,
+            head_only=method == "HEAD",
         )
 
     # ------------------------------------------------------------- websocket
@@ -343,8 +345,42 @@ class ArcaneServer:
         if kind == "cast":
             await self.handle_cast(client, message)
             return
+        if kind == "check":
+            await self.handle_check(client, message)
+            return
         if kind == "ping":
-            await client.ws.send_json({"t": "pong"})
+            reply: dict[str, Any] = {"t": "pong"}
+            sent_at = message.get("at")
+            if type(sent_at) in (int, float):
+                reply["at"] = sent_at
+            await client.ws.send_json(reply)
+
+    async def handle_check(self, client: Client, message: dict[str, Any]) -> None:
+        """Parse a spell for the editor, without casting anything."""
+
+        code = message.get("code")
+        slot = message.get("slot")
+        if not isinstance(code, str) or type(slot) is not int:
+            return
+        now = asyncio.get_running_loop().time()
+        while client.check_times and now - client.check_times[0] > 1.0:
+            client.check_times.popleft()
+        if len(client.check_times) >= MAX_CHECKS_PER_SECOND:
+            return
+        client.check_times.append(now)
+        ticket = message.get("ticket")
+        reply: dict[str, Any] = {
+            "t": "check_result",
+            "slot": slot,
+            "ticket": ticket if type(ticket) is int else None,
+        }
+        try:
+            low, high = mana_estimate(validate_source(code), SPELL_COSTS)
+        except SpellError as exc:
+            reply.update(ok=False, error=str(exc))
+        else:
+            reply.update(ok=True, cost=[low, high])
+        await client.ws.send_json(reply)
 
     async def handle_join(self, client: Client, message: dict[str, Any]) -> None:
         if client.joined:
@@ -446,6 +482,44 @@ class ArcaneServer:
         await client.ws.send_json(result)
 
     # -------------------------------------------------------------- game loop
+    def drop_client(self, client: Client) -> None:
+        self.clients.discard(client)
+        if client.player_id is not None:
+            self.arena.remove_player(client.player_id)
+            client.player_id = None
+        client.ws.abort()
+
+    def broadcast(self, now: float, events: list[dict[str, Any]]) -> None:
+        """Send one tick to everyone, never waiting on any single reader.
+
+        People on the login screen get it too: they watch the arena live
+        behind the form, which is also why it runs with no one joined.
+        """
+
+        snapshot = self.arena.snapshot()
+        snapshot["events"] = events
+        payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        for client in list(self.clients):
+            if client.ws.backlog > MAX_CLIENT_BACKLOG:
+                client.pending_events.extend(events)
+                if client.stalled_since is None:
+                    client.stalled_since = now
+                elif now - client.stalled_since > MAX_STALL_SECONDS:
+                    self.drop_client(client)
+                continue
+            client.stalled_since = None
+            if client.pending_events:
+                caught_up = {
+                    **snapshot,
+                    "events": [*client.pending_events, *events],
+                }
+                client.pending_events.clear()
+                client.ws.send_text_nowait(
+                    json.dumps(caught_up, ensure_ascii=False, separators=(",", ":"))
+                )
+            elif not client.ws.send_text_nowait(payload):
+                self.drop_client(client)
+
     async def game_loop(self) -> None:
         tick = 1.0 / TICK_RATE
         next_tick = asyncio.get_running_loop().time()
@@ -454,37 +528,17 @@ class ArcaneServer:
             now = asyncio.get_running_loop().time()
             self.arena.update(now)
             events = self.arena.drain_events()
-            joined = [client for client in list(self.clients) if client.joined]
-            if joined:
-                snapshot = self.arena.snapshot()
-                snapshot["events"] = events
-                payload = json.dumps(
-                    snapshot, ensure_ascii=False, separators=(",", ":")
-                )
-                for client in joined:
-                    if client.player_id is None:
-                        continue
-                    if not await client.ws.send_text(payload):
-                        self.clients.discard(client)
-                        if client.player_id is not None:
-                            self.arena.remove_player(client.player_id)
-                            client.player_id = None
-                        await client.ws.close(1001, "send failed")
+            if self.clients:
+                self.broadcast(now, events)
                 if now - last_ping > 20.0:
                     last_ping = now
                     for client in list(self.clients):
-                        await client.ws.send_ping()
-            else:
-                events.clear()
+                        client.ws.send_ping_nowait()
 
             timeout_threshold = 60.0
             for client in list(self.clients):
                 if now - client.ws.last_seen > timeout_threshold:
-                    await client.ws.close(1001, "timeout")
-                    self.clients.discard(client)
-                    if client.player_id is not None:
-                        self.arena.remove_player(client.player_id)
-                        client.player_id = None
+                    self.drop_client(client)
 
             next_tick += tick
             delay = next_tick - asyncio.get_running_loop().time()
@@ -497,6 +551,18 @@ class ArcaneServer:
         for client in list(self.clients):
             await client.ws.close(1001, "server shutdown")
         self.clients.clear()
+
+
+def bots_setting(raw: str) -> int | None:
+    """A fixed number of spirits, or None for ``auto``."""
+
+    text = raw.strip().lower()
+    if text == "auto":
+        return None
+    try:
+        return max(0, min(6, int(text)))
+    except ValueError:
+        raise argparse.ArgumentTypeError("ожидается число или auto") from None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -516,9 +582,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--bots",
-        type=int,
-        default=int(os.environ.get("ARCANE_BOTS", "0")),
-        help="количество магов-духов на арене (0..6)",
+        type=bots_setting,
+        default=os.environ.get("ARCANE_BOTS", "auto"),
+        help=(
+            "маги-духи: число 0..6 или auto, чтобы на арене "
+            f"было {AUTO_FILL_MAGES} мага с учётом людей (по умолчанию auto)"
+        ),
     )
     parser.add_argument(
         "--no-open",
@@ -549,8 +618,9 @@ def should_open_browser() -> bool:
 
 
 async def main(args: argparse.Namespace) -> None:
-    bots = max(0, min(6, args.bots))
-    app = ArcaneServer(bots=bots)
+    auto_bots = args.bots is None
+    bots = 0 if auto_bots else args.bots
+    app = ArcaneServer(bots=bots, fill_to=AUTO_FILL_MAGES if auto_bots else 0)
     try:
         server = await asyncio.start_server(
             app.handle_connection,
@@ -572,7 +642,8 @@ async def main(args: argparse.Namespace) -> None:
     print(f"  Локально:   \033[36m{local_url}\033[0m")
     if net_ip:
         print(f"  В сети:     http://{net_ip}:{args.port}")
-    print(f"  Духов:      {bots}   ·   порт {args.port}")
+    bots_label = f"авто, до {AUTO_FILL_MAGES} магов на арене" if auto_bots else str(bots)
+    print(f"  Духов:      {bots_label}   ·   порт {args.port}")
     print("  Остановка:  Ctrl+C")
     print()
 

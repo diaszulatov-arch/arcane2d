@@ -39,14 +39,6 @@
   font-display: swap;
 }
 
-@font-face {
-  font-family: "Cozette";
-  src: url("/fonts/cozette-700.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
 :root {
   --bg: #05060b;
   --bg-soft: #090c14;
@@ -66,11 +58,14 @@
   --line: rgba(217, 181, 108, 0.17);
   --line-cool: rgba(169, 151, 255, 0.16);
   --glass: rgba(9, 12, 20, 0.76);
-  --font-display: "Pixelify Sans", "Cozette", "Trebuchet MS", sans-serif;
-  --font-ui: "Pixelify Sans", "Cozette", "Trebuchet MS", sans-serif;
+  /* Cozette is a true bitmap face: crisp at its 13px grid, and unlike Pixelify
+     its Cyrillic stays legible (Pixelify's "в" reads as "е" at small sizes). */
+  --font-display: "Cozette", "JetBrains Mono", monospace;
+  --font-ui: "Cozette", "JetBrains Mono", monospace;
   --font-pixel: "Press Start 2P", "Pixelify Sans", monospace;
   --font-mono: "Cozette", "JetBrains Mono", "Cascadia Code", monospace;
   --panel-w: 414px;
+  --code-line: 20px;
   --radius: 3px;
   --shadow: 0 20px 70px rgba(0, 0, 0, 0.48);
 }
@@ -81,6 +76,9 @@
 
 html,
 body {
+  /* Cozette ships no usable bold: its Ш, Ж and Ы clot, and its glyphs are wider,
+     which would pull the coloured code layer out of line with the textarea. */
+  font-synthesis: none;
   margin: 0;
   min-height: 100%;
   background: var(--bg);
@@ -304,7 +302,7 @@ textarea:focus-visible {
 .brand-copy p {
   margin: 6px 0 0;
   color: rgba(199, 184, 149, 0.58);
-  font-size: 7.5px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.32em;
   white-space: nowrap;
@@ -327,7 +325,7 @@ textarea:focus-visible {
   background: rgba(7, 10, 17, 0.66);
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
   backdrop-filter: blur(12px);
-  font-size: 11px;
+  font-size: 13px;
   letter-spacing: 0.04em;
   color: var(--ink-dim);
 }
@@ -403,7 +401,7 @@ textarea:focus-visible {
   border: 1px solid rgba(217, 181, 108, 0.22);
   background: rgba(10, 12, 19, 0.92);
   color: var(--gold-bright);
-  font-size: 11px;
+  font-size: 13px;
   letter-spacing: 0.04em;
   backdrop-filter: blur(14px);
   box-shadow: var(--shadow);
@@ -449,14 +447,14 @@ body.in-game .scoreboard {
   padding: 10px 12px 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.055);
   color: rgba(217, 181, 108, 0.7);
-  font-size: 8px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.19em;
 }
 
 .scoreboard-live {
   color: #6fd9a6;
-  font-size: 7px;
+  font-size: 13px;
   letter-spacing: 0.12em;
   opacity: 0.8;
 }
@@ -475,7 +473,7 @@ body.in-game .scoreboard {
   gap: 4px;
   padding: 6px 12px;
   color: var(--ink-dim);
-  font-size: 10.5px;
+  font-size: 13px;
   transition: background 0.2s ease;
 }
 
@@ -487,7 +485,7 @@ body.in-game .scoreboard {
 .score-rank {
   color: rgba(255, 255, 255, 0.25);
   font-family: var(--font-mono);
-  font-size: 8px;
+  font-size: 13px;
 }
 
 .score-row:first-child .score-rank {
@@ -519,12 +517,12 @@ body.in-game .scoreboard {
 .score-row.bot .score-name > span::after {
   content: " · дух";
   color: rgba(255, 255, 255, 0.25);
-  font-size: 7px;
+  font-size: 13px;
 }
 
 .score-score {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 13px;
   color: var(--gold);
 }
 
@@ -550,7 +548,7 @@ body.in-game .scoreboard {
   border-left: 1px solid rgba(217, 181, 108, 0.25);
   background: linear-gradient(90deg, rgba(6, 8, 14, 0.86), rgba(6, 8, 14, 0));
   color: rgba(228, 220, 204, 0.78);
-  font-size: 10px;
+  font-size: 13px;
   animation: feed-in 0.35s ease both;
   text-shadow: 0 1px 3px #000;
 }
@@ -571,7 +569,7 @@ body.in-game .scoreboard {
 
 .feed-line .feed-sigil {
   color: rgba(255, 255, 255, 0.35);
-  font-size: 8px;
+  font-size: 13px;
 }
 
 /* -------------------------------------------------------------------- hud */
@@ -668,7 +666,7 @@ body.in-game .local-hud {
 
 .hud-alive {
   flex: 0 0 auto;
-  font-size: 6.5px;
+  font-size: 13px;
   letter-spacing: 0.18em;
   color: #7cdaae;
 }
@@ -716,7 +714,7 @@ body.in-game .local-hud {
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
-  font-size: 6.5px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.13em;
   z-index: 1;
@@ -794,14 +792,14 @@ body.in-game .hotbar {
   top: 6px;
   right: 8px;
   font-family: var(--font-mono);
-  font-size: 8px;
+  font-size: 13px;
   color: rgba(255, 255, 255, 0.28);
 }
 
 .hot-rune {
   display: block;
   font-family: var(--font-display);
-  font-size: 10px;
+  font-size: 13px;
   letter-spacing: 0.1em;
   color: var(--gold);
   margin-bottom: 4px;
@@ -814,7 +812,7 @@ body.in-game .hotbar {
   white-space: nowrap;
   text-overflow: ellipsis;
   font-family: var(--font-display);
-  font-size: 11px;
+  font-size: 13px;
   color: rgba(236, 228, 211, 0.87);
 }
 
@@ -869,7 +867,7 @@ body.in-game .hotbar {
 .respawn-overlay p {
   margin: 0 0 4px;
   color: var(--gold);
-  font-size: 9px;
+  font-size: 13px;
   letter-spacing: 0.28em;
 }
 
@@ -884,13 +882,13 @@ body.in-game .hotbar {
 .respawn-overlay span {
   margin-top: 8px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 13px;
 }
 
 /* ------------------------------------------------------------------ hint */
 .stage-hint {
   position: absolute;
-  left: 50%;
+  left: calc(50% + 190px);
   bottom: 96px;
   z-index: 12;
   display: flex;
@@ -898,7 +896,7 @@ body.in-game .hotbar {
   gap: 18px;
   transform: translateX(-50%);
   color: rgba(255, 255, 255, 0.4);
-  font-size: 9px;
+  font-size: 13px;
   letter-spacing: 0.02em;
   white-space: nowrap;
   pointer-events: none;
@@ -918,7 +916,7 @@ body.in-game .stage-hint {
 
 .roll-hint {
   color: #7fe0b0;
-  font-size: 8px;
+  font-size: 13px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -939,7 +937,7 @@ kbd {
   background: rgba(255, 255, 255, 0.045);
   color: rgba(255, 255, 255, 0.6);
   font-family: var(--font-ui);
-  font-size: 8px;
+  font-size: 13px;
   font-weight: 700;
   line-height: 1;
 }
@@ -982,7 +980,7 @@ kbd {
   border: 1px solid rgba(217, 181, 108, 0.25);
   background: rgba(8, 10, 16, 0.88);
   color: var(--gold-bright);
-  font-size: 10.5px;
+  font-size: 13px;
   letter-spacing: 0.03em;
   backdrop-filter: blur(12px);
   box-shadow: 0 10px 34px rgba(0, 0, 0, 0.32);
@@ -1058,7 +1056,7 @@ kbd {
   place-items: center;
   color: var(--gold);
   border: 1px solid rgba(217, 181, 108, 0.27);
-  font-size: 12px;
+  font-size: 13px;
   transform: rotate(45deg);
 }
 
@@ -1078,7 +1076,7 @@ kbd {
 .grimoire-title p {
   margin: 3px 0 0;
   color: rgba(185, 179, 164, 0.42);
-  font-size: 7px;
+  font-size: 13px;
   letter-spacing: 0.19em;
   text-transform: uppercase;
 }
@@ -1136,7 +1134,7 @@ kbd {
 .tab-rune {
   display: block;
   font-family: var(--font-mono);
-  font-size: 8px;
+  font-size: 13px;
   color: var(--gold);
   letter-spacing: 0.1em;
   margin-bottom: 3px;
@@ -1148,7 +1146,7 @@ kbd {
   white-space: nowrap;
   text-overflow: ellipsis;
   font-family: var(--font-display);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .spell-meta {
@@ -1164,7 +1162,7 @@ kbd {
 .spell-meta label {
   grid-column: 1 / -1;
   color: rgba(185, 179, 164, 0.38);
-  font-size: 6.5px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.18em;
 }
@@ -1195,7 +1193,7 @@ kbd {
   padding-bottom: 4px;
   color: rgba(169, 151, 255, 0.48);
   font-family: var(--font-mono);
-  font-size: 7.5px;
+  font-size: 13px;
 }
 
 .code-shell {
@@ -1229,7 +1227,7 @@ kbd {
   background: rgba(255, 255, 255, 0.018);
   color: rgba(255, 255, 255, 0.31);
   font-family: var(--font-mono);
-  font-size: 7.5px;
+  font-size: 13px;
   letter-spacing: 0.04em;
 }
 
@@ -1249,11 +1247,15 @@ kbd {
   background: rgba(217, 181, 108, 0.48);
 }
 
-.code-lang {
+.code-cost {
   margin-left: auto;
-  color: rgba(169, 151, 255, 0.42);
-  font-size: 6.5px;
-  letter-spacing: 0.13em;
+  color: var(--mana);
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.code-cost.stale {
+  opacity: 0.4;
 }
 
 .code-body {
@@ -1267,33 +1269,175 @@ kbd {
   flex: 0 0 39px;
   height: 100%;
   margin: 0;
-  padding: 13px 9px 20px 0;
+  padding: 13px 9px 0 0;
   overflow: hidden;
   border-right: 1px solid rgba(255, 255, 255, 0.035);
   background: rgba(255, 255, 255, 0.012);
-  color: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.26);
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.56;
+  font-size: 13px;
+  line-height: var(--code-line);
   text-align: right;
   user-select: none;
 }
 
-#codeInput {
+.code-line-number {
+  display: block;
+  height: var(--code-line);
+}
+
+.code-line-number.has-error {
+  color: #1a0c0e;
+  background: var(--danger);
+  margin-right: -9px;
+  padding-right: 9px;
+}
+
+.code-pane {
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 0;
+  overflow: hidden;
+}
+
+.code-layer {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.code-layer code {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  padding: 13px 14px 24px;
+  color: #d9d4c7;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: var(--code-line);
+  tab-size: 4;
+  white-space: pre;
+  font-variant-ligatures: none;
+  will-change: transform;
+}
+
+.code-line {
+  display: block;
+  min-height: var(--code-line);
+}
+
+.code-line.has-error {
+  margin: 0 -14px;
+  padding: 0 14px;
+  background: rgba(231, 105, 114, 0.16);
+  box-shadow: inset 2px 0 0 var(--danger);
+}
+
+.tok-kw { color: #c3a6ff; }
+.tok-lit { color: #ffb86b; }
+.tok-num { color: #ffcf8a; }
+.tok-str { color: #a7e3a0; }
+.tok-comment { color: #6f6b79; }
+.tok-def { color: #f4d99b; }
+.tok-sense { color: #93d7ff; }
+.tok-const { color: #ffb86b; }
+.tok-field { color: #b9c7d9; }
+.tok-rune-fire { color: #ff9a4d; }
+.tok-rune-frost { color: #6fe2ff; }
+.tok-rune-storm { color: #c6d6ff; }
+.tok-rune-arcane { color: #d29bff; }
+.tok-rune-blood { color: #ff7da8; }
+.tok-rune-nature { color: #8fe89a; }
+.tok-rune-guard { color: #f4d99b; }
+
+.code-complete {
+  position: absolute;
+  z-index: 6;
+  width: min(330px, calc(100% - 46px));
+  border: 1px solid rgba(217, 181, 108, 0.42);
+  background: #0c0e18;
+  box-shadow: 4px 4px 0 rgba(4, 2, 8, 0.72);
+  font-family: var(--font-mono);
+}
+
+.complete-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0 10px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.complete-row[aria-selected="true"] {
+  background: rgba(217, 181, 108, 0.16);
+  box-shadow: inset 2px 0 0 var(--gold);
+}
+
+.complete-label {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 18px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.complete-row[data-element="fire"] .complete-label { color: #ff9a4d; }
+.complete-row[data-element="frost"] .complete-label { color: #6fe2ff; }
+.complete-row[data-element="storm"] .complete-label { color: #c6d6ff; }
+.complete-row[data-element="arcane"] .complete-label { color: #d29bff; }
+.complete-row[data-element="blood"] .complete-label { color: #ff7da8; }
+.complete-row[data-element="nature"] .complete-label { color: #8fe89a; }
+.complete-row[data-element="guard"] .complete-label { color: #f4d99b; }
+
+.complete-cost {
+  grid-column: 2;
+  grid-row: 1;
+  color: var(--mana);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.complete-about {
+  grid-column: 1 / -1;
+  color: rgba(233, 227, 211, 0.55);
+  font-size: 13px;
+  line-height: 16px;
+}
+
+.code-diagnostic {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 11px;
+  border-top: 1px solid rgba(231, 105, 114, 0.3);
+  background: rgba(231, 105, 114, 0.09);
+  color: #ffb4b8;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 17px;
+}
+
+#codeInput {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
   padding: 13px 14px 24px;
   resize: none;
   border: 0;
   outline: none;
   background: transparent;
-  color: #d9d4c7;
+  /* The text is painted by .code-layer; this one only keeps caret and selection. */
+  color: transparent;
+  -webkit-text-fill-color: transparent;
   caret-color: var(--gold-bright);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 400;
-  line-height: 1.56;
+  line-height: var(--code-line);
   tab-size: 4;
   white-space: pre;
   overflow: auto;
@@ -1301,8 +1445,7 @@ kbd {
 }
 
 #codeInput::selection {
-  color: #17130b;
-  background: rgba(230, 196, 126, 0.8);
+  background: rgba(230, 196, 126, 0.3);
 }
 
 #codeInput::placeholder {
@@ -1325,7 +1468,7 @@ kbd {
   gap: 6px;
   min-width: 0;
   color: rgba(255, 255, 255, 0.4);
-  font-size: 9px;
+  font-size: 13px;
 }
 
 .select-icon {
@@ -1342,7 +1485,7 @@ kbd {
   border-bottom: 1px solid transparent;
   background: transparent;
   color: rgba(255, 255, 255, 0.45);
-  font-size: 9px;
+  font-size: 13px;
   cursor: pointer;
 }
 
@@ -1358,7 +1501,7 @@ kbd {
   top: 50%;
   transform: translateY(-55%);
   color: rgba(255, 255, 255, 0.28);
-  font-size: 10px;
+  font-size: 13px;
   pointer-events: none;
 }
 
@@ -1366,7 +1509,7 @@ kbd {
   flex: 0 0 auto;
   padding: 4px 0;
   color: rgba(217, 181, 108, 0.66);
-  font-size: 9px;
+  font-size: 13px;
   letter-spacing: 0.03em;
   border-bottom: 1px solid rgba(217, 181, 108, 0.14);
   transition: color 0.2s ease, border-color 0.2s ease;
@@ -1393,7 +1536,7 @@ kbd {
   padding: 5px 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   color: rgba(255, 255, 255, 0.22);
-  font-size: 6px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.18em;
 }
@@ -1417,7 +1560,7 @@ kbd {
   padding: 5px 8px 7px;
   overflow-y: auto;
   font-family: var(--font-mono);
-  font-size: 8.5px;
+  font-size: 13px;
   line-height: 1.5;
 }
 
@@ -1430,7 +1573,7 @@ kbd {
   color: rgba(255, 255, 255, 0.2);
   font-family: var(--font-ui);
   font-style: italic;
-  font-size: 9px;
+  font-size: 13px;
 }
 
 .console-entry {
@@ -1468,7 +1611,7 @@ kbd {
   gap: 9px;
   margin-bottom: 8px;
   color: rgba(255, 255, 255, 0.32);
-  font-size: 8px;
+  font-size: 13px;
   letter-spacing: 0.04em;
 }
 
@@ -1572,7 +1715,7 @@ kbd {
   gap: 3px;
   opacity: 0.48;
   font-family: var(--font-ui);
-  font-size: 7px;
+  font-size: 13px;
   letter-spacing: 0.04em;
 }
 
@@ -1582,7 +1725,7 @@ kbd {
   border-color: rgba(24, 19, 10, 0.23);
   color: rgba(24, 19, 10, 0.58);
   background: rgba(24, 19, 10, 0.06);
-  font-size: 6px;
+  font-size: 13px;
 }
 
 .cast-star {
@@ -1746,7 +1889,7 @@ body.in-game .login-overlay {
 .login-eyebrow {
   margin: 0 0 4px;
   color: rgba(217, 181, 108, 0.51);
-  font-size: 7px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.38em;
 }
@@ -1778,7 +1921,7 @@ body.in-game .login-overlay {
   margin: 11px 0 26px;
   color: rgba(206, 198, 181, 0.56);
   font-family: var(--font-display);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.65;
   letter-spacing: 0.015em;
 }
@@ -1796,7 +1939,7 @@ body.in-game .login-overlay {
   display: block;
   margin-bottom: 6px;
   color: rgba(217, 181, 108, 0.5);
-  font-size: 6.5px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.23em;
 }
@@ -1855,7 +1998,7 @@ body.in-game .login-overlay {
   background: linear-gradient(100deg, #bf9654 0%, #e7c782 52%, #b78d4e 100%);
   color: #191309;
   font-family: var(--font-display);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.14em;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.25);
@@ -1890,7 +2033,7 @@ body.in-game .login-overlay {
   min-height: 13px;
   margin: 6px 0 0;
   color: #ff9ca4;
-  font-size: 9px;
+  font-size: 13px;
   line-height: 1.4;
 }
 
@@ -1929,7 +2072,7 @@ body.in-game .login-overlay {
 .login-features p {
   margin: 0;
   color: rgba(255, 255, 255, 0.28);
-  font-size: 7.5px;
+  font-size: 13px;
   line-height: 1.45;
 }
 
@@ -1938,7 +2081,7 @@ body.in-game .login-overlay {
   margin-bottom: 2px;
   color: rgba(233, 227, 211, 0.64);
   font-family: var(--font-display);
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 400;
   letter-spacing: 0.025em;
 }
@@ -1952,7 +2095,7 @@ body.in-game .login-overlay {
   padding-top: 13px;
   border-top: 1px solid rgba(255, 255, 255, 0.055);
   color: rgba(255, 255, 255, 0.3);
-  font-size: 8px;
+  font-size: 13px;
   letter-spacing: 0.02em;
 }
 
@@ -1968,7 +2111,7 @@ body.in-game .login-overlay {
   z-index: 1;
   margin: 0;
   color: rgba(255, 255, 255, 0.25);
-  font-size: 8px;
+  font-size: 13px;
   letter-spacing: 0.02em;
 }
 
@@ -2055,7 +2198,7 @@ body.in-game .login-overlay {
 .api-head p {
   margin: 0 0 5px;
   color: rgba(217, 181, 108, 0.52);
-  font-size: 7px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.28em;
 }
@@ -2084,14 +2227,14 @@ body.in-game .login-overlay {
   margin: 0;
   max-width: 680px;
   color: rgba(220, 212, 196, 0.58);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.65;
 }
 
 .api-intro code {
   color: var(--gold);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .api-flow {
@@ -2100,7 +2243,7 @@ body.in-game .login-overlay {
   gap: 7px;
   flex: 0 0 auto;
   color: rgba(255, 255, 255, 0.27);
-  font-size: 8px;
+  font-size: 13px;
   letter-spacing: 0.05em;
 }
 
@@ -2148,7 +2291,7 @@ body.in-game .login-overlay {
 .api-section h3 span {
   color: rgba(217, 181, 108, 0.38);
   font-family: var(--font-mono);
-  font-size: 7px;
+  font-size: 13px;
 }
 
 .api-section dl {
@@ -2163,7 +2306,7 @@ body.in-game .login-overlay {
   margin-top: 9px;
   color: var(--gold-bright);
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 13px;
 }
 
 .api-section dt:first-child {
@@ -2180,14 +2323,14 @@ body.in-game .login-overlay {
 .api-section dd {
   margin: 2px 0 7px;
   color: rgba(255, 255, 255, 0.42);
-  font-size: 9.5px;
+  font-size: 13px;
   line-height: 1.5;
 }
 
 .api-section dd code {
   color: rgba(169, 151, 255, 0.8);
   font-family: var(--font-mono);
-  font-size: 8.5px;
+  font-size: 13px;
 }
 
 .cost {
@@ -2197,7 +2340,7 @@ body.in-game .login-overlay {
   background: rgba(122, 140, 255, 0.09);
   color: rgba(145, 160, 255, 0.72);
   font-family: var(--font-mono);
-  font-size: 7px;
+  font-size: 13px;
 }
 
 .cost::after {
@@ -2211,7 +2354,7 @@ body.in-game .login-overlay {
   border-left: 1px solid rgba(169, 151, 255, 0.26);
   background: rgba(169, 151, 255, 0.035);
   color: rgba(255, 255, 255, 0.37);
-  font-size: 9px;
+  font-size: 13px;
   line-height: 1.55;
 }
 
@@ -2223,14 +2366,14 @@ body.in-game .login-overlay {
   background: rgba(0, 0, 0, 0.22);
   color: #cfd5c8;
   font-family: var(--font-mono);
-  font-size: 8.5px;
+  font-size: 13px;
   line-height: 1.6;
 }
 
 .api-warning {
   margin: 0;
   color: rgba(255, 156, 164, 0.52);
-  font-size: 8.5px;
+  font-size: 13px;
   line-height: 1.5;
 }
 
@@ -2242,7 +2385,7 @@ body.in-game .login-overlay {
   padding: 14px 28px;
   border-top: 1px solid rgba(255, 255, 255, 0.055);
   color: rgba(255, 255, 255, 0.28);
-  font-size: 8.5px;
+  font-size: 13px;
 }
 
 .api-footer > span {
@@ -2392,7 +2535,7 @@ body.panel-collapsed #panelToggle {
   }
 
   .brand-copy p {
-    font-size: 6px;
+    font-size: 13px;
   }
 
   .online-label {
@@ -2427,13 +2570,13 @@ body.panel-collapsed #panelToggle {
 
   .scoreboard-head {
     padding: 8px 9px 6px;
-    font-size: 6.5px;
+    font-size: 13px;
   }
 
   .score-row {
     grid-template-columns: 18px minmax(0, 1fr) auto;
     padding: 5px 9px;
-    font-size: 9px;
+    font-size: 13px;
   }
 
   .killfeed {
@@ -2443,7 +2586,7 @@ body.panel-collapsed #panelToggle {
   }
 
   .feed-line {
-    font-size: 8px;
+    font-size: 13px;
     padding: 5px 7px;
   }
 
@@ -2466,7 +2609,7 @@ body.panel-collapsed #panelToggle {
   }
 
   .hud-name {
-    font-size: 11px;
+    font-size: 13px;
   }
 
   .hud-name-row {
@@ -2483,7 +2626,7 @@ body.panel-collapsed #panelToggle {
 
   .bar-label,
   .bar-value {
-    font-size: 5.5px;
+    font-size: 13px;
   }
 
   .hotbar {
@@ -2508,16 +2651,16 @@ body.panel-collapsed #panelToggle {
 
   .hot-title {
     max-width: 72px;
-    font-size: 9px;
+    font-size: 13px;
   }
 
   .hot-rune {
-    font-size: 8px;
+    font-size: 13px;
     margin-bottom: 2px;
   }
 
   .hot-key {
-    font-size: 7px;
+    font-size: 13px;
     top: 4px;
     right: 5px;
   }
@@ -2631,7 +2774,7 @@ body.panel-collapsed #panelToggle {
 
   .login-subtitle {
     margin-bottom: 18px;
-    font-size: 11px;
+    font-size: 13px;
   }
 
   .login-footnote {
@@ -2736,14 +2879,14 @@ body.panel-collapsed #panelToggle {
 
 .grimoire-title h2 {
   font-family: var(--font-pixel);
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 400;
   letter-spacing: 0.08em;
 }
 
 .cast-button-copy strong {
   font-family: var(--font-pixel);
-  font-size: 9px;
+  font-size: 13px;
   font-weight: 400;
   letter-spacing: 0.06em;
 }
@@ -2764,13 +2907,13 @@ body.panel-collapsed #panelToggle {
 }
 
 .console-body {
-  font-size: 9.5px;
+  font-size: 13px;
   line-height: 1.45;
   font-variant-ligatures: none;
 }
 
 .console-idle {
-  font-size: 10px;
+  font-size: 13px;
 }
 
 #codeInput,
@@ -2820,4 +2963,103 @@ body.panel-collapsed #panelToggle {
 
 .stage-grain {
   opacity: 0.07;
+}
+
+/* ------------------------------------------------------------ rune economy */
+@media (min-width: 761px) {
+  .hot-card {
+    height: 66px;
+  }
+}
+
+.hot-cost {
+  position: absolute;
+  right: 9px;
+  bottom: 6px;
+  color: var(--mana);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.hot-card.no-mana .hot-title,
+.hot-card.no-mana .hot-rune {
+  opacity: 0.45;
+}
+
+.hot-card.no-mana .hot-cost {
+  color: var(--danger);
+}
+
+.hot-card.broken {
+  border-color: rgba(231, 105, 114, 0.5);
+}
+
+.hot-card.broken .hot-cost {
+  color: var(--danger);
+}
+
+/* Between the drawer layout and a wide stage there is room for one hint only;
+   the roll timer is the one that changes during a fight. */
+@media (max-width: 1560px) {
+  .stage-hint > span:not(:nth-child(4)) {
+    display: none;
+  }
+}
+
+.ping-value {
+  padding-left: 8px;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.feed-accent {
+  font-family: var(--font-mono);
+}
+
+/* ------------------------------------------------- the arena as a title card */
+body:not(.in-game) .topbar,
+body:not(.in-game) .scoreboard,
+body:not(.in-game) .grimoire,
+body:not(.in-game) .killfeed {
+  display: none;
+}
+
+.login-overlay {
+  align-items: flex-start;
+  padding-left: clamp(18px, 7vw, 120px);
+  background:
+    linear-gradient(90deg, rgba(4, 4, 10, 0.86), rgba(4, 4, 10, 0.3) 46%, rgba(4, 4, 10, 0) 74%);
+  backdrop-filter: none;
+}
+
+.login-aura {
+  display: none;
+}
+
+.login-footnote {
+  width: min(470px, 100%);
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .login-overlay {
+    align-items: center;
+    padding-left: 18px;
+    background: rgba(4, 4, 10, 0.62);
+  }
+}
+
+@media (max-width: 760px) {
+  .ping-value,
+  .brand-copy p {
+    display: none;
+  }
+
+  .scoreboard-head {
+    white-space: nowrap;
+    letter-spacing: 0.04em;
+  }
 }

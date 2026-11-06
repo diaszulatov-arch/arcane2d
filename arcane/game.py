@@ -14,6 +14,7 @@ from .interpreter import (
     SpellRuntimeError,
     execute_spell,
     safe_globals,
+    spell_text,
 )
 
 ARENA_W = 1900
@@ -72,6 +73,9 @@ POISON_DAMAGE = 6.0
 ROLL_DISTANCE = 165.0
 ROLL_COOLDOWN = 1.6
 ROLL_INVULN = 0.22
+BOT_DODGE_CHANCE = 0.55
+BOT_DODGE_LOOKAHEAD = 0.38
+BOT_PROJECTILE_SPEED = 575.0
 
 SPARK_COLORS = [
     "#ffe17a",  # yellow
@@ -156,6 +160,7 @@ class Player:
     mana: float = MAX_MANA
     score: int = 0
     deaths: int = 0
+    streak: int = 0
     shield: float = 0.0
     shield_until: float = 0.0
     shield_ready_at: float = 0.0
@@ -172,6 +177,9 @@ class Player:
     is_bot: bool = False
     input: Input = field(default_factory=Input)
     next_bot_cast: float = 0.0
+    next_bot_dodge: float = 0.0
+    next_bot_turn: float = 0.0
+    bot_strafe: float = 0.65
     bot_style: str = "fire"
     last_x: float = 0.0
     last_y: float = 0.0
@@ -269,27 +277,58 @@ BOT_PROFILES = [
         "style": "arcane",
         "interval": (1.7, 2.7),
     },
+    {
+        "name": "Пепел",
+        "color": "#ffb35c",
+        "style": "fire",
+        "interval": (1.5, 2.4),
+    },
+    {
+        "name": "Сирин",
+        "color": "#8fe0d0",
+        "style": "frost",
+        "interval": (1.6, 2.6),
+    },
+    {
+        "name": "Морок",
+        "color": "#d59cff",
+        "style": "arcane",
+        "interval": (1.6, 2.6),
+    },
 ]
 
 BOT_SPELLS = {
     "fire": """
-fireball(aim() + rand(-0.055, 0.055))
+target = cursor()
+fireball(aim() + rand(-0.05, 0.05))
 
-if me().hp < 36 and me().shield < 1:
+if target.dist < 220 and me().mana >= 21:
+    nova(200)
+elif 340 < target.dist < 600 and me().mana >= 60:
+    meteor(target.x, target.y)
+
+if me().hp < 36 and ready("shield"):
     shield()
 """,
     "frost": """
-frostbolt(aim() + rand(-0.045, 0.045))
+target = cursor()
+frostbolt(aim() + rand(-0.04, 0.04))
 
-if me().shield < 1:
-    shield()
-if me().hp < 54:
+if me().hp < 54 and ready("heal"):
     heal()
+
+if target.dist < 440 and me().mana >= 55:
+    ward(target.x, target.y)
 """,
     "arcane": """
-fireball(aim() + rand(-0.08, 0.08))
+target = cursor()
 
-if me().shield < 1:
+if target.dist < 360 and me().mana >= 62:
+    siphon(aim())
+else:
+    spark_volley(aim() + rand(-0.05, 0.05), 5, 0.55)
+
+if ready("shield") and me().mana >= 30:
     shield()
 """,
 }
@@ -360,6 +399,22 @@ class SpellSession:
                 2,
             ),
         )
+
+    def ready(self, name: Any) -> bool:
+        """Whether a rune can be cast right now, so spells need not fail to find out."""
+
+        if name not in SPELL_COSTS:
+            raise SpellRuntimeError(f"Неизвестная руна: {str(name)[:32]}.")
+        player = self.player
+        if name == "shield" and (
+            self.now < player.shield_ready_at or player.shield > 0.5
+        ):
+            return False
+        if name == "heal" and (
+            self.now < player.heal_ready_at or player.hp >= MAX_HP - 0.5
+        ):
+            return False
+        return self.actions < MAX_SPELL_ACTIONS and player.mana + 1e-6 >= SPELL_COSTS[name]
 
     def direction(self, x: Any, y: Any) -> float:
         target_x = _api_number(x, "x")
@@ -929,7 +984,7 @@ class SpellSession:
     def say(self, text: Any) -> None:
         if self.says >= 2:
             raise SpellRuntimeError("Нельзя произнести больше двух фраз за заклинание.")
-        message = str(text).replace("\n", " ").strip()[:80]
+        message = spell_text(text).replace("\n", " ").strip()[:80]
         if not message:
             return
         self.says += 1
@@ -947,7 +1002,7 @@ class SpellSession:
             elif isinstance(value, PointView):
                 parts.append(f"точка ({value.x:.1f}, {value.y:.1f})")
             else:
-                parts.append(str(value))
+                parts.append(spell_text(value))
         line = " ".join(parts)[:220]
         self.logs.append(line)
 
@@ -957,6 +1012,7 @@ class SpellSession:
                 "me": self.me,
                 "aim": self.aim,
                 "cursor": self.cursor,
+                "ready": self.ready,
                 "direction": self.direction,
                 "distance": self.distance,
                 "fireball": self.fireball,
@@ -998,7 +1054,7 @@ def _api_angle(value: Any) -> float:
 
 
 class Arena:
-    def __init__(self, *, bots: int = 2) -> None:
+    def __init__(self, *, bots: int = 2, fill_to: int = 0) -> None:
         self.players: dict[int, Player] = {}
         self.projectiles: list[Projectile] = []
         self.wards: list[Ward] = []
@@ -1015,6 +1071,9 @@ class Arena:
         self._next_cloud_id = 1
         self._last_tick = 0.0
         self.bots_wanted = max(0, min(6, bots))
+        # With ``fill_to`` the spirits top the arena up to that many mages and
+        # step aside as people arrive, so nobody opens an empty room.
+        self.fill_to = max(0, min(6, fill_to))
         self._spawn_bots()
 
     # ------------------------------------------------------------------ setup
@@ -1037,8 +1096,12 @@ class Arena:
             "tick_rate": TICK_RATE,
         }
 
+    def _bots_needed(self) -> int:
+        humans = sum(1 for player in self.players.values() if not player.is_bot)
+        return max(self.bots_wanted, self.fill_to - humans)
+
     def _spawn_bots(self) -> None:
-        for index in range(self.bots_wanted):
+        for index in range(self._bots_needed()):
             profile = BOT_PROFILES[index % len(BOT_PROFILES)]
             self.add_player(
                 profile["name"],
@@ -1577,7 +1640,7 @@ class Arena:
                 player.stun_until = 0.0
 
     def _update_bots(self, now: float) -> None:
-        for bot in self.players.values():
+        for bot in list(self.players.values()):
             if not bot.is_bot or bot.dead:
                 continue
             if bot.stun_until > self.now:
@@ -1589,22 +1652,29 @@ class Arena:
             if not enemies:
                 bot.input = Input()
                 continue
-            enemies.sort(
-                key=lambda p: (p.x - bot.x) ** 2 + (p.y - bot.y) ** 2
+            # People are worth a detour: spirits should not just duel each other.
+            target = min(
+                enemies,
+                key=lambda p: ((p.x - bot.x) ** 2 + (p.y - bot.y) ** 2)
+                * (1.0 if p.is_bot else 0.55),
             )
-            target = enemies[0]
             distance = math.hypot(target.x - bot.x, target.y - bot.y)
-            angle = math.atan2(target.y - bot.y, target.x - bot.x)
-            bot.aim = angle
+            aim_x, aim_y = self._bot_lead_point(bot, target, distance)
+            angle = math.atan2(aim_y - bot.y, aim_x - bot.x)
+            bot.aim = angle % math.tau
+
+            if now >= bot.next_bot_turn:
+                bot.next_bot_turn = now + random.uniform(1.4, 3.6)
+                if random.random() < 0.7:
+                    bot.bot_strafe = -bot.bot_strafe
 
             desired = 295.0
             forward = 0.0
-            strafe = 0.0
             if distance > desired + 95:
                 forward = 1.0
             elif distance < desired - 110:
                 forward = -1.0
-            strafe = 0.65 if (bot.id % 2 == 0) else -0.65
+            strafe = bot.bot_strafe
             dx = math.cos(angle) * forward + math.cos(angle + math.pi / 2) * strafe
             dy = math.sin(angle) * forward + math.sin(angle + math.pi / 2) * strafe
             length = math.hypot(dx, dy) or 1.0
@@ -1613,13 +1683,16 @@ class Arena:
             probe_x = bot.x + dx * 56
             probe_y = bot.y + dy * 56
             if not self.can_stand(probe_x, probe_y):
-                side = 1 if bot.id % 2 == 0 else -1
+                side = 1 if strafe > 0 else -1
                 dx = math.cos(angle + side * math.pi / 2)
                 dy = math.sin(angle + side * math.pi / 2)
+                bot.bot_strafe = -strafe
             bot.input.left = dx < -0.3
             bot.input.right = dx > 0.3
             bot.input.up = dy < -0.3
             bot.input.down = dy > 0.3
+
+            self._bot_dodge(bot, now)
 
             if now >= bot.next_bot_cast and distance < 720:
                 profile = next(
@@ -1629,10 +1702,54 @@ class Arena:
                 low, high = profile["interval"]
                 bot.next_bot_cast = now + random.uniform(low, high)
                 if random.random() < 0.88:
-                    self.cast(bot.id, BOT_SPELLS[bot.bot_style], 0, bot.aim)
+                    self.cast(bot.id, BOT_SPELLS[bot.bot_style], 0, bot.aim, aim_x, aim_y)
+
+    def _bot_lead_point(
+        self, bot: Player, target: Player, distance: float
+    ) -> tuple[float, float]:
+        """Where to shoot so a bolt meets a moving mage, with a human's doubt."""
+
+        speed_x = (target.x - target.last_x) * TICK_RATE
+        speed_y = (target.y - target.last_y) * TICK_RATE
+        # A roll or blink shows up as one huge step; that is not a heading.
+        if math.hypot(speed_x, speed_y) > MOVE_SPEED * 1.25:
+            return target.x, target.y
+        flight = distance / BOT_PROJECTILE_SPEED * random.uniform(0.45, 1.0)
+        return target.x + speed_x * flight, target.y + speed_y * flight
+
+    def _bot_dodge(self, bot: Player, now: float) -> None:
+        """Roll away from a bolt about to land, sometimes."""
+
+        if now < bot.next_bot_dodge or bot.roll_ready_at > self.now:
+            return
+        for projectile in self.projectiles:
+            if projectile.owner == bot.id:
+                continue
+            heading_x = math.cos(projectile.angle)
+            heading_y = math.sin(projectile.angle)
+            offset_x = bot.x - projectile.x
+            offset_y = bot.y - projectile.y
+            ahead = offset_x * heading_x + offset_y * heading_y
+            if not 0.0 < ahead < projectile.speed * BOT_DODGE_LOOKAHEAD:
+                continue
+            side = offset_x * -heading_y + offset_y * heading_x
+            if abs(side) > PLAYER_RADIUS + projectile.radius + 12:
+                continue
+            bot.next_bot_dodge = now + 0.45
+            if random.random() >= BOT_DODGE_CHANCE:
+                return
+            away = 1.0 if side >= 0 else -1.0
+            bot.input.left = -heading_y * away < -0.3
+            bot.input.right = -heading_y * away > 0.3
+            bot.input.up = heading_x * away < -0.3
+            bot.input.down = heading_x * away > 0.3
+            self.roll(bot.id)
+            return
 
     def _move_players(self, dt: float) -> None:
         for player in self.players.values():
+            player.last_x = player.x
+            player.last_y = player.y
             if player.dead:
                 continue
             if player.stun_until > self.now:
@@ -1704,7 +1821,11 @@ class Arena:
             target: Player | None = None
             best_distance = 1e9
             for candidate in self.players.values():
-                if candidate.id == projectile.owner or candidate.dead:
+                if (
+                    candidate.id == projectile.owner
+                    or candidate.dead
+                    or candidate.invuln_until > self.now
+                ):
                     continue
                 distance = _segment_circle_distance(
                     old_x,
@@ -1718,8 +1839,6 @@ class Arena:
                     target = candidate
                     best_distance = distance
             if target is not None:
-                if target.invuln_until > self.now:
-                    continue
                 owner = self.players.get(projectile.owner)
                 self.damage(
                     target=target,
@@ -1958,8 +2077,9 @@ class Arena:
 
     def _sync_bot_roster(self) -> None:
         current = sum(1 for player in self.players.values() if player.is_bot)
-        if current < self.bots_wanted:
-            for index in range(current, self.bots_wanted):
+        needed = self._bots_needed()
+        if current < needed:
+            for index in range(current, needed):
                 profile = BOT_PROFILES[index % len(BOT_PROFILES)]
                 self.add_player(
                     profile["name"],
@@ -1967,12 +2087,12 @@ class Arena:
                     color=profile["color"],
                     bot_style=profile["style"],
                 )
-        elif current > self.bots_wanted:
-            for player in list(self.players.values()):
+        elif current > needed:
+            for player in reversed(list(self.players.values())):
                 if player.is_bot:
                     self.remove_player(player.id)
                     current -= 1
-                    if current <= self.bots_wanted:
+                    if current <= needed:
                         break
 
     # ------------------------------------------------------------------- combat
@@ -2009,10 +2129,10 @@ class Arena:
             }
         )
         if target.hp <= 0:
-            self._kill(target, source)
+            self._kill(target, source, kind)
         return max(0.0, hp_before - target.hp)
 
-    def _kill(self, target: Player, killer: Player | None) -> None:
+    def _kill(self, target: Player, killer: Player | None, kind: str = "") -> None:
         if target.dead:
             return
         target.dead = True
@@ -2021,9 +2141,12 @@ class Arena:
         target.shield = 0.0
         target.input = Input()
         target.deaths += 1
+        target.streak = 0
         target.respawn_at = self.now + RESPAWN_TIME
-        if killer is not None and killer.id != target.id and not killer.dead:
+        credited = killer is not None and killer.id != target.id
+        if credited:
             killer.score += 1
+            killer.streak += 1
         self.emit(
             {
                 "e": "death",
@@ -2034,6 +2157,8 @@ class Arena:
                 "color": target.color,
                 "killer_id": killer.id if killer else None,
                 "killer": killer.name if killer else "Арена",
+                "kind": kind,
+                "streak": killer.streak if credited else 0,
             }
         )
 
@@ -2103,6 +2228,7 @@ class Arena:
                 "x": round(projectile.x, 1),
                 "y": round(projectile.y, 1),
                 "angle": round(projectile.angle, 3),
+                "speed": round(projectile.speed),
                 "color": projectile.color,
             }
             for projectile in self.projectiles

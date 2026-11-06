@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 import unittest
 
 from arcane.game import (
@@ -30,6 +31,7 @@ from arcane.game import (
     STRIKE_STUN,
     Arena,
 )
+from arcane.interpreter import mana_estimate, validate_source
 
 
 class SpellCastingTests(unittest.TestCase):
@@ -563,6 +565,158 @@ class CombatTests(unittest.TestCase):
         self.arena.update(self.arena.now)
         self.assertLess(self.target.hp, MAX_HP)
         self.assertEqual(self.arena.wards, [])
+
+
+LIST_TOWER = """
+a = [1] * 250
+b = [a] * 250
+c = [b] * 250
+d = [c] * 250
+"""
+
+
+class SandboxCostTests(unittest.TestCase):
+    """Shared references make shallow data enormous; C code must not walk it."""
+
+    def setUp(self) -> None:
+        self.arena = Arena(bots=0)
+        self.player = self.arena.add_player("Тест")
+
+    def assert_stopped_quickly(self, code: str) -> dict:
+        started = time.perf_counter()
+        result = self.arena.cast(self.player.id, code, 0, 0.0)
+        self.arena.players[self.player.id].cast_ready_at = 0.0
+        self.assertLess(time.perf_counter() - started, 0.2, code)
+        self.assertFalse(result["ok"], code)
+        return result
+
+    def test_stringifying_a_tower_of_lists_is_refused(self) -> None:
+        for line in ('x = str(d)', 'x = f"{d}"', "log(d)", "print(d)", "say(d)"):
+            with self.subTest(line):
+                self.assert_stopped_quickly(LIST_TOWER + line)
+
+    def test_comparing_two_towers_is_billed_as_steps(self) -> None:
+        twin = LIST_TOWER.replace("a =", "e =").replace("[a]", "[e]")
+        twin = twin.replace("b =", "f =").replace("[b]", "[f]")
+        twin = twin.replace("c =", "g =").replace("[c]", "[g]")
+        twin = twin.replace("d =", "h =")
+        for line in ("x = d == h", "x = d != h", "x = d < h", "x = d in [h]"):
+            with self.subTest(line):
+                self.assert_stopped_quickly(LIST_TOWER + twin + line)
+
+    def test_min_and_max_only_order_plain_values(self) -> None:
+        self.assert_stopped_quickly(LIST_TOWER + "x = max([d, d])")
+        self.assert_stopped_quickly("x = min([[1], [2]])")
+        self.assertTrue(self.arena.cast(self.player.id, "x = min([1, 2.5, True])")["ok"])
+
+    def test_hashing_a_nested_tuple_as_a_dict_key_is_refused(self) -> None:
+        result = self.assert_stopped_quickly("a = {}\nx = a[(1, 2)]")
+        self.assertIn("Ключ словаря", result["error"])
+
+    def test_small_collections_still_print(self) -> None:
+        result = self.arena.cast(self.player.id, 'log([1, [2, 3]], {"a": 1})')
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["log"], ["[1, [2, 3]] {'a': 1}"])
+
+    def test_fractional_power_of_a_negative_stays_a_real_number(self) -> None:
+        result = self.assert_stopped_quickly("x = (-8) ** 0.5")
+        self.assertIn("степень", result["error"])
+
+
+class ReadyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.arena = Arena(bots=0)
+        self.player = self.arena.add_player("Тест")
+
+    def ask(self, name: str) -> bool:
+        self.player.cast_ready_at = 0.0
+        result = self.arena.cast(self.player.id, f'log(ready("{name}"))', 0, 0.0)
+        self.assertTrue(result["ok"], result)
+        return result["log"] == ["True"]
+
+    def test_mana_decides_for_an_ordinary_rune(self) -> None:
+        self.assertTrue(self.ask("beam"))
+        self.player.mana = SPELL_COSTS["beam"] - 1
+        self.assertFalse(self.ask("beam"))
+
+    def test_a_shield_on_cooldown_is_not_ready(self) -> None:
+        self.assertTrue(self.ask("shield"))
+        self.player.cast_ready_at = 0.0
+        self.assertTrue(self.arena.cast(self.player.id, "shield()", 0, 0.0)["ok"])
+        self.assertFalse(self.ask("shield"))
+        self.player.shield = 0.0
+        self.assertFalse(self.ask("shield"), "the shield itself is gone, its cooldown is not")
+        self.arena.now = self.player.shield_ready_at + 0.1
+        self.assertTrue(self.ask("shield"))
+
+    def test_heal_is_not_ready_at_full_health(self) -> None:
+        self.assertFalse(self.ask("heal"))
+        self.player.hp = 50.0
+        self.assertTrue(self.ask("heal"))
+
+    def test_ready_guards_a_spell_against_its_own_cooldown_error(self) -> None:
+        code = 'if ready("shield"):\n    shield()\nfireball(0)\n'
+        for _ in range(3):
+            self.player.cast_ready_at = 0.0
+            self.player.mana = 100.0
+            self.assertTrue(self.arena.cast(self.player.id, code, 0, 0.0)["ok"])
+
+    def test_an_unknown_rune_name_is_an_error(self) -> None:
+        result = self.arena.cast(self.player.id, 'ready("fireblast")', 0, 0.0)
+        self.assertFalse(result["ok"])
+        self.assertIn("fireblast", result["error"])
+
+
+class ManaEstimateTests(unittest.TestCase):
+    def estimate(self, source: str) -> tuple[int, int]:
+        return mana_estimate(validate_source(source), SPELL_COSTS)
+
+    def test_straight_line_spell_has_one_price(self) -> None:
+        fire = SPELL_COSTS["fireball"]
+        self.assertEqual(self.estimate("fireball(aim())"), (fire, fire))
+
+    def test_a_branch_widens_the_range(self) -> None:
+        fire, shield = SPELL_COSTS["fireball"], SPELL_COSTS["shield"]
+        self.assertEqual(
+            self.estimate("fireball(0)\nif me().hp < 45:\n    shield()\n"),
+            (fire, fire + shield),
+        )
+
+    def test_counted_loops_multiply(self) -> None:
+        fire = SPELL_COSTS["fireball"]
+        self.assertEqual(
+            self.estimate("for a in [1, 2, 3]:\n    fireball(a)\n"), (fire * 3, fire * 3)
+        )
+        self.assertEqual(
+            self.estimate("for a in range(4):\n    fireball(a)\n"), (fire * 4, fire * 4)
+        )
+
+    def test_an_unknown_loop_may_not_run_at_all(self) -> None:
+        fire = SPELL_COSTS["fireball"]
+        self.assertEqual(
+            self.estimate("for a in items:\n    fireball(a)\n"), (0, fire)
+        )
+
+    def test_helper_functions_count_where_they_are_called(self) -> None:
+        heal = SPELL_COSTS["heal"]
+        source = "def mend():\n    heal()\n"
+        self.assertEqual(self.estimate(source), (0, 0))
+        self.assertEqual(self.estimate(source + "mend()\nmend()\n"), (heal * 2, heal * 2))
+
+    def test_recursion_does_not_hang_the_estimate(self) -> None:
+        self.assertEqual(self.estimate("def f():\n    f()\nf()\n"), (0, 0))
+
+    def test_helpers_calling_helpers_stay_linear(self) -> None:
+        depth = 120
+        source = "".join(
+            f"def f{index}():\n    f{index + 1}()\n    f{index + 1}()\n"
+            for index in range(depth)
+        )
+        source += f"def f{depth}():\n    fireball(0)\nf0()\n"
+        started = time.perf_counter()
+        low, high = self.estimate(source)
+        self.assertLess(time.perf_counter() - started, 0.2)
+        self.assertEqual((low, high), (999, 999), "a hint needs no 37-digit price tag")
 
 
 if __name__ == "__main__":

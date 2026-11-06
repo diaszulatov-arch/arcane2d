@@ -10,7 +10,8 @@ export const DEFAULT_SPELLS = [
     code: `# aim() направлен туда, куда смотрит курсор
 fireball(aim())
 
-if me().hp < 45:
+# ready() проверяет ману и перезарядку руны
+if me().hp < 45 and ready("shield"):
     shield()
 `,
   },
@@ -19,14 +20,14 @@ if me().hp < 45:
     code: `# Ручной прицел: снаряд летит на курсор
 frostbolt(aim())
 
-if me().hp < 55:
+if me().hp < 55 and ready("heal"):
     heal()
 `,
   },
   {
     name: "Оберег",
     code: `# Щит и огонь по направлению прицела
-if me().shield < 1:
+if ready("shield"):
     shield()
 
 fireball(aim())
@@ -73,6 +74,33 @@ else:
 
 const LEGACY_CODE_REPLACEMENTS = [
   {
+    old: `# aim() направлен туда, куда смотрит курсор
+fireball(aim())
+
+if me().hp < 45:
+    shield()
+`,
+    code: DEFAULT_SPELLS[0].code,
+  },
+  {
+    old: `# Ручной прицел: снаряд летит на курсор
+frostbolt(aim())
+
+if me().hp < 55:
+    heal()
+`,
+    code: DEFAULT_SPELLS[1].code,
+  },
+  {
+    old: `# Щит и огонь по направлению прицела
+if me().shield < 1:
+    shield()
+
+fireball(aim())
+`,
+    code: DEFAULT_SPELLS[2].code,
+  },
+  {
     old: `target = nearest(520)
 
 if target:
@@ -105,10 +133,10 @@ for offset in [-0.24, -0.12, 0, 0.12, 0.24]:
     description: "Стреляет по прицелу, держит щит и лечится.",
     code: `fireball(aim())
 
-if me().hp < 50 and me().shield < 1:
+if me().hp < 50 and ready("shield"):
     shield()
 
-if me().hp < 35:
+if me().hp < 35 and ready("heal"):
     heal()
 `,
   },
@@ -141,7 +169,7 @@ else:
 
 frostbolt(aim())
 
-if me().hp < 45:
+if me().hp < 45 and ready("heal"):
     heal()
 `,
   },
@@ -157,10 +185,10 @@ say("Слишком близко")
   {
     name: "Кровавый оберег",
     description: "Лечение, щит и огонь по прицелу.",
-    code: `if me().hp < 58:
+    code: `if me().hp < 58 and ready("heal"):
     heal()
 
-if me().shield < 1:
+if ready("shield"):
     shield()
 
 fireball(aim())
@@ -175,10 +203,10 @@ fireball(aim())
   {
     name: "Магический страж",
     description: "Щит, лечение и снаряд для неторопливой осады.",
-    code: `if me().shield < 1:
+    code: `if ready("shield"):
     shield()
 
-if me().hp < 48:
+if me().hp < 48 and ready("heal"):
     heal()
 
 if me().mana > 50:
@@ -313,3 +341,70 @@ export function saveSoundEnabled(enabled) {
 }
 
 export const SLOT_RUNES = ["I", "II", "III"];
+
+/* The spell language as the editor sees it: colours, completion and signatures.
+ * Argument strings show the player what to fill in; `element` picks the colour. */
+export const SPELL_API = [
+  { name: "fireball", args: "angle, speed=1.0", about: "Снаряд, 16 урона", element: "fire" },
+  { name: "meteor", args: "x, y, radius=120", about: "Три метеора через 1,15 с", element: "fire" },
+  { name: "frostbolt", args: "angle", about: "10 урона и замедление", element: "frost" },
+  { name: "beam", args: "angle, length=780, width=96", about: "Луч сквозь укрытия, 34 урона", element: "frost" },
+  { name: "chain_lightning", args: "angle, targets=3", about: "30 / 24 / 18 по цепочке", element: "storm" },
+  { name: "lightning_strike", args: "angle", about: "28 урона и оглушение", element: "storm" },
+  { name: "emp", args: "x, y", about: "Сжигает ману, стягивает врагов", element: "storm" },
+  { name: "spark_volley", args: "angle, count=8, spread=1.1", about: "Веер из искр, по 5 урона", element: "arcane" },
+  { name: "nova", args: "radius=150", about: "15 урона и отброс вокруг", element: "arcane" },
+  { name: "ward", args: "x, y", about: "Мина: 22 урона, до двух", element: "arcane" },
+  { name: "siphon", args: "angle, length=380, width=64", about: "18 урона и лечение", element: "blood" },
+  { name: "poison_cloud", args: "x, y, radius=110", about: "Яд: 6 урона за тик", element: "nature" },
+  { name: "heal", args: "", about: "+30 HP, перезарядка 4,5 с", element: "nature" },
+  { name: "shield", args: "", about: "Щит на 38, перезарядка 3 с", element: "guard" },
+  { name: "dash", args: "angle, dist=170", about: "Рывок на 60–260", element: "guard" },
+  { name: "blink", args: "x, y", about: "Перенос в свободную точку", element: "guard" },
+];
+
+export const SENSE_API = [
+  { name: "me", args: "", about: "Ваш маг: .hp .mana .shield .x .y" },
+  { name: "aim", args: "", about: "Угол прицела в радианах" },
+  { name: "cursor", args: "", about: "Точка под курсором: .x .y .dist" },
+  { name: "ready", args: "rune", about: "Хватит ли маны и готова ли руна" },
+  { name: "direction", args: "x, y", about: "Угол от мага к точке" },
+  { name: "distance", args: "x1, y1, x2, y2", about: "Расстояние между точками" },
+  { name: "log", args: "value", about: "Строка в «Печать»" },
+  { name: "print", args: "value", about: "То же, что log" },
+  { name: "say", args: "text", about: "Фраза над магом" },
+  { name: "rand", args: "a, b", about: "Случайное дробное" },
+  { name: "randi", args: "a, b", about: "Случайное целое" },
+  { name: "clamp", args: "value, low, high", about: "Ограничить диапазоном" },
+  { name: "sin", args: "a", about: "Синус" },
+  { name: "cos", args: "a", about: "Косинус" },
+  { name: "atan2", args: "y, x", about: "Угол по катетам" },
+  { name: "hypot", args: "x, y", about: "Длина вектора" },
+  { name: "sqrt", args: "x", about: "Квадратный корень" },
+  { name: "range", args: "n", about: "Числа для цикла" },
+  { name: "len", args: "items", about: "Длина коллекции" },
+  { name: "abs", args: "x", about: "Модуль числа" },
+  { name: "min", args: "a, b", about: "Меньшее" },
+  { name: "max", args: "a, b", about: "Большее" },
+  { name: "sum", args: "items", about: "Сумма списка" },
+  { name: "round", args: "x, digits=0", about: "Округление" },
+  { name: "int", args: "x", about: "К целому" },
+  { name: "float", args: "x", about: "К дробному" },
+  { name: "str", args: "x", about: "К строке" },
+  { name: "bool", args: "x", about: "К логическому" },
+];
+
+export const CONSTANT_API = ["PI", "TAU", "ARENA_W", "ARENA_H"];
+
+export const FIELD_API = [
+  { name: "hp", about: "Здоровье" },
+  { name: "max_hp", about: "Предел здоровья" },
+  { name: "mana", about: "Мана" },
+  { name: "max_mana", about: "Предел маны" },
+  { name: "shield", about: "Прочность щита" },
+  { name: "aim", about: "Угол прицела" },
+  { name: "name", about: "Имя мага" },
+  { name: "x", about: "Координата X" },
+  { name: "y", about: "Координата Y" },
+  { name: "dist", about: "Расстояние до курсора" },
+];

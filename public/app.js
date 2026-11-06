@@ -1,6 +1,7 @@
 /* Arcane 2D — browser client: local spellbook, networking, controls and UI. */
 
 import { SoundEngine } from "./js/audio.js";
+import { SpellEditor } from "./js/editor.js";
 import { ArenaRenderer } from "./js/renderer.js";
 import {
   EXAMPLES,
@@ -90,6 +91,11 @@ const dom = {
   spellName: $("spellName"),
   codeInput: $("codeInput"),
   lineNumbers: $("lineNumbers"),
+  codeLayer: $("codeLayer"),
+  codeComplete: $("codeComplete"),
+  codeCost: $("codeCost"),
+  codeDiagnostic: $("codeDiagnostic"),
+  pingValue: $("pingValue"),
   codeFilename: $("codeFilename"),
   spellsheetFilename: document.querySelector(".spell-file"),
   exampleSelect: $("exampleSelect"),
@@ -140,11 +146,14 @@ const client = {
     joy: null,
   },
   aim: 0,
-  prediction: { x: 950, y: 550, active: false, selfId: null },
+  prediction: { x: 950, y: 550, errorX: 0, errorY: 0, active: false, selfId: null },
+  rtt: 0,
   spells: loadSpellbook(),
+  checks: [{}, {}, {}],
   activeSlot: 0,
   cooldownEnd: 0,
   castPending: false,
+  castIntent: null,
   rollCooldownEnd: 0,
   rollPending: false,
   lastStateAt: 0,
@@ -153,6 +162,13 @@ const client = {
 
 const renderer = new ArenaRenderer(dom.canvas);
 const sound = new SoundEngine(loadSoundEnabled());
+const editor = new SpellEditor({
+  input: dom.codeInput,
+  layer: dom.codeLayer,
+  gutter: dom.lineNumbers,
+  popup: dom.codeComplete,
+  costOf: (name) => client.config.spell_costs?.[name],
+});
 
 let socket = null;
 let socketOpen = false;
@@ -165,6 +181,8 @@ let reconnectTimer = null;
 let inputTimer = null;
 let pingTimer = null;
 let saveTimer = null;
+let checkTimer = null;
+let checkTicket = 0;
 let consoleTimer = null;
 let vignetteTimer = null;
 let activeTouchId = null;
@@ -174,6 +192,13 @@ let lastCooldownSignature = "";
 let lastHealthSignature = "";
 let serverHello = null;
 let hasShownWelcome = false;
+let lastManaBand = "";
+
+// Local steps the server may not have applied yet: [{at, dx, dy}].
+const moveLog = [];
+const SNAP_DISTANCE = 170;
+const TICK_MS = 1000 / 30;
+const CAST_BUFFER_MS = 220;
 
 const keyboardMove = { up: false, down: false, left: false, right: false };
 const touchMove = { up: false, down: false, left: false, right: false };
@@ -286,6 +311,8 @@ function connect() {
     refreshJoinButton();
     updateLoginStatus("Портал открыт. Входите.", false);
     setTopbarConnection(true);
+    sendPing();
+    client.spells.forEach((_, slot) => sendCheck(slot));
     if (hasEnteredArena) {
       showConnectionBanner("Портал найден. Возвращаюсь…");
       const name = client.selfName || loadMageName();
@@ -316,6 +343,9 @@ function connect() {
     client.castPending = false;
     client.rollPending = false;
     client.rollCooldownEnd = 0;
+    client.castIntent = null;
+    client.rtt = 0;
+    dom.pingValue.hidden = true;
     clearMovement(false);
     updateSelfHud(localPlayer());
     setTopbarConnection(false);
@@ -445,6 +475,10 @@ function handleServerMessage(message) {
       handleCastResult(message);
       break;
     }
+    case "check_result": {
+      handleCheckResult(message);
+      break;
+    }
     case "roll_result": {
       handleRollResult(message);
       break;
@@ -497,8 +531,14 @@ function handleServerMessage(message) {
       }
       break;
     }
-    case "pong":
+    case "pong": {
+      if (typeof message.at !== "number") break;
+      const sample = Math.max(0, performance.now() - message.at);
+      client.rtt = client.rtt ? client.rtt * 0.7 + sample * 0.3 : sample;
+      dom.pingValue.textContent = `${Math.round(client.rtt)} мс`;
+      dom.pingValue.hidden = false;
       break;
+    }
     default:
       break;
   }
@@ -526,7 +566,7 @@ function sendInputNow() {
 function sendPing() {
   if (!socketIsOpen()) return;
   try {
-    socket.send(JSON.stringify({ t: "ping" }));
+    socket.send(JSON.stringify({ t: "ping", at: performance.now() }));
   } catch {
     /* noop */
   }
@@ -627,8 +667,18 @@ function handleEventFeedback(event) {
     }
     case "death": {
       addKillfeed(event);
+      if (selfId && event.killer_id === selfId && event.id !== selfId) {
+        const streak = Number(event.streak) || 0;
+        showToast(
+          streak >= 2
+            ? `${event.name} повержен · серия ${streak}`
+            : `${event.name} повержен`,
+          "combat",
+        );
+      }
       if (event.id === selfId) {
         client.prediction.active = false;
+        client.castIntent = null;
         clearMovement();
         flashVignette("hit");
         updateRespawnOverlay(event.respawn_in ?? 3);
@@ -641,9 +691,7 @@ function handleEventFeedback(event) {
     }
     case "respawn": {
       if (event.id === selfId && typeof event.x === "number") {
-        client.prediction.x = event.x;
-        client.prediction.y = event.y;
-        client.prediction.active = true;
+        placePrediction(event.x, event.y);
         client.prediction.selfId = selfId;
         client.rollCooldownEnd = 0;
         client.rollPending = false;
@@ -654,17 +702,13 @@ function handleEventFeedback(event) {
     }
     case "dash":
       if (event.id === selfId && typeof event.to_x === "number") {
-        client.prediction.x = event.to_x;
-        client.prediction.y = event.to_y;
-        client.prediction.active = true;
+        placePrediction(event.to_x, event.to_y);
       }
       if (near) sound.play("dash");
       break;
     case "roll":
       if (event.id === selfId && typeof event.x2 === "number") {
-        client.prediction.x = event.x2;
-        client.prediction.y = event.y2;
-        client.prediction.active = true;
+        placePrediction(event.x2, event.y2);
         client.rollPending = false;
       }
       if (near) sound.play("roll");
@@ -736,7 +780,7 @@ function handleCastResult(message) {
   client.castPending = false;
   const cooldown = Math.max(0, Number(message.cooldown) || 0);
   if (message.ok) {
-    client.cooldownEnd = performance.now() + (cooldown || castLockMs());
+    client.cooldownEnd = performance.now() + (cooldown ? cooldown * 1000 : castLockMs());
   } else if (cooldown > 0) {
     client.cooldownEnd = Math.max(
       client.cooldownEnd,
@@ -766,12 +810,84 @@ function handleCastResult(message) {
     }
   } else {
     const error = String(message.error || "Заклинание рассеялось.");
+    // A held button must not keep firing a spell that just failed.
+    client.castIntent = null;
     addConsoleEntry(error, "error");
     setConsoleStatus("ошибка", "error");
     showToast(error, "error");
     sound.play("error");
+    if (message.slot === client.activeSlot) showDiagnostic(error);
   }
   refreshCooldownUi(performance.now(), true);
+}
+
+// ---------------------------------------------------------------- spell check
+function errorLine(text) {
+  const match = String(text || "").match(/^Строка (\d+):/);
+  return match ? Number(match[1]) : null;
+}
+
+function showDiagnostic(error) {
+  dom.codeDiagnostic.hidden = !error;
+  dom.codeDiagnostic.textContent = error || "";
+  editor.setErrorLine(errorLine(error));
+}
+
+function costLabel(cost) {
+  if (!Array.isArray(cost)) return "";
+  const [low, high] = cost;
+  return low === high ? String(low) : `${low}–${high}`;
+}
+
+function sendCheck(slot) {
+  const spell = client.spells[slot];
+  if (!spell || !socketIsOpen()) return;
+  checkTicket += 1;
+  client.checks[slot].ticket = checkTicket;
+  try {
+    socket.send(
+      JSON.stringify({ t: "check", slot, ticket: checkTicket, code: spell.code }),
+    );
+  } catch {
+    /* The socket close handler will restore the portal. */
+  }
+}
+
+function scheduleCheck() {
+  if (checkTimer) window.clearTimeout(checkTimer);
+  const slot = client.activeSlot;
+  checkTimer = window.setTimeout(() => {
+    checkTimer = null;
+    sendCheck(slot);
+  }, 280);
+}
+
+function handleCheckResult(message) {
+  const check = client.checks[message.slot];
+  if (!check || message.ticket !== check.ticket) return;
+  check.ok = Boolean(message.ok);
+  check.error = message.ok ? "" : String(message.error || "");
+  if (message.ok) check.cost = message.cost;
+  if (message.slot === client.activeSlot) showCheck();
+  refreshHotbarCosts();
+}
+
+function showCheck() {
+  const check = client.checks[client.activeSlot] || {};
+  showDiagnostic(check.error);
+  const label = costLabel(check.cost);
+  dom.codeCost.textContent = label ? `${label} ◆` : "";
+  dom.codeCost.classList.toggle("stale", Boolean(check.error));
+}
+
+function refreshHotbarCosts() {
+  client.hotCards.forEach((card, index) => {
+    const check = client.checks[index] || {};
+    const cost = card.querySelector(".hot-cost");
+    if (cost) cost.textContent = check.error ? "ошибка" : costLabel(check.cost);
+    card.classList.toggle("broken", Boolean(check.error));
+  });
+  lastManaBand = "";
 }
 
 function castLockMs() {
@@ -806,31 +922,54 @@ function handleRollResult(message) {
   refreshCooldownUi(performance.now(), true);
 }
 
+function placePrediction(x, y) {
+  const prediction = client.prediction;
+  prediction.x = x;
+  prediction.y = y;
+  prediction.errorX = 0;
+  prediction.errorY = 0;
+  prediction.active = true;
+  moveLog.length = 0;
+}
+
+/**
+ * Compare the local mage with the server's, allowing for the steps still in
+ * flight: a snapshot is one round trip old, so replaying what we did since
+ * then shows where the server will have us. What remains is a real difference
+ * (knockback, a pull, a shove from another mage) and is eased in by frames.
+ */
 function reconcilePrediction() {
   const me = localPlayer();
   if (!me || me.dead) {
     client.prediction.active = false;
     return;
   }
-  if (client.prediction.selfId !== client.selfId || !client.prediction.active) {
-    client.prediction.x = me.x;
-    client.prediction.y = me.y;
-    client.prediction.active = true;
-    client.prediction.selfId = client.selfId;
+  const prediction = client.prediction;
+  if (prediction.selfId !== client.selfId || !prediction.active) {
+    placePrediction(me.x, me.y);
+    prediction.selfId = client.selfId;
     return;
   }
   if (me.stun) {
-    client.prediction.x = me.x;
-    client.prediction.y = me.y;
+    placePrediction(me.x, me.y);
     return;
   }
-  const error = Math.hypot(me.x - client.prediction.x, me.y - client.prediction.y);
-  if (error > 170) {
-    client.prediction.x = me.x;
-    client.prediction.y = me.y;
-  } else if (!movementActive() && error < 46) {
-    client.prediction.x += (me.x - client.prediction.x) * 0.32;
-    client.prediction.y += (me.y - client.prediction.y) * 0.32;
+  const horizon = performance.now() - clamp(client.rtt + TICK_MS, TICK_MS, 400);
+  while (moveLog.length && moveLog[0].at < horizon) moveLog.shift();
+
+  let x = me.x;
+  let y = me.y;
+  for (const step of moveLog) {
+    if (canStand(x + step.dx, y)) x += step.dx;
+    if (canStand(x, y + step.dy)) y += step.dy;
+  }
+  const errorX = x - prediction.x;
+  const errorY = y - prediction.y;
+  if (Math.hypot(errorX, errorY) > SNAP_DISTANCE) {
+    placePrediction(me.x, me.y);
+  } else {
+    prediction.errorX = errorX;
+    prediction.errorY = errorY;
   }
 }
 
@@ -841,37 +980,43 @@ function updatePrediction(dt) {
     client.prediction.active = false;
     return;
   }
+  const prediction = client.prediction;
+  const pull = 1 - Math.exp(-dt * 10);
+  prediction.x += prediction.errorX * pull;
+  prediction.y += prediction.errorY * pull;
+  prediction.errorX *= 1 - pull;
+  prediction.errorY *= 1 - pull;
   if (me.stun) return;
+
   const movement = combinedMovement();
   const dx = Number(movement.right) - Number(movement.left);
   const dy = Number(movement.down) - Number(movement.up);
   if (!dx && !dy) return;
   const length = Math.hypot(dx, dy) || 1;
   const speed = (Number(client.config.speed) || 238) * (me.slow ? 0.58 : 1);
-  const stepX = (dx / length) * speed * dt;
-  const stepY = (dy / length) * speed * dt;
-  const prediction = client.prediction;
+  const radius = client.config.player_radius || 18;
+  const { arena } = client.config;
+  const startX = prediction.x;
+  const startY = prediction.y;
 
-  if (stepX) {
-    const nextX = clamp(
-      prediction.x + stepX,
-      client.config.arena.border + (client.config.player_radius || 18),
-      client.config.arena.w -
-        client.config.arena.border -
-        (client.config.player_radius || 18),
-    );
-    if (canStand(nextX, prediction.y)) prediction.x = nextX;
-  }
-  if (stepY) {
-    const nextY = clamp(
-      prediction.y + stepY,
-      client.config.arena.border + (client.config.player_radius || 18),
-      client.config.arena.h -
-        client.config.arena.border -
-        (client.config.player_radius || 18),
-    );
-    if (canStand(prediction.x, nextY)) prediction.y = nextY;
-  }
+  const nextX = clamp(
+    startX + (dx / length) * speed * dt,
+    arena.border + radius,
+    arena.w - arena.border - radius,
+  );
+  if (canStand(nextX, startY)) prediction.x = nextX;
+  const nextY = clamp(
+    startY + (dy / length) * speed * dt,
+    arena.border + radius,
+    arena.h - arena.border - radius,
+  );
+  if (canStand(prediction.x, nextY)) prediction.y = nextY;
+
+  moveLog.push({
+    at: performance.now(),
+    dx: prediction.x - startX,
+    dy: prediction.y - startY,
+  });
 }
 
 function updateAimFromPointer() {
@@ -995,6 +1140,36 @@ function updateScoreboard(players) {
   dom.scoreList.append(fragment);
 }
 
+const KILL_GLYPHS = {
+  fire: "●",
+  frost: "◆",
+  spark: "✦",
+  beam: "═",
+  nova: "◎",
+  emp: "⌁",
+  chain: "⌁",
+  lightning: "↯",
+  meteor: "▼",
+  siphon: "♥",
+  poison: "☁",
+  ward: "✶",
+};
+
+const KILL_COLORS = {
+  fire: "#ff9a4d",
+  frost: "#7ce7ff",
+  spark: "#ffe17a",
+  beam: "#5fd8ff",
+  nova: "#b596ff",
+  emp: "#b38cff",
+  chain: "#c9f6ff",
+  lightning: "#9fd4ff",
+  meteor: "#ff7b45",
+  siphon: "#ff6b9e",
+  poison: "#86e08a",
+  ward: "#b596ff",
+};
+
 function addKillfeed(event) {
   if (!event.name) return;
   const line = document.createElement("div");
@@ -1010,7 +1185,8 @@ function addKillfeed(event) {
 
   const sigil = document.createElement("span");
   sigil.className = "feed-accent";
-  sigil.textContent = "✦";
+  sigil.textContent = KILL_GLYPHS[event.kind] || "✦";
+  sigil.style.color = KILL_COLORS[event.kind] || "";
 
   const victimElement = document.createElement("span");
   victimElement.className = "feed-name";
@@ -1066,20 +1242,37 @@ function showConnectionBanner(text) {
 }
 
 function showToast(text, kind = "") {
-  const message = String(text || "").trim();
+  const message = String(text || "").trim().slice(0, 220);
   if (!message) return;
+  const repeated = [...dom.toasts.children].find(
+    (item) => item.dataset.message === message && !item.classList.contains("fading"),
+  );
+  if (repeated) {
+    repeated.dataset.count = String(Number(repeated.dataset.count) + 1);
+    repeated.textContent = `${message} ×${repeated.dataset.count}`;
+    scheduleToastFade(repeated);
+    return;
+  }
   const toast = document.createElement("div");
   toast.className = `toast${kind ? ` ${kind}` : ""}`;
-  toast.textContent = message.slice(0, 220);
+  toast.dataset.message = message;
+  toast.dataset.count = "1";
+  toast.textContent = message;
   dom.toasts.append(toast);
   while (dom.toasts.children.length > 4) {
     dom.toasts.firstElementChild?.remove();
   }
-  window.setTimeout(() => {
+  scheduleToastFade(toast);
+}
+
+function scheduleToastFade(toast) {
+  window.clearTimeout(Number(toast.dataset.timer));
+  const timer = window.setTimeout(() => {
     if (!toast.isConnected) return;
     toast.classList.add("fading");
     window.setTimeout(() => toast.remove(), 420);
   }, 3800);
+  toast.dataset.timer = String(timer);
 }
 
 function flashVignette(kind) {
@@ -1120,6 +1313,19 @@ function addConsoleEntry(text, kind = "log") {
     dom.consoleOutput.firstElementChild?.remove();
   }
   dom.consoleOutput.scrollTop = dom.consoleOutput.scrollHeight;
+}
+
+/** Dim runes the mage cannot pay for right now; repaints only on a real change. */
+function refreshManaBand(me) {
+  const mana = Number(me?.mana) || 0;
+  const band = client.checks
+    .map((check) => (Array.isArray(check.cost) && mana + 0.5 < check.cost[0] ? 1 : 0))
+    .join("");
+  if (band === lastManaBand) return;
+  lastManaBand = band;
+  client.hotCards.forEach((card, index) => {
+    card.classList.toggle("no-mana", band[index] === "1");
+  });
 }
 
 function refreshCooldownUi(now, force = false) {
@@ -1165,6 +1371,7 @@ function refreshCooldownUi(now, force = false) {
     );
     card.style.setProperty("--cd", String(cd));
   }
+  refreshManaBand(me);
   if (dom.rollHint) {
     const rollRemaining = Math.max(0, client.rollCooldownEnd - now);
     dom.rollHint.textContent = stunned
@@ -1203,18 +1410,22 @@ function renderHotbar() {
     const cooldown = document.createElement("span");
     cooldown.className = "hot-cd";
     cooldown.setAttribute("aria-hidden", "true");
-    card.append(key, rune, title, cooldown);
+    const cost = document.createElement("span");
+    cost.className = "hot-cost";
+    cost.title = "Мана за каст";
+    card.append(key, rune, title, cost, cooldown);
 
     card.addEventListener("click", () => {
       sound.unlock();
       sound.play("click");
       selectSlot(index);
-      castSlot(index);
+      requestCast(index);
     });
     client.hotCards.push(card);
     dom.hotbar.append(card);
   });
   refreshSpellChrome();
+  refreshHotbarCosts();
 }
 
 function refreshSpellChrome() {
@@ -1254,18 +1465,12 @@ function selectSlot(index, options = {}) {
   dom.codeInput.value = spell.code;
   dom.codeInput.scrollTop = 0;
   dom.codeInput.scrollLeft = 0;
-  updateLineNumbers();
+  editor.closeCompletion();
+  editor.refresh();
   refreshSpellChrome();
+  showCheck();
   if (!options.skipSave) scheduleSave();
   if (options.focus) dom.codeInput.focus();
-}
-
-function updateLineNumbers() {
-  const lines = dom.codeInput.value.split("\n").length;
-  const parts = new Array(lines);
-  for (let index = 0; index < lines; index += 1) parts[index] = index + 1;
-  dom.lineNumbers.textContent = parts.join("\n");
-  dom.lineNumbers.scrollTop = dom.codeInput.scrollTop;
 }
 
 function scheduleSave() {
@@ -1283,10 +1488,6 @@ function saveSpellbookNow() {
   }
   syncEditorState();
   saveSpellbook(client.spells);
-}
-
-function dispatchEditorInput() {
-  dom.codeInput.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function setupEditor() {
@@ -1333,11 +1534,10 @@ function setupEditor() {
     const spell = client.spells[client.activeSlot];
     if (!spell) return;
     spell.code = dom.codeInput.value.slice(0, 12000);
-    updateLineNumbers();
+    editor.refresh();
+    editor.updateCompletion();
     scheduleSave();
-  });
-  dom.codeInput.addEventListener("scroll", () => {
-    dom.lineNumbers.scrollTop = dom.codeInput.scrollTop;
+    scheduleCheck();
   });
   dom.codeInput.addEventListener("keydown", handleEditorKeydown);
   dom.codeInput.addEventListener("focus", () => {
@@ -1358,9 +1558,10 @@ function setupEditor() {
     dom.codeInput.value = example.code;
     dom.codeInput.scrollTop = 0;
     dom.codeInput.scrollLeft = 0;
-    updateLineNumbers();
+    editor.refresh();
     refreshSpellChrome();
     saveSpellbookNow();
+    sendCheck(client.activeSlot);
     sound.play("click");
     addConsoleEntry(`Свиток «${example.name}» перенесён в руну.`, "system");
     showToast(`Свиток «${example.name}» загружен.`);
@@ -1368,7 +1569,7 @@ function setupEditor() {
 
   dom.castButton.addEventListener("click", () => {
     sound.unlock();
-    castActive();
+    requestCast(client.activeSlot);
   });
 
   renderHotbar();
@@ -1377,6 +1578,7 @@ function setupEditor() {
 
 function handleEditorKeydown(event) {
   if (event.isComposing) return;
+  if (editor.handleKey(event)) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
     event.preventDefault();
     saveSpellbookNow();
@@ -1402,12 +1604,7 @@ function handleEditorKeydown(event) {
 }
 
 function applyEditorEdit(start, end, text, selectionStart, selectionEnd) {
-  dom.codeInput.setRangeText(text, start, end, "end");
-  dispatchEditorInput();
-  dom.codeInput.setSelectionRange(
-    clamp(selectionStart, 0, dom.codeInput.value.length),
-    clamp(selectionEnd, 0, dom.codeInput.value.length),
-  );
+  editor.replaceRange(start, end, text, selectionStart, selectionEnd);
 }
 
 function applyTabKey(outdent) {
@@ -1706,11 +1903,7 @@ function castSlot(index) {
   }
 
   const now = performance.now();
-  if (client.castPending) return;
-  if (now < client.cooldownEnd) {
-    sound.play("error");
-    return;
-  }
+  if (client.castPending || now < client.cooldownEnd) return;
   if (index === client.activeSlot) syncEditorState();
 
   updateAimFromPointer();
@@ -1744,8 +1937,31 @@ function castSlot(index) {
   }
 }
 
-function castActive() {
-  castSlot(client.activeSlot);
+/** Ask for a cast: right now if the grimoire is ready, otherwise the moment it is. */
+function requestCast(index, held = false) {
+  const now = performance.now();
+  client.castIntent = { slot: index, held, until: now + CAST_BUFFER_MS };
+  if (now >= client.cooldownEnd && !client.castPending) castSlot(index);
+}
+
+function releaseCast() {
+  const intent = client.castIntent;
+  if (!intent) return;
+  intent.held = false;
+  intent.until = performance.now() + CAST_BUFFER_MS;
+}
+
+function runCastIntent(now) {
+  const intent = client.castIntent;
+  if (!intent) return;
+  if (!intent.held && now > intent.until) {
+    client.castIntent = null;
+    return;
+  }
+  if (now < client.cooldownEnd || client.castPending) return;
+  const me = localPlayer();
+  if (!client.joined || !socketIsOpen() || !me || me.dead || me.stun) return;
+  castSlot(intent.slot);
 }
 
 function rollCooldownMs() {
@@ -1873,8 +2089,11 @@ function setupPointer() {
     if (event.button !== 0 && event.button !== 2) return;
     updatePointerPosition(event);
     updateAimFromPointer();
-    castActive();
+    requestCast(client.activeSlot, true);
     event.preventDefault();
+  });
+  window.addEventListener("pointerup", (event) => {
+    if (event.pointerType !== "touch") releaseCast();
   });
 
   dom.canvas.addEventListener("pointermove", (event) => {
@@ -1925,7 +2144,7 @@ function setupKeyboard() {
       if (!client.joined) return;
       event.preventDefault();
       sound.unlock();
-      castActive();
+      requestCast(client.activeSlot);
       return;
     }
     if (event.key === "Escape") {
@@ -1945,16 +2164,18 @@ function setupKeyboard() {
 
     if (event.key === "1" || event.key === "2" || event.key === "3") {
       event.preventDefault();
+      if (event.repeat) return;
       const index = Number(event.key) - 1;
       sound.unlock();
       selectSlot(index);
-      castSlot(index);
+      requestCast(index, true);
       return;
     }
     if (event.key === " " || event.code === "Space") {
       event.preventDefault();
+      if (event.repeat) return;
       sound.unlock();
-      castActive();
+      requestCast(client.activeSlot, true);
       return;
     }
     if (
@@ -1977,6 +2198,7 @@ function setupKeyboard() {
   });
 
   window.addEventListener("keyup", (event) => {
+    if (event.key === " " || ["1", "2", "3"].includes(event.key)) releaseCast();
     const direction = MOVE_KEYS[event.code];
     if (!direction) return;
     if (keyboardMove[direction]) {
@@ -1987,6 +2209,7 @@ function setupKeyboard() {
 
   window.addEventListener("blur", () => {
     clearMovement();
+    client.castIntent = null;
     client.pointer.inside = false;
   });
 
@@ -2012,7 +2235,7 @@ function startNetworkTimers() {
     }, 120);
   }
   if (!pingTimer) {
-    pingTimer = window.setInterval(sendPing, 20000);
+    pingTimer = window.setInterval(sendPing, 2000);
   }
 }
 
@@ -2052,6 +2275,7 @@ function animate(now) {
 
   updateAimFromPointer();
   updatePrediction(dt);
+  runCastIntent(now);
   renderer.draw(client, now);
   refreshCooldownUi(now);
 
@@ -2098,8 +2322,3 @@ function boot() {
 }
 
 boot();
-
-
-
-
-
