@@ -46,18 +46,18 @@ class SpellRuntimeError(SpellError):
 
 @dataclass(frozen=True, slots=True)
 class UnitView:
-    """Read-only snapshot of another mage, exposed inside spell code."""
+    """Read-only snapshot of an enemy or an ally, exposed inside spell code."""
 
     id: int
     name: str
+    kind: str
     x: float
     y: float
     hp: float
     max_hp: float
-    mana: float
-    shield: float
     dist: float
-    bot: bool
+    boss: bool
+    dead: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +200,6 @@ _ALLOWED_NODES: set[type[ast.AST]] = {
 
 _BANNED_NAMES = {
     "__import__",
-    "breakpoint",
     "compile",
     "delattr",
     "eval",
@@ -1217,6 +1216,34 @@ class Interpreter:
         finally:
             self.call_depth -= 1
         return None
+
+
+def call_function(
+    source: str, globals_: Mapping[str, Any], name: str, args: Iterable[Any]
+) -> Any:
+    """Run a program, then call one of the functions it defined.
+
+    This is how a task checks real code: what a function returns for given
+    input, under the same limits as a cast.
+    """
+
+    interpreter = Interpreter(source, globals_)
+    interpreter.run()
+    function = interpreter.root.values.get(name)
+    if not isinstance(function, _UserFunction):
+        raise SpellRuntimeError(f"Функция {name} не найдена.")
+    try:
+        return interpreter._call_user_function(
+            function, list(args), {}, function.body[0]
+        )
+    except SpellError:
+        raise
+    except RecursionError:
+        raise SpellRuntimeError("Заклинание ушло в слишком глубокую рекурсию.") from None
+    except (MemoryError, OverflowError):
+        raise SpellRuntimeError("Заклинание потребовало слишком много ресурсов.") from None
+    except Exception:
+        raise SpellRuntimeError("Внутренняя ошибка заклинания.") from None
 
 
 def execute_spell(source: str, globals_: Mapping[str, Any]) -> int:

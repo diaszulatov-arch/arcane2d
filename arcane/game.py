@@ -12,6 +12,7 @@ from .interpreter import (
     PointView,
     SpellError,
     SpellRuntimeError,
+    UnitView,
     execute_spell,
     safe_globals,
     spell_text,
@@ -73,6 +74,7 @@ POISON_DAMAGE = 6.0
 ROLL_DISTANCE = 165.0
 ROLL_COOLDOWN = 1.6
 ROLL_INVULN = 0.22
+BOT_MAX_HUMANS = 1
 BOT_DODGE_CHANCE = 0.55
 BOT_DODGE_LOOKAHEAD = 0.38
 BOT_PROJECTILE_SPEED = 575.0
@@ -120,6 +122,7 @@ SPAWNS = [
     {"x": 950, "y": 770},
 ]
 
+SHIELD_POWER = 38.0
 SPELL_COSTS = {
     "fireball": 11,
     "frostbolt": 9,
@@ -158,6 +161,19 @@ class Player:
     aim: float = 0.0
     hp: float = MAX_HP
     mana: float = MAX_MANA
+    max_hp: float = MAX_HP
+    max_mana: float = MAX_MANA
+    mana_regen: float = MANA_REGEN
+    hp_regen: float = 0.0
+    radius: float = PLAYER_RADIUS
+    speed: float = MOVE_SPEED
+    cast_lock: float = CAST_LOCK
+    roll_cooldown: float = ROLL_COOLDOWN
+    perks: Any = None
+    role: str = ""
+    shield_power: float = SHIELD_POWER
+    skill_ready: dict[str, float] = field(default_factory=dict)
+    curses: dict[str, float] = field(default_factory=dict)
     score: int = 0
     deaths: int = 0
     streak: int = 0
@@ -174,6 +190,8 @@ class Player:
     roll_ready_at: float = 0.0
     dead: bool = False
     respawn_at: float = 0.0
+    revive: float = 0.0
+    spawned_at: float = 0.0
     is_bot: bool = False
     input: Input = field(default_factory=Input)
     next_bot_cast: float = 0.0
@@ -187,6 +205,12 @@ class Player:
     def __post_init__(self) -> None:
         self.last_x = self.x
         self.last_y = self.y
+
+    @property
+    def reach(self) -> float:
+        """How much further than an ordinary mage this body can be touched."""
+
+        return self.radius - PLAYER_RADIUS
 
 
 @dataclass(slots=True)
@@ -203,6 +227,7 @@ class Projectile:
     life: float
     color: str
     slow_until: float = 0.0
+    mana_burn: float = 0.0
 
 
 @dataclass(slots=True)
@@ -366,6 +391,7 @@ class SpellSession:
         self.meteors = 0
         self.siphons = 0
         self.clouds = 0
+        self.spent: list[str] = []
 
     # -------------------------------------------------------------- read side
     def me(self) -> OwnView:
@@ -375,9 +401,9 @@ class SpellSession:
             x=round(player.x, 2),
             y=round(player.y, 2),
             hp=round(player.hp, 1),
-            max_hp=MAX_HP,
+            max_hp=player.max_hp,
             mana=round(player.mana, 1),
-            max_mana=MAX_MANA,
+            max_mana=player.max_mana,
             shield=round(player.shield, 1),
             aim=round(player.aim, 4),
         )
@@ -386,7 +412,7 @@ class SpellSession:
         return self.player.aim
 
     def cursor(self) -> PointView | None:
-        if self.cursor_x is None or self.cursor_y is None:
+        if self.cursor_x is None or self.cursor_y is None or self._jammed():
             return None
         return PointView(
             x=round(self.cursor_x, 2),
@@ -400,21 +426,65 @@ class SpellSession:
             ),
         )
 
+    def _jammed(self) -> bool:
+        return self.arena.radar_jammed(self.player)
+
+    def enemies(self) -> list[UnitView] | None:
+        """Everyone this mage can hurt, in no useful order: sorting is the player's job."""
+
+        if self._jammed():
+            return None
+        views = []
+        for other in self.arena.targets_for(self.player.id):
+            kind, boss = self.arena.describe_target(other)
+            views.append(self._view(other, kind, boss))
+        return views
+
+    def allies(self) -> list[UnitView] | None:
+        """The whole party, this mage and the fallen included."""
+
+        if self._jammed():
+            return None
+        return [
+            self._view(mate, mate.role or "mage", False)
+            for mate in self.arena.players.values()
+        ]
+
+    def _view(self, other: Player, kind: str, boss: bool) -> UnitView:
+        player = self.player
+        return UnitView(
+            id=other.id,
+            name=other.name,
+            kind=kind,
+            x=round(other.x, 2),
+            y=round(other.y, 2),
+            hp=round(other.hp, 1),
+            max_hp=other.max_hp,
+            dist=round(math.hypot(other.x - player.x, other.y - player.y), 2),
+            boss=boss,
+            dead=other.dead,
+        )
+
     def ready(self, name: Any) -> bool:
         """Whether a rune can be cast right now, so spells need not fail to find out."""
 
-        if name not in SPELL_COSTS:
+        costs = self.arena.rune_costs()
+        if name not in costs:
             raise SpellRuntimeError(f"Неизвестная руна: {str(name)[:32]}.")
         player = self.player
+        if not self.arena.rune_known(name, player):
+            return False
+        if self.arena.skill_wait(player, name) > 0:
+            return False
         if name == "shield" and (
             self.now < player.shield_ready_at or player.shield > 0.5
         ):
             return False
         if name == "heal" and (
-            self.now < player.heal_ready_at or player.hp >= MAX_HP - 0.5
+            self.now < player.heal_ready_at or player.hp >= player.max_hp - 0.5
         ):
             return False
-        return self.actions < MAX_SPELL_ACTIONS and player.mana + 1e-6 >= SPELL_COSTS[name]
+        return self.actions < MAX_SPELL_ACTIONS and player.mana + 1e-6 >= costs[name]
 
     def direction(self, x: Any, y: Any) -> float:
         target_x = _api_number(x, "x")
@@ -447,6 +517,7 @@ class SpellSession:
             )
         self.player.mana -= cost
         self.actions += 1
+        self.spent.append(action)
 
     def fireball(self, angle: Any, speed: Any = 1.0) -> None:
         angle = _api_angle(angle)
@@ -582,7 +653,7 @@ class SpellSession:
             raise SpellRuntimeError("В одном заклинании возможен только один блинк.")
         target_x = _api_number(x, "x")
         target_y = _api_number(y, "y")
-        if not self.arena.can_stand(target_x, target_y):
+        if not self.arena.can_blink(self.player, target_x, target_y):
             raise SpellRuntimeError("Туда нельзя переместиться: препятствие или край арены.")
         self._spend(SPELL_COSTS["blink"], "blink")
         self.blinks += 1
@@ -610,7 +681,7 @@ class SpellSession:
         if self.player.shield > 0.5:
             raise SpellRuntimeError("Щит уже активен.")
         self._spend(SPELL_COSTS["shield"], "shield")
-        self.player.shield = 38.0
+        self.player.shield = self.player.shield_power
         self.player.shield_until = self.now + 4.2
         self.player.shield_ready_at = self.now + 3.0
         self.arena.emit({"e": "shield", "id": self.player.id})
@@ -620,10 +691,10 @@ class SpellSession:
             raise SpellRuntimeError(
                 f"Исцеление будет готово через {max(0.1, self.player.heal_ready_at - self.now):.1f} с."
             )
-        if self.player.hp >= MAX_HP - 0.5:
+        if self.player.hp >= self.player.max_hp - 0.5:
             raise SpellRuntimeError("Здоровье уже полное.")
         self._spend(SPELL_COSTS["heal"], "heal")
-        healed = min(30.0, MAX_HP - self.player.hp)
+        healed = min(30.0, self.player.max_hp - self.player.hp)
         self.player.hp += healed
         self.player.heal_ready_at = self.now + 4.5
         self.arena.emit(
@@ -653,11 +724,9 @@ class SpellSession:
                 "color": player.color,
             }
         )
-        for other in list(self.arena.players.values()):
-            if other.id == player.id or other.dead:
-                continue
+        for other in self.arena.targets_for(player.id):
             distance = math.hypot(other.x - player.x, other.y - player.y)
-            if distance <= radius:
+            if distance <= radius + other.reach:
                 self.arena.damage(
                     target=other,
                     amount=15.0,
@@ -681,7 +750,7 @@ class SpellSession:
         dy = math.sin(angle)
         start_x = player.x + dx * (PLAYER_RADIUS + 6)
         start_y = player.y + dy * (PLAYER_RADIUS + 6)
-        end_x, end_y = _ray_arena_end(start_x, start_y, dx, dy, length)
+        end_x, end_y = self.arena.ray_end(start_x, start_y, dx, dy, length)
 
         self.arena.emit(
             {
@@ -696,14 +765,12 @@ class SpellSession:
             }
         )
         half_width = width * 0.5 + PLAYER_RADIUS
-        for other in list(self.arena.players.values()):
-            if other.id == player.id or other.dead:
-                continue
+        for other in self.arena.targets_for(player.id):
             if (
                 _segment_circle_distance(
                     start_x, start_y, end_x, end_y, other.x, other.y
                 )
-                <= half_width
+                <= half_width + other.reach
             ):
                 self.arena.damage(
                     target=other,
@@ -724,10 +791,7 @@ class SpellSession:
             raise SpellRuntimeError(
                 f"E.M.P. можно создать не дальше {int(EMP_RANGE)} единиц от себя."
             )
-        if not (
-            BORDER + 8 <= target_x <= ARENA_W - BORDER - 8
-            and BORDER + 8 <= target_y <= ARENA_H - BORDER - 8
-        ):
+        if not self.arena.inside_field(target_x, target_y):
             raise SpellRuntimeError("E.M.P. нужно навести внутрь арены.")
         self._spend(SPELL_COSTS["emp"], "E.M.P.")
         self.emps_placed += 1
@@ -768,19 +832,17 @@ class SpellSession:
         start_y = player.y + dy * (PLAYER_RADIUS + 6)
         first: Player | None = None
         best_projection = float("inf")
-        for other in self.arena.players.values():
-            if other.id == player.id or other.dead:
-                continue
+        for other in self.arena.targets_for(player.id):
             offset_x = other.x - player.x
             offset_y = other.y - player.y
             distance = math.hypot(offset_x, offset_y)
-            if distance > CHAIN_RANGE:
+            if distance > CHAIN_RANGE + other.reach:
                 continue
             projection = offset_x * dx + offset_y * dy
             if projection < 0:
                 continue
             lateral = abs(offset_x * -dy + offset_y * dx)
-            if lateral > CHAIN_WIDTH:
+            if lateral > CHAIN_WIDTH + other.reach:
                 continue
             if projection < best_projection:
                 first = other
@@ -795,12 +857,8 @@ class SpellSession:
             previous = selected[-1]
             next_target: Player | None = None
             nearest = float("inf")
-            for other in self.arena.players.values():
-                if (
-                    other.id == player.id
-                    or other.dead
-                    or other in selected
-                ):
+            for other in self.arena.targets_for(player.id):
+                if other in selected:
                     continue
                 distance = math.hypot(other.x - previous.x, other.y - previous.y)
                 if distance <= CHAIN_JUMP_RANGE and distance < nearest:
@@ -840,19 +898,17 @@ class SpellSession:
         dy = math.sin(angle)
         target_player: Player | None = None
         best_projection = float("inf")
-        for other in self.arena.players.values():
-            if other.id == player.id or other.dead:
-                continue
+        for other in self.arena.targets_for(player.id):
             offset_x = other.x - player.x
             offset_y = other.y - player.y
             distance = math.hypot(offset_x, offset_y)
-            if distance > STRIKE_RANGE:
+            if distance > STRIKE_RANGE + other.reach:
                 continue
             projection = offset_x * dx + offset_y * dy
             if projection < 0:
                 continue
             lateral = abs(offset_x * -dy + offset_y * dx)
-            if lateral > STRIKE_WIDTH:
+            if lateral > STRIKE_WIDTH + other.reach:
                 continue
             if projection < best_projection:
                 target_player = other
@@ -898,10 +954,7 @@ class SpellSession:
             raise SpellRuntimeError(
                 f"Метеорит можно призвать не дальше {int(METEOR_RANGE)} единиц от себя."
             )
-        if not (
-            BORDER + 8 <= target_x <= ARENA_W - BORDER - 8
-            and BORDER + 8 <= target_y <= ARENA_H - BORDER - 8
-        ):
+        if not self.arena.inside_field(target_x, target_y):
             raise SpellRuntimeError("Метеорит нужно навести внутрь арены.")
         radius = max(80.0, min(160.0, _api_number(radius, "radius")))
         self._spend(SPELL_COSTS["meteor"], "meteor")
@@ -921,18 +974,16 @@ class SpellSession:
         dy = math.sin(angle)
         start_x = player.x + dx * (PLAYER_RADIUS + 6)
         start_y = player.y + dy * (PLAYER_RADIUS + 6)
-        end_x, end_y = _ray_arena_end(start_x, start_y, dx, dy, length)
+        end_x, end_y = self.arena.ray_end(start_x, start_y, dx, dy, length)
         half_width = width * 0.5 + PLAYER_RADIUS
         total_lost = 0.0
         hits = 0
-        for other in list(self.arena.players.values()):
-            if other.id == player.id or other.dead:
-                continue
+        for other in self.arena.targets_for(player.id):
             if (
                 _segment_circle_distance(
                     start_x, start_y, end_x, end_y, other.x, other.y
                 )
-                <= half_width
+                <= half_width + other.reach
             ):
                 total_lost += self.arena.damage(
                     target=other,
@@ -945,7 +996,7 @@ class SpellSession:
                 hits += 1
         healed = min(SIPHON_MAX_HEAL, total_lost * SIPHON_HEAL_RATIO)
         if healed > 0.0:
-            player.hp = min(MAX_HP, player.hp + healed)
+            player.hp = min(player.max_hp, player.hp + healed)
         self.arena.emit(
             {
                 "e": "siphon",
@@ -970,10 +1021,7 @@ class SpellSession:
             raise SpellRuntimeError(
                 f"Облако можно создать не дальше {int(POISON_CLOUD_RANGE)} единиц от себя."
             )
-        if not (
-            BORDER + 8 <= target_x <= ARENA_W - BORDER - 8
-            and BORDER + 8 <= target_y <= ARENA_H - BORDER - 8
-        ):
+        if not self.arena.inside_field(target_x, target_y):
             raise SpellRuntimeError("Облако нужно навести внутрь арены.")
         radius = max(70.0, min(150.0, _api_number(radius, "radius")))
         self._spend(SPELL_COSTS["poison_cloud"], "poison_cloud")
@@ -997,7 +1045,7 @@ class SpellSession:
             return
         parts: list[str] = []
         for value in values:
-            if isinstance(value, OwnView):
+            if isinstance(value, (OwnView, UnitView)):
                 parts.append(f"{value.name} ({value.hp:.0f} HP)")
             elif isinstance(value, PointView):
                 parts.append(f"точка ({value.x:.1f}, {value.y:.1f})")
@@ -1006,8 +1054,14 @@ class SpellSession:
         line = " ".join(parts)[:220]
         self.logs.append(line)
 
+    def _sealed(self, name: str) -> Any:
+        def rune(*_args: Any, **_kwargs: Any) -> None:
+            raise SpellRuntimeError(f"Руна {name} ещё не изучена.")
+
+        return rune
+
     def globals(self) -> dict[str, Any]:
-        return safe_globals(
+        api = safe_globals(
             {
                 "me": self.me,
                 "aim": self.aim,
@@ -1034,10 +1088,19 @@ class SpellSession:
                 "say": self.say,
                 "log": self.log,
                 "print": self.log,
-                "ARENA_W": ARENA_W,
-                "ARENA_H": ARENA_H,
+                "ARENA_W": self.arena.field_w,
+                "ARENA_H": self.arena.field_h,
             }
         )
+        for name in SPELL_COSTS:
+            if not self.arena.rune_known(name, self.player):
+                api[name] = self._sealed(name)
+        if self.arena.radar:
+            for name, read in (("enemies", self.enemies), ("allies", self.allies)):
+                known = self.arena.rune_known(name, self.player)
+                api[name] = read if known else self._sealed(name)
+        api.update(self.arena.extra_runes(self))
+        return api
 
 
 def _api_number(value: Any, name: str) -> float:
@@ -1054,6 +1117,11 @@ def _api_angle(value: Any) -> float:
 
 
 class Arena:
+    field_w = ARENA_W
+    field_h = ARENA_H
+    # Aim is a human skill on the arena. Elsewhere, reading the field is the point.
+    radar = False
+
     def __init__(self, *, bots: int = 2, fill_to: int = 0) -> None:
         self.players: dict[int, Player] = {}
         self.projectiles: list[Projectile] = []
@@ -1071,14 +1139,102 @@ class Arena:
         self._next_cloud_id = 1
         self._last_tick = 0.0
         self.bots_wanted = max(0, min(6, bots))
-        # With ``fill_to`` the spirits top the arena up to that many mages and
-        # step aside as people arrive, so nobody opens an empty room.
+        # With ``fill_to`` the spirits top the arena up to that many mages, so
+        # nobody opens an empty room. Once two people meet, they leave them to it.
         self.fill_to = max(0, min(6, fill_to))
         self._spawn_bots()
+
+    # ------------------------------------------------- what other worlds change
+    def targets_for(self, owner_id: int) -> list[Player]:
+        """Who this caster can hurt: on the arena, everyone but themselves."""
+
+        return [
+            player
+            for player in self.players.values()
+            if player.id != owner_id and not player.dead
+        ]
+
+    def actor(self, actor_id: int) -> Player | None:
+        return self.players.get(actor_id)
+
+    def describe_target(self, target: Player) -> tuple[str, bool]:
+        """What ``enemies()`` reports about a target: its kind and whether it is a boss."""
+
+        return "mage", False
+
+    def radar_jammed(self, player: Player) -> bool:
+        """Whether a dungeon curse has turned this mage's lookups into None."""
+
+        return False
+
+    def rune_known(self, name: str, player: Player | None = None) -> bool:
+        return True
+
+    def rune_costs(self) -> dict[str, int]:
+        return SPELL_COSTS
+
+    def skill_wait(self, player: Player, name: str) -> float:
+        """Seconds until a role skill comes back. The arena has no such thing."""
+
+        return 0.0
+
+    def extra_runes(self, session: SpellSession) -> dict[str, Any]:
+        return {}
+
+    def shot_held(self, projectile: Projectile) -> bool:
+        """Whether a shot stands still this tick instead of flying."""
+
+        return False
+
+    def shot_turned(
+        self, projectile: Projectile, old_x: float, old_y: float, new_x: float, new_y: float
+    ) -> bool:
+        """Whether something turned a shot aside during this step."""
+
+        return False
+
+    def inside_field(self, x: float, y: float) -> bool:
+        return (
+            BORDER + 8 <= x <= ARENA_W - BORDER - 8
+            and BORDER + 8 <= y <= ARENA_H - BORDER - 8
+        )
+
+    def can_blink(self, player: Player, x: float, y: float) -> bool:
+        return self.can_stand(x, y)
+
+    def ray_end(
+        self, x: float, y: float, dx: float, dy: float, length: float
+    ) -> tuple[float, float]:
+        return _ray_arena_end(x, y, dx, dy, length)
+
+    def shot_blocked(
+        self, old_x: float, old_y: float, new_x: float, new_y: float, radius: float
+    ) -> bool:
+        return (
+            new_x < BORDER + 10
+            or new_x > ARENA_W - BORDER - 10
+            or new_y < BORDER + 10
+            or new_y > ARENA_H - BORDER - 10
+            or any(
+                _segment_circle_distance(
+                    old_x, old_y, new_x, new_y, obstacle["x"], obstacle["y"]
+                )
+                <= obstacle["r"] + radius
+                for obstacle in OBSTACLES
+            )
+        )
+
+    def _update_world(self, now: float, dt: float) -> None:
+        """A tick's worth of whatever this world adds to the shared simulation."""
+
+    def _tick_dead(self, player: Player) -> None:
+        if self.now >= player.respawn_at:
+            self._respawn(player)
 
     # ------------------------------------------------------------------ setup
     def world_config(self) -> dict[str, Any]:
         return {
+            "mode": "arena",
             "arena": {"w": ARENA_W, "h": ARENA_H, "border": BORDER},
             "obstacles": OBSTACLES,
             "spawns": SPAWNS,
@@ -1098,6 +1254,8 @@ class Arena:
 
     def _bots_needed(self) -> int:
         humans = sum(1 for player in self.players.values() if not player.is_bot)
+        if humans > BOT_MAX_HUMANS:
+            return 0
         return max(self.bots_wanted, self.fill_to - humans)
 
     def _spawn_bots(self) -> None:
@@ -1140,7 +1298,7 @@ class Arena:
             bot_style=bot_style,
         )
         self._next_player_id += 1
-        player.aim = math.atan2(ARENA_H / 2 - player.y, ARENA_W / 2 - player.x)
+        player.aim = math.atan2(self.field_h / 2 - player.y, self.field_w / 2 - player.x)
         player.invuln_until = self.now + 1.5
         if is_bot:
             player.next_bot_cast = self.now + random.uniform(0.8, 2.0)
@@ -1231,7 +1389,7 @@ class Arena:
 
         start_x, start_y = player.x, player.y
         player.x, player.y = destination
-        player.roll_ready_at = self.now + ROLL_COOLDOWN
+        player.roll_ready_at = self.now + player.roll_cooldown
         player.invuln_until = max(player.invuln_until, self.now + ROLL_INVULN)
         self.emit(
             {
@@ -1248,7 +1406,7 @@ class Arena:
         )
         return {
             "ok": True,
-            "cooldown": ROLL_COOLDOWN,
+            "cooldown": player.roll_cooldown,
             "distance": ROLL_DISTANCE,
             "invuln": ROLL_INVULN,
         }
@@ -1308,7 +1466,7 @@ class Arena:
             except (TypeError, ValueError):
                 pass
 
-        player.cast_ready_at = self.now + CAST_LOCK
+        player.cast_ready_at = self.now + player.cast_lock
         player.last_cast_at = self.now
         session = SpellSession(
             self,
@@ -1329,9 +1487,10 @@ class Arena:
             "ok": error is None,
             "error": error,
             "log": session.logs,
+            "runes": session.spent,
             "actions": session.actions,
             "slot": int(slot) if isinstance(slot, int) else 0,
-            "cooldown": CAST_LOCK,
+            "cooldown": player.cast_lock,
         }
 
     def spawn_projectile(
@@ -1570,14 +1729,20 @@ class Arena:
             return None
         return (x, y)
 
+    def _clamp_x(self, x: float, radius: float) -> float:
+        return max(BORDER + radius, min(ARENA_W - BORDER - radius, x))
+
+    def _clamp_y(self, y: float, radius: float) -> float:
+        return max(BORDER + radius, min(ARENA_H - BORDER - radius, y))
+
     def try_move(self, player: Player, dx: float, dy: float) -> None:
         if dx:
-            nx = max(BORDER + PLAYER_RADIUS, min(ARENA_W - BORDER - PLAYER_RADIUS, player.x + dx))
-            if self.can_stand(nx, player.y):
+            nx = self._clamp_x(player.x + dx, player.radius)
+            if self.can_stand(nx, player.y, player.radius):
                 player.x = nx
         if dy:
-            ny = max(BORDER + PLAYER_RADIUS, min(ARENA_H - BORDER - PLAYER_RADIUS, player.y + dy))
-            if self.can_stand(player.x, ny):
+            ny = self._clamp_y(player.y + dy, player.radius)
+            if self.can_stand(player.x, ny, player.radius):
                 player.y = ny
 
     def displace(self, player: Player, from_x: float, from_y: float, amount: float) -> None:
@@ -1612,6 +1777,7 @@ class Arena:
 
         self._update_statuses(dt)
         self._update_bots(now)
+        self._update_world(now, dt)
         self._move_players(dt)
         self._separate_players()
         self._update_projectiles(dt)
@@ -1625,12 +1791,13 @@ class Arena:
     def _update_statuses(self, dt: float) -> None:
         for player in self.players.values():
             if player.dead:
-                if self.now >= player.respawn_at:
-                    self._respawn(player)
+                self._tick_dead(player)
                 continue
-            player.mana = min(MAX_MANA, player.mana + MANA_REGEN * dt)
+            player.mana = min(player.max_mana, player.mana + player.mana_regen * dt)
+            regen = player.hp_regen
             if self.now - player.last_damage_at > 7.0:
-                player.hp = min(MAX_HP, player.hp + 1.4 * dt)
+                regen += 1.4
+            player.hp = min(player.max_hp, player.hp + regen * dt)
             if player.shield_until and self.now >= player.shield_until:
                 player.shield = 0.0
                 player.shield_until = 0.0
@@ -1754,7 +1921,7 @@ class Arena:
                 continue
             if player.stun_until > self.now:
                 continue
-            speed = MOVE_SPEED
+            speed = player.speed
             if player.slow_until > self.now:
                 speed *= 0.58
             movement = player.input
@@ -1786,6 +1953,9 @@ class Arena:
     def _update_projectiles(self, dt: float) -> None:
         alive: list[Projectile] = []
         for projectile in self.projectiles:
+            if self.shot_held(projectile):
+                alive.append(projectile)
+                continue
             projectile.life -= dt
             if projectile.life <= 0:
                 continue
@@ -1793,20 +1963,11 @@ class Arena:
             new_x = old_x + math.cos(projectile.angle) * projectile.speed * dt
             new_y = old_y + math.sin(projectile.angle) * projectile.speed * dt
 
-            hit_obstacle = any(
-                _segment_circle_distance(
-                    old_x, old_y, new_x, new_y, obstacle["x"], obstacle["y"]
-                )
-                <= obstacle["r"] + projectile.radius
-                for obstacle in OBSTACLES
-            )
-            if (
-                new_x < BORDER + 10
-                or new_x > ARENA_W - BORDER - 10
-                or new_y < BORDER + 10
-                or new_y > ARENA_H - BORDER - 10
-                or hit_obstacle
-            ):
+            if self.shot_turned(projectile, old_x, old_y, new_x, new_y):
+                alive.append(projectile)
+                continue
+
+            if self.shot_blocked(old_x, old_y, new_x, new_y, projectile.radius):
                 self.emit(
                     {
                         "e": "impact",
@@ -1820,12 +1981,8 @@ class Arena:
 
             target: Player | None = None
             best_distance = 1e9
-            for candidate in self.players.values():
-                if (
-                    candidate.id == projectile.owner
-                    or candidate.dead
-                    or candidate.invuln_until > self.now
-                ):
+            for candidate in self.targets_for(projectile.owner):
+                if candidate.invuln_until > self.now:
                     continue
                 distance = _segment_circle_distance(
                     old_x,
@@ -1835,11 +1992,11 @@ class Arena:
                     candidate.x,
                     candidate.y,
                 )
-                if distance <= PLAYER_RADIUS + projectile.radius and distance < best_distance:
+                if distance <= candidate.radius + projectile.radius and distance < best_distance:
                     target = candidate
                     best_distance = distance
             if target is not None:
-                owner = self.players.get(projectile.owner)
+                owner = self.actor(projectile.owner)
                 self.damage(
                     target=target,
                     amount=projectile.damage,
@@ -1850,6 +2007,8 @@ class Arena:
                 )
                 if projectile.slow_until:
                     target.slow_until = max(target.slow_until, projectile.slow_until)
+                if projectile.mana_burn:
+                    target.mana = max(0.0, target.mana - projectile.mana_burn)
                 self.emit(
                     {
                         "e": "impact",
@@ -1872,13 +2031,11 @@ class Arena:
             if not emp.pulled and self.now >= emp.pull_at:
                 emp.pulled = True
                 pull_hits = 0
-                for candidate in list(self.players.values()):
-                    if candidate.id == emp.owner or candidate.dead:
-                        continue
+                for candidate in self.targets_for(emp.owner):
                     if candidate.invuln_until > self.now:
                         continue
                     distance = math.hypot(candidate.x - emp.x, candidate.y - emp.y)
-                    if distance > emp.radius:
+                    if distance > emp.radius + candidate.reach:
                         continue
                     pull_hits += 1
                     if distance > 4.0:
@@ -1904,16 +2061,14 @@ class Arena:
                 remaining.append(emp)
                 continue
 
-            owner = self.players.get(emp.owner)
+            owner = self.actor(emp.owner)
             total_drained = 0.0
             hit_count = 0
-            for candidate in list(self.players.values()):
-                if candidate.id == emp.owner or candidate.dead:
-                    continue
+            for candidate in self.targets_for(emp.owner):
                 if candidate.invuln_until > self.now:
                     continue
                 distance = math.hypot(candidate.x - emp.x, candidate.y - emp.y)
-                if distance > emp.radius:
+                if distance > emp.radius + candidate.reach:
                     continue
 
                 hit_count += 1
@@ -1954,14 +2109,15 @@ class Arena:
                 continue
             triggered = False
             if self.now >= ward.armed_at:
-                for candidate in self.players.values():
-                    if candidate.id == ward.owner or candidate.dead:
-                        continue
-                    if math.hypot(candidate.x - ward.x, candidate.y - ward.y) <= ward.trigger_radius:
+                for candidate in self.targets_for(ward.owner):
+                    if (
+                        math.hypot(candidate.x - ward.x, candidate.y - ward.y)
+                        <= ward.trigger_radius + candidate.reach
+                    ):
                         triggered = True
                         break
             if triggered:
-                owner = self.players.get(ward.owner)
+                owner = self.actor(ward.owner)
                 self.emit(
                     {
                         "e": "ward_blast",
@@ -1971,11 +2127,9 @@ class Arena:
                         "color": owner.color if owner else "#b596ff",
                     }
                 )
-                for candidate in list(self.players.values()):
-                    if candidate.id == ward.owner or candidate.dead:
-                        continue
+                for candidate in self.targets_for(ward.owner):
                     distance = math.hypot(candidate.x - ward.x, candidate.y - ward.y)
-                    if distance <= ward.blast_radius:
+                    if distance <= ward.blast_radius + candidate.reach:
                         self.damage(
                             target=candidate,
                             amount=ward.damage,
@@ -1995,12 +2149,11 @@ class Arena:
             if self.now < meteor.impact_at:
                 remaining.append(meteor)
                 continue
-            owner = self.players.get(meteor.owner)
+            owner = self.actor(meteor.owner)
             hits = 0
-            for candidate in list(self.players.values()):
-                if candidate.id == meteor.owner or candidate.dead:
-                    continue
-                if math.hypot(candidate.x - meteor.x, candidate.y - meteor.y) > meteor.radius:
+            for candidate in self.targets_for(meteor.owner):
+                distance = math.hypot(candidate.x - meteor.x, candidate.y - meteor.y)
+                if distance > meteor.radius + candidate.reach:
                     continue
                 hits += 1
                 self.damage(
@@ -2041,12 +2194,11 @@ class Arena:
                 )
                 continue
             if self.now >= cloud.next_tick:
-                owner = self.players.get(cloud.owner)
+                owner = self.actor(cloud.owner)
                 hits = 0
-                for candidate in list(self.players.values()):
-                    if candidate.id == cloud.owner or candidate.dead:
-                        continue
-                    if math.hypot(candidate.x - cloud.x, candidate.y - cloud.y) > cloud.radius:
+                for candidate in self.targets_for(cloud.owner):
+                    distance = math.hypot(candidate.x - cloud.x, candidate.y - cloud.y)
+                    if distance > cloud.radius + candidate.reach:
                         continue
                     hits += 1
                     self.damage(
@@ -2168,8 +2320,8 @@ class Arena:
         player.y = spawn["y"]
         player.last_x = player.x
         player.last_y = player.y
-        player.hp = MAX_HP
-        player.mana = MAX_MANA
+        player.hp = player.max_hp
+        player.mana = player.max_mana
         player.shield = 0.0
         player.shield_until = 0.0
         player.shield_ready_at = 0.0
@@ -2182,7 +2334,7 @@ class Arena:
         player.last_damage_at = -100.0
         player.input = Input()
         player.next_bot_cast = self.now + random.uniform(0.8, 1.8)
-        player.aim = math.atan2(ARENA_H / 2 - player.y, ARENA_W / 2 - player.x)
+        player.aim = math.atan2(self.field_h / 2 - player.y, self.field_w / 2 - player.x)
         self.emit(
             {
                 "e": "respawn",
@@ -2206,6 +2358,8 @@ class Arena:
                     "aim": round(player.aim, 3),
                     "hp": round(player.hp, 1),
                     "mana": round(player.mana, 1),
+                    "max_hp": player.max_hp,
+                    "max_mana": player.max_mana,
                     "shield": round(player.shield, 1),
                     "score": player.score,
                     "deaths": player.deaths,

@@ -3,15 +3,22 @@
 import { SoundEngine } from "./js/audio.js";
 import { SpellEditor } from "./js/editor.js";
 import { ArenaRenderer } from "./js/renderer.js";
+import { StoryUi } from "./js/story.js";
 import {
   EXAMPLES,
   SLOT_RUNES,
+  SPELL_API,
+  STORY_ONLY,
   loadMageName,
+  loadMode,
   loadSoundEnabled,
   loadSpellbook,
+  loadToken,
   saveMageName,
+  saveMode,
   saveSoundEnabled,
   saveSpellbook,
+  useSpellbook,
 } from "./js/content.js";
 
 const TAU = Math.PI * 2;
@@ -121,6 +128,7 @@ const dom = {
   damageVignette: $("damageVignette"),
   loginOverlay: $("loginOverlay"),
   loginCard: $("loginCard"),
+  modeCards: [...document.querySelectorAll(".mode-card")],
   loginFooterDot: document.querySelector(".login-footer .status-dot"),
   topbarDot: document.querySelector(".online-pill .status-dot"),
 };
@@ -138,6 +146,16 @@ const client = {
   emps: [],
   meteors: [],
   clouds: [],
+  monsters: [],
+  hazards: [],
+  pickups: [],
+  terminals: [],
+  barriers: [],
+  breakpoints: [],
+  role: "",
+  story: null,
+  closedDoors: new Set(),
+  mode: loadMode(),
   pointer: {
     x: window.innerWidth / 2,
     y: window.innerHeight / 2,
@@ -168,6 +186,21 @@ const editor = new SpellEditor({
   gutter: dom.lineNumbers,
   popup: dom.codeComplete,
   costOf: (name) => client.config.spell_costs?.[name],
+  isKnown: (name) => {
+    const skill = client.config.skills?.[name];
+    if (skill) return skill.open && skill.role === client.role;
+    return client.config.runes ? client.config.runes.includes(name) : !STORY_ONLY.has(name);
+  },
+});
+const story = new StoryUi({
+  send: sendMessage,
+  sound,
+  toast: (text, kind) => showToast(text, kind),
+  costOf: (name) => client.config.spell_costs?.[name],
+  onTerminal: () => {
+    client.castIntent = null;
+    clearMovement();
+  },
 });
 
 let socket = null;
@@ -193,6 +226,8 @@ let lastHealthSignature = "";
 let serverHello = null;
 let hasShownWelcome = false;
 let lastManaBand = "";
+let pendingStoryName = "";
+let partyCode = "";
 
 // Local steps the server may not have applied yet: [{at, dx, dy}].
 const moveLog = [];
@@ -259,10 +294,30 @@ function mergeWorldConfig(config) {
   client.config = next;
 }
 
+/** The client's copy of the dungeon check, so walking feels instant. */
+function canStandInDungeon(x, y, radius) {
+  const { tiles, tile } = client.config;
+  const left = Math.floor((x - radius) / tile);
+  const right = Math.floor((x + radius) / tile);
+  const top = Math.floor((y - radius) / tile);
+  const bottom = Math.floor((y + radius) / tile);
+  for (let ty = top; ty <= bottom; ty += 1) {
+    for (let tx = left; tx <= right; tx += 1) {
+      const open = tiles[ty]?.[tx] === "." && !client.closedDoors.has(`${tx},${ty}`);
+      if (open) continue;
+      const nearestX = clamp(x, tx * tile, (tx + 1) * tile);
+      const nearestY = clamp(y, ty * tile, (ty + 1) * tile);
+      if ((x - nearestX) ** 2 + (y - nearestY) ** 2 < radius * radius) return false;
+    }
+  }
+  return true;
+}
+
 function canStand(x, y) {
   const arena = client.config.arena;
   const border = arena.border;
   const radius = client.config.player_radius || 18;
+  if (client.config.tiles) return canStandInDungeon(x, y, radius);
   if (
     x < border + radius ||
     x > arena.w - border - radius ||
@@ -313,7 +368,9 @@ function connect() {
     setTopbarConnection(true);
     sendPing();
     client.spells.forEach((_, slot) => sendCheck(slot));
-    if (hasEnteredArena) {
+    if (pendingStoryName) {
+      sendProfile();
+    } else if (hasEnteredArena) {
       showConnectionBanner("Портал найден. Возвращаюсь…");
       const name = client.selfName || loadMageName();
       if (name) sendJoinNow(name);
@@ -351,7 +408,7 @@ function connect() {
     setTopbarConnection(false);
     refreshJoinButton();
     refreshCooldownUi(performance.now(), true);
-    if (hasEnteredArena) {
+    if (hasEnteredArena || pendingStoryName) {
       showConnectionBanner("Связь с ареной потеряна. Восстанавливаю портал…");
     } else {
       updateLoginStatus("Портал закрыт. Открываю заново…", true);
@@ -362,6 +419,22 @@ function connect() {
   ws.addEventListener("error", () => {
     /* The close event carries the retry logic. */
   });
+}
+
+function sendMessage(message) {
+  if (!socketIsOpen()) {
+    showToast("Нет связи с порталом.", "error");
+    return;
+  }
+  try {
+    socket.send(JSON.stringify(message));
+  } catch {
+    /* The socket close handler will restore the portal. */
+  }
+}
+
+function sendProfile() {
+  sendMessage({ t: "profile", token: loadToken(), name: pendingStoryName });
 }
 
 function scheduleReconnect() {
@@ -479,6 +552,50 @@ function handleServerMessage(message) {
       handleCheckResult(message);
       break;
     }
+    case "profile": {
+      handleProfile(message);
+      break;
+    }
+    case "profile_update": {
+      story.updateProfile(message.profile);
+      if (message.error) showToast(message.error, "error");
+      else sound.play("heal");
+      break;
+    }
+    case "party": {
+      partyCode = String(message.code || "");
+      story.setParty(message);
+      break;
+    }
+    case "party_left": {
+      partyCode = "";
+      story.clearParty();
+      break;
+    }
+    case "party_error": {
+      story.setError(String(message.error || "Портал не пропустил вас."));
+      break;
+    }
+    case "stage_start": {
+      enterDungeon(message);
+      break;
+    }
+    case "stage_end": {
+      leaveDungeon(message);
+      break;
+    }
+    case "terminal_state": {
+      story.terminalState(message);
+      break;
+    }
+    case "terminal_help": {
+      story.terminalHelp(message);
+      break;
+    }
+    case "fix_result": {
+      story.fixResult(message);
+      break;
+    }
     case "roll_result": {
       handleRollResult(message);
       break;
@@ -589,6 +706,17 @@ function handleState(message) {
   client.emps = Array.isArray(message.emps) ? message.emps : [];
   client.meteors = Array.isArray(message.meteors) ? message.meteors : [];
   client.clouds = Array.isArray(message.clouds) ? message.clouds : [];
+  client.monsters = Array.isArray(message.monsters) ? message.monsters : [];
+  client.hazards = Array.isArray(message.hazards) ? message.hazards : [];
+  client.pickups = Array.isArray(message.pickups) ? message.pickups : [];
+  client.terminals = Array.isArray(message.terminals) ? message.terminals : [];
+  client.barriers = Array.isArray(message.barriers) ? message.barriers : [];
+  client.breakpoints = Array.isArray(message.breakpoints) ? message.breakpoints : [];
+  client.story = message.story || null;
+  if (client.story) {
+    client.closedDoors = new Set(client.story.doors.map(([x, y]) => `${x},${y}`));
+    story.updateHud(message, client.selfId);
+  }
 
   if (message.stats && typeof message.stats === "object") {
     const online =
@@ -622,6 +750,7 @@ function processEvents(events) {
     if (!event || typeof event !== "object") continue;
     renderer.handleEvent(event, client);
     handleEventFeedback(event);
+    story.handleEvent(event, client.selfId);
   }
 }
 
@@ -655,6 +784,35 @@ function handleEventFeedback(event) {
     case "impact":
       if (near) sound.play("impact");
       break;
+    case "fix_done":
+      sound.play("respawn");
+      break;
+    case "rollback":
+      if (event.id === selfId) placePrediction(event.x, event.y);
+      sound.play("respawn");
+      break;
+    case "patch":
+      sound.play("heal");
+      break;
+    case "sudo":
+      sound.play("shield");
+      break;
+    case "segfault":
+      sound.play("nova");
+      break;
+    case "hijack":
+    case "scan":
+      sound.play("emp_pull");
+      break;
+    case "breakpoint":
+      sound.play("frost");
+      break;
+    case "gate_open":
+      sound.play("emp");
+      break;
+    case "gate_lift":
+      sound.play("emp_blast");
+      break;
     case "hit": {
       if (event.id === selfId) {
         if ((Number(event.amount) || 0) > 0) flashVignette("hit");
@@ -681,7 +839,7 @@ function handleEventFeedback(event) {
         client.castIntent = null;
         clearMovement();
         flashVignette("hit");
-        updateRespawnOverlay(event.respawn_in ?? 3);
+        if (!client.story) updateRespawnOverlay(event.respawn_in ?? 3);
         showToast(`Вас поверг ${event.killer || "Арена"}.`, "error");
         sound.play("death");
       } else if (near) {
@@ -821,6 +979,111 @@ function handleCastResult(message) {
   refreshCooldownUi(performance.now(), true);
 }
 
+// --------------------------------------------------------------------- story
+function chooseMode(mode) {
+  client.mode = mode;
+  saveMode(mode);
+  dom.modeCards.forEach((card) => {
+    const active = card.dataset.mode === mode;
+    card.classList.toggle("active", active);
+    card.setAttribute("aria-checked", String(active));
+  });
+  refreshJoinButton();
+}
+
+function setupModes() {
+  dom.modeCards.forEach((card) => {
+    card.addEventListener("click", () => {
+      sound.unlock();
+      sound.play("click");
+      chooseMode(card.dataset.mode);
+    });
+  });
+  chooseMode(client.mode);
+}
+
+function useModeSpellbook(mode) {
+  saveSpellbookNow();
+  useSpellbook(mode);
+  client.spells = loadSpellbook();
+  client.checks = [{}, {}, {}];
+  selectSlot(0, { force: true, skipSave: true });
+  renderHotbar();
+  client.spells.forEach((_, slot) => sendCheck(slot));
+}
+
+function beginStory(name) {
+  pendingStoryName = name;
+  if (socketIsOpen()) sendProfile();
+  else connect();
+}
+
+function handleProfile(message) {
+  dom.connectionBanner.hidden = true;
+  dom.body.classList.add("in-camp");
+  useModeSpellbook("story");
+  story.setProfile(message);
+  for (const role of message.roles?.roles || []) {
+    if (EXAMPLES.some((example) => example.role === role.key)) continue;
+    EXAMPLES.push({ name: `Роль: ${role.title}`, code: role.example, role: role.key });
+  }
+  // A dropped connection walks straight back to its seat.
+  if (partyCode) sendMessage({ t: "party_join", code: partyCode });
+}
+
+function enterDungeon(message) {
+  client.config = { ...DEFAULT_WORLD };
+  mergeWorldConfig(message.config);
+  client.selfId = Number(message.you) || null;
+  client.joined = true;
+  client.players = new Map();
+  client.monsters = [];
+  client.hazards = [];
+  client.pickups = [];
+  client.terminals = [];
+  client.barriers = [];
+  client.breakpoints = [];
+  client.role = String(message.role || "");
+  client.projectiles = [];
+  client.wards = [];
+  client.emps = [];
+  client.meteors = [];
+  client.clouds = [];
+  client.closedDoors = new Set();
+  client.prediction.active = false;
+  client.prediction.selfId = null;
+  moveLog.length = 0;
+  lastScoreSignature = "";
+  const start = message.config.rooms?.[0];
+  if (start) {
+    const { tile } = message.config;
+    renderer.resetScene((start.x + start.w / 2) * tile, (start.y + start.h / 2) * tile);
+  }
+  dom.body.classList.remove("in-camp");
+  dom.body.classList.add("in-game", "story-mode");
+  dom.hudName.textContent = pendingStoryName || client.selfName;
+  story.enterStage(message);
+  rebuildExamples();
+  editor.closeCompletion();
+  refreshCooldownUi(performance.now(), true);
+  sound.play("join");
+}
+
+function leaveDungeon(message) {
+  client.joined = false;
+  client.selfId = null;
+  client.castIntent = null;
+  client.cooldownEnd = 0;
+  clearMovement(false);
+  dom.body.classList.remove("in-game", "story-mode");
+  dom.body.classList.add("in-camp");
+  dom.respawnOverlay.hidden = true;
+  story.leaveStage();
+  story.setResult(message);
+  story.showCamp();
+  sound.play(message.result === "cleared" ? "respawn" : "death");
+}
+
 // ---------------------------------------------------------------- spell check
 function errorLine(text) {
   const match = String(text || "").match(/^Строка (\d+):/);
@@ -891,7 +1154,8 @@ function refreshHotbarCosts() {
 }
 
 function castLockMs() {
-  return Math.max(0.1, Number(client.config.cast_lock) || 0.72) * 1000;
+  const lock = Number(localPlayer()?.cast_lock) || Number(client.config.cast_lock) || 0.72;
+  return Math.max(0.1, lock) * 1000;
 }
 
 function handleRollResult(message) {
@@ -993,7 +1257,7 @@ function updatePrediction(dt) {
   const dy = Number(movement.down) - Number(movement.up);
   if (!dx && !dy) return;
   const length = Math.hypot(dx, dy) || 1;
-  const speed = (Number(client.config.speed) || 238) * (me.slow ? 0.58 : 1);
+  const speed = (Number(me.speed) || Number(client.config.speed) || 238) * (me.slow ? 0.58 : 1);
   const radius = client.config.player_radius || 18;
   const { arena } = client.config;
   const startX = prediction.x;
@@ -1047,19 +1311,21 @@ function updateSelfHud(me) {
     updateRespawnOverlay(0);
     return;
   }
-  const hp = clamp(Number(me.hp) || 0, 0, 100);
-  const mana = clamp(Number(me.mana) || 0, 0, 100);
+  const hp = Math.max(0, Number(me.hp) || 0);
+  const mana = Math.max(0, Number(me.mana) || 0);
+  const hpShare = clamp((hp / (Number(me.max_hp) || 100)) * 100, 0, 100);
+  const manaShare = clamp((mana / (Number(me.max_mana) || 100)) * 100, 0, 100);
   const dead = Boolean(me.dead);
   const stunned = Boolean(me.stun) && !dead;
-  dom.hpFill.style.width = `${hp}%`;
-  dom.manaFill.style.width = `${mana}%`;
+  dom.hpFill.style.width = `${hpShare}%`;
+  dom.manaFill.style.width = `${manaShare}%`;
   const healthSignature =
     `${Math.round(hp)}:${Math.round(mana)}:${dead}:${stunned}:${client.connected}`;
   if (healthSignature !== lastHealthSignature) {
     lastHealthSignature = healthSignature;
     dom.hpText.textContent = String(Math.round(hp));
     dom.manaText.textContent = String(Math.round(mana));
-    dom.localHud.classList.toggle("low-health", !dead && hp < 36);
+    dom.localHud.classList.toggle("low-health", !dead && hpShare < 36);
     dom.hudAlive.classList.toggle("dead", dead || !client.connected);
     dom.hudAlive.textContent = !client.connected
       ? "НЕТ СВЯЗИ"
@@ -1070,7 +1336,9 @@ function updateSelfHud(me) {
           : "В БОЮ";
   }
   dom.hudName.textContent = me.name || client.selfName || "Безымянный";
-  if (dead) {
+  if (dead && client.story) {
+    updateRespawnOverlay(0);
+  } else if (dead) {
     updateRespawnOverlay(Math.max(0, Number(me.respawn_in) || 0));
   } else {
     updateRespawnOverlay(0);
@@ -1233,7 +1501,7 @@ function refreshJoinButton() {
   if (!label) return;
   if (fatalError) label.textContent = "Портал закрыт";
   else if (waiting) label.textContent = "Открываю портал…";
-  else label.textContent = "Войти в арену";
+  else label.textContent = client.mode === "story" ? "Начать сюжет" : "Войти в арену";
 }
 
 function showConnectionBanner(text) {
@@ -1490,13 +1758,33 @@ function saveSpellbookNow() {
   saveSpellbook(client.spells);
 }
 
-function setupEditor() {
-  for (const [index, example] of EXAMPLES.entries()) {
+const RUNE_NAMES = SPELL_API.map((entry) => entry.name);
+
+/** In the campaign a scroll is only offered once its runes have been studied. */
+function rebuildExamples() {
+  const known = client.config.runes;
+  const usesRadar = (example) => example.code.includes("enemies(");
+  const usable = EXAMPLES.map((example, index) => ({ example, index })).filter(({ example }) => {
+    if (example.role) return example.role === client.role;
+    if (!known) return !usesRadar(example);
+    return (
+      RUNE_NAMES.every(
+        (name) => known.includes(name) || !new RegExp(`\\b${name}\\(`).test(example.code),
+      ) &&
+      (!usesRadar(example) || known.includes("enemies"))
+    );
+  });
+  const options = usable.map(({ example, index }) => {
     const option = document.createElement("option");
     option.value = String(index);
     option.textContent = example.name;
-    dom.exampleSelect.append(option);
-  }
+    return option;
+  });
+  dom.exampleSelect.replaceChildren(dom.exampleSelect.options[0], ...options);
+}
+
+function setupEditor() {
+  rebuildExamples();
 
   dom.spellTabs.forEach((tab, index) => {
     tab.addEventListener("click", () => {
@@ -1585,107 +1873,7 @@ function handleEditorKeydown(event) {
     showToast("Гримуар сохранён в вашей башне.");
     return;
   }
-  if (event.key === "Tab") {
-    event.preventDefault();
-    applyTabKey(event.shiftKey);
-    return;
-  }
-  if (
-    event.key === "Enter" &&
-    !event.shiftKey &&
-    !event.ctrlKey &&
-    !event.metaKey &&
-    !event.altKey &&
-    dom.codeInput.selectionStart === dom.codeInput.selectionEnd
-  ) {
-    event.preventDefault();
-    applyAutoIndent();
-  }
-}
-
-function applyEditorEdit(start, end, text, selectionStart, selectionEnd) {
-  editor.replaceRange(start, end, text, selectionStart, selectionEnd);
-}
-
-function applyTabKey(outdent) {
-  const input = dom.codeInput;
-  const value = input.value;
-  const selectionStart = input.selectionStart;
-  const selectionEnd = input.selectionEnd;
-
-  if (selectionStart === selectionEnd) {
-    if (!outdent) {
-      applyEditorEdit(selectionStart, selectionEnd, "    ", selectionStart + 4, selectionStart + 4);
-      return;
-    }
-    const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
-    const linePrefix = value.slice(lineStart, selectionStart);
-    const match = linePrefix.match(/^( {1,4}|\t)/);
-    if (!match) return;
-    const remove = match[0].length;
-    applyEditorEdit(
-      lineStart,
-      lineStart + remove,
-      "",
-      Math.max(lineStart, selectionStart - remove),
-      Math.max(lineStart, selectionEnd - remove),
-    );
-    return;
-  }
-
-  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
-  let lineEnd = value.indexOf("\n", selectionEnd);
-  if (lineEnd === -1) lineEnd = value.length;
-  const block = value.slice(lineStart, lineEnd);
-  const lines = block.split("\n");
-  let deltaFirst = 0;
-  let deltaTotal = 0;
-  let changed;
-  if (outdent) {
-    changed = lines
-      .map((line, index) => {
-        const match = line.match(/^( {1,4}|\t)/);
-        const remove = match ? match[0].length : 0;
-        if (index === 0) deltaFirst -= remove;
-        deltaTotal -= remove;
-        return line.slice(remove);
-      })
-      .join("\n");
-  } else {
-    changed = lines
-      .map((line, index) => {
-        if (index === 0) deltaFirst += 4;
-        deltaTotal += 4;
-        return `    ${line}`;
-      })
-      .join("\n");
-  }
-  applyEditorEdit(
-    lineStart,
-    lineEnd,
-    changed,
-    Math.max(lineStart, selectionStart + deltaFirst),
-    Math.max(lineStart, selectionEnd + deltaTotal),
-  );
-}
-
-function applyAutoIndent() {
-  const input = dom.codeInput;
-  const value = input.value;
-  const position = input.selectionStart;
-  const lineStart = value.lastIndexOf("\n", position - 1) + 1;
-  const before = value.slice(lineStart, position);
-  const indentMatch = before.match(/^[ \t]*/);
-  const indent = indentMatch ? indentMatch[0] : "";
-  const extra = before.trimEnd().endsWith(":") ? "    " : "";
-  const insert = `\n${indent}${extra}`;
-  applyEditorEdit(
-    position,
-    position,
-    insert,
-    position + insert.length,
-    position + insert.length,
-  );
+  editor.handleEditingKey(event);
 }
 
 // --------------------------------------------------------------------- panels
@@ -1833,10 +2021,14 @@ function handleLoginSubmit(event) {
     return;
   }
   setLoginError("");
-  pendingJoinName = name;
   saveMageName(name);
   dom.nameInput.value = name;
   sound.unlock();
+  if (client.mode === "story") {
+    beginStory(name);
+    return;
+  }
+  pendingJoinName = name;
   refreshJoinButton();
   if (socketIsOpen()) {
     sendJoinNow(name);
@@ -1854,6 +2046,7 @@ function setupLogin() {
 
 // --------------------------------------------------------------------- moving
 function combinedMovement() {
+  if (story.terminalTask) return { up: false, down: false, left: false, right: false };
   return {
     up: keyboardMove.up || touchMove.up,
     down: keyboardMove.down || touchMove.down,
@@ -1939,6 +2132,7 @@ function castSlot(index) {
 
 /** Ask for a cast: right now if the grimoire is ready, otherwise the moment it is. */
 function requestCast(index, held = false) {
+  if (story.terminalTask) return;
   const now = performance.now();
   client.castIntent = { slot: index, held, until: now + CAST_BUFFER_MS };
   if (now >= client.cooldownEnd && !client.castPending) castSlot(index);
@@ -1965,11 +2159,13 @@ function runCastIntent(now) {
 }
 
 function rollCooldownMs() {
-  return Math.max(0.1, Number(client.config.roll?.cooldown) || 1.6) * 1000;
+  const cooldown =
+    Number(localPlayer()?.roll_cooldown) || Number(client.config.roll?.cooldown) || 1.6;
+  return Math.max(0.1, cooldown) * 1000;
 }
 
 function requestRoll() {
-  if (!client.joined || !socketIsOpen()) return;
+  if (!client.joined || !socketIsOpen() || story.terminalTask) return;
   const me = localPlayer();
   if (!me || me.dead) return;
   if (me.stun) {
@@ -2148,6 +2344,11 @@ function setupKeyboard() {
       return;
     }
     if (event.key === "Escape") {
+      if (story.closeLog()) return;
+      if (story.terminalTask) {
+        story.closeTerminal();
+        return;
+      }
       if (!dom.apiModal.hidden) {
         closeApiModal();
         return;
@@ -2159,9 +2360,17 @@ function setupKeyboard() {
     }
     if (event.defaultPrevented) return;
     if (!dom.apiModal.hidden) return;
-    if (isTypingTarget(event.target)) return;
+    if (isTypingTarget(event.target) || story.terminalTask) return;
     if (!client.joined) return;
 
+    if (event.code === "KeyE" && !event.repeat && client.story) {
+      if (story.openTerminal()) event.preventDefault();
+      return;
+    }
+    if (event.code === "KeyL" && !event.repeat && client.story) {
+      story.toggleLog();
+      return;
+    }
     if (event.key === "1" || event.key === "2" || event.key === "3") {
       event.preventDefault();
       if (event.repeat) return;
@@ -2305,6 +2514,7 @@ function boot() {
   booted = true;
 
   setupLogin();
+  setupModes();
   setupEditor();
   setupPanels();
   setupModal();

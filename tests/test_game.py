@@ -330,22 +330,29 @@ class BotTests(unittest.TestCase):
     def test_the_arena_fills_up_and_makes_room_for_people(self) -> None:
         arena = Arena(bots=0, fill_to=4)
         self.assertEqual(arena.online_counts()["bots"], 4)
-        first = arena.add_player("Первый")
+        arena.add_player("Первый")
         arena.update(arena.now + 1 / TICK_RATE)
         self.assertEqual(arena.online_counts()["bots"], 3)
-        for name in ("Два", "Три", "Четыре", "Пять"):
-            arena.add_player(name)
-        arena.update(arena.now + 1 / TICK_RATE)
-        self.assertEqual(arena.online_counts()["bots"], 0)
-        arena.remove_player(first.id)
-        arena.update(arena.now + 1 / TICK_RATE)
-        self.assertEqual(arena.online_counts()["bots"], 0)
 
-    def test_a_fixed_count_ignores_the_crowd(self) -> None:
+    def test_two_people_are_enough_to_send_the_spirits_away(self) -> None:
+        arena = Arena(bots=0, fill_to=4)
+        arena.add_player("Первый")
+        second = arena.add_player("Второй")
+        arena.update(arena.now + 1 / TICK_RATE)
+        self.assertEqual(arena.online_counts(), {"humans": 2, "bots": 0, "online": 2})
+        self.assertFalse([player for player in arena.players.values() if player.is_bot])
+        arena.remove_player(second.id)
+        arena.update(arena.now + 1 / TICK_RATE)
+        self.assertEqual(arena.online_counts()["bots"], 3, "a mage left alone gets company")
+
+    def test_a_fixed_count_holds_for_one_person_but_not_for_two(self) -> None:
         arena = Arena(bots=2)
         arena.add_player("Первый")
         arena.update(arena.now + 1 / TICK_RATE)
         self.assertEqual(arena.online_counts()["bots"], 2)
+        arena.add_player("Второй")
+        arena.update(arena.now + 1 / TICK_RATE)
+        self.assertEqual(arena.online_counts()["bots"], 0)
 
     def test_every_bot_spell_is_valid_and_castable(self) -> None:
         arena = Arena(bots=0)

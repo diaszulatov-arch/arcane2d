@@ -629,13 +629,15 @@ function spriteFor(kind, r) {
   return sprite;
 }
 
+const FIRE = ["#d8391b", "#ff8a1f", "#ffcf4d", "#fff6cf"];
+
 /** Layered pixel flame; `size` is its height in world units. */
-function drawFlame(ctx, x, y, size, t, seed) {
+export function drawFlame(ctx, x, y, size, t, seed, palette = FIRE) {
   const layers = [
-    ["#d8391b", 1, 1],
-    ["#ff8a1f", 0.72, 0.74],
-    ["#ffcf4d", 0.46, 0.5],
-    ["#fff6cf", 0.22, 0.28],
+    [palette[0], 1, 1],
+    [palette[1], 0.72, 0.74],
+    [palette[2], 0.46, 0.5],
+    [palette[3], 0.22, 0.28],
   ];
   const blockSize = Math.max(3, size / 7);
   for (const [color, tall, wide] of layers) {

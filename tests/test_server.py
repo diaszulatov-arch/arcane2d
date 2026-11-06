@@ -235,6 +235,232 @@ class ServerTestCase(unittest.IsolatedAsyncioTestCase):
         finally:
             writer.close()
 
+    async def story_client(self, name: str, token: str):
+        reader, writer = await self.ws_connect()
+        await self.wait_for_type(reader, "hello")
+        await self.send_json(writer, {"t": "profile", "token": token, "name": name})
+        profile = await self.wait_for_type(reader, "profile")
+        return reader, writer, profile
+
+    async def test_two_mages_meet_by_code_and_enter_a_dungeon(self) -> None:
+        reader_a, writer_a, profile = await self.story_client("Лидер", "a" * 32)
+        reader_b, writer_b, _ = await self.story_client("Друг", "b" * 32)
+        try:
+            self.assertEqual(len(profile["lessons"]), 20)
+            self.assertEqual(len(profile["campaign"]["stages"]), 20)
+
+            await self.send_json(writer_a, {"t": "party_create"})
+            party = await self.wait_for_type(reader_a, "party")
+            self.assertTrue(party["leader"])
+
+            await self.send_json(writer_b, {"t": "party_join", "code": party["code"].lower()})
+            joined = await self.wait_for_type(reader_b, "party")
+            self.assertEqual(len(joined["seats"]), 2)
+            self.assertFalse(joined["leader"])
+
+            for writer in (writer_a, writer_b):
+                await self.send_json(writer, {"t": "party_ready", "ready": True})
+            started = await self.wait_for_type(reader_a, "stage_start")
+            self.assertEqual(started["config"]["mode"], "story")
+            self.assertEqual(started["config"]["runes"], ["fireball"])
+            self.assertTrue(started["you"])
+
+            state = await self.wait_for_type(reader_a, "state")
+            self.assertEqual(len(state["players"]), 2)
+            self.assertIn("story", state)
+
+            await self.send_json(writer_a, {"t": "cast", "code": "beam(0)", "slot": 0})
+            result = await self.wait_for_type(reader_a, "cast_result")
+            self.assertIn("не изучена", result["error"])
+            self.assertEqual(self.app.arena.online_counts()["humans"], 0, "the arena stays apart")
+        finally:
+            writer_a.close()
+            writer_b.close()
+
+    async def test_a_cleared_stage_sends_everyone_back_to_camp_and_onward(self) -> None:
+        reader, writer, _ = await self.story_client("Маг", "9" * 32)
+        try:
+            await self.send_json(writer, {"t": "party_create"})
+            party = await self.wait_for_type(reader, "party")
+            await self.send_json(writer, {"t": "party_ready", "ready": True})
+            first = await self.wait_for_type(reader, "stage_start")
+            self.app.parties[party["code"]].world.outcome = "cleared"
+            ended = await self.wait_for_type(reader, "stage_end")
+            self.assertEqual(ended["result"], "cleared")
+            self.assertGreater(ended["profile"]["essence"], 0)
+            self.assertEqual(ended["profile"]["cleared"], 1)
+            camp = await self.wait_for_type(reader, "party")
+            self.assertEqual(camp["stage"]["index"], 1)
+
+            await self.send_json(writer, {"t": "party_ready", "ready": True})
+            second = await self.wait_for_type(reader, "stage_start")
+            self.assertEqual(second["stage"]["index"], 1)
+            self.assertIn("frostbolt", second["config"]["runes"])
+            self.assertNotEqual(first["config"]["map_id"], second["config"]["map_id"])
+            cast = {"t": "cast", "code": "frostbolt(0)", "slot": 0}
+            await self.send_json(writer, cast)
+            self.assertTrue((await self.wait_for_type(reader, "cast_result"))["ok"])
+        finally:
+            writer.close()
+
+    async def test_a_dropped_mage_walks_back_into_the_running_dungeon(self) -> None:
+        reader_a, writer_a, _ = await self.story_client("Первый", "1" * 32)
+        reader_b, writer_b, _ = await self.story_client("Второй", "2" * 32)
+        try:
+            await self.send_json(writer_a, {"t": "party_create"})
+            party = await self.wait_for_type(reader_a, "party")
+            await self.send_json(writer_b, {"t": "party_join", "code": party["code"]})
+            await self.wait_for_type(reader_b, "party")
+            for writer in (writer_a, writer_b):
+                await self.send_json(writer, {"t": "party_ready", "ready": True})
+            await self.wait_for_type(reader_b, "stage_start")
+
+            writer_b.close()
+            world = self.app.parties[party["code"]].world
+            for _ in range(60):
+                if len(world.players) == 1:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual(len(world.players), 1)
+
+            reader_c, writer_c, _ = await self.story_client("Второй", "2" * 32)
+            await self.send_json(writer_c, {"t": "party_join", "code": party["code"]})
+            back = await self.wait_for_type(reader_c, "stage_start")
+            self.assertEqual(len(world.players), 2)
+            self.assertTrue(back["you"])
+            writer_c.close()
+        finally:
+            writer_a.close()
+
+    async def test_a_wrong_party_code_is_explained(self) -> None:
+        reader, writer, _ = await self.story_client("Маг", "c" * 32)
+        try:
+            await self.send_json(writer, {"t": "party_join", "code": "ZZZZ"})
+            self.assertIn("кодом", (await self.wait_for_type(reader, "party_error"))["error"])
+        finally:
+            writer.close()
+
+    async def test_story_messages_need_a_profile_first(self) -> None:
+        reader, writer = await self.ws_connect()
+        try:
+            await self.send_json(writer, {"t": "party_create"})
+            await self.send_json(writer, {"t": "ping", "at": 1})
+            await self.wait_for_type(reader, "pong")
+            self.assertEqual(self.app.parties, {})
+        finally:
+            writer.close()
+
+    async def test_a_repair_goes_through_a_terminal_and_pays_once(self) -> None:
+        reader, writer, _ = await self.story_client("Ученик", "d" * 32)
+        try:
+            await self.send_json(writer, {"t": "party_create"})
+            party = await self.wait_for_type(reader, "party")
+            await self.send_json(writer, {"t": "party_ready", "ready": True})
+            start = await self.wait_for_type(reader, "stage_start")
+            world = self.app.parties[party["code"]].world
+
+            await self.send_json(writer, {"t": "terminal_open"})
+            self.assertFalse((await self.wait_for_type(reader, "terminal_state"))["linked"])
+
+            terminal = world.terminals[0]
+            mage = world.players[start["you"]]
+            mage.x, mage.y = terminal.x, terminal.y + 40
+            await self.send_json(writer, {"t": "terminal_open"})
+            state = await self.wait_for_type(reader, "terminal_state")
+            self.assertTrue(state["linked"])
+            self.assertEqual(state["task"], "call")
+
+            await self.send_json(writer, {"t": "fix_submit", "code": "firebal(aim())"})
+            self.assertFalse((await self.wait_for_type(reader, "fix_result"))["ok"])
+            await self.send_json(writer, {"t": "fix_submit", "code": "fireball(aim())"})
+            solved = await self.wait_for_type(reader, "fix_result")
+            self.assertTrue(solved["ok"])
+            self.assertGreater(solved["reward"], 0)
+            self.assertIn("call", solved["profile"]["lessons"])
+            self.assertTrue(world.portal_ready)
+        finally:
+            writer.close()
+
+    async def test_a_terminal_ignores_junk(self) -> None:
+        reader, writer, _ = await self.story_client("Шум", "f" * 32)
+        try:
+            await self.send_json(writer, {"t": "fix_submit", "code": "fireball(aim())"})
+            await self.send_json(writer, {"t": "terminal_close"})
+            await self.send_json(writer, {"t": "party_create"})
+            await self.wait_for_type(reader, "party")
+            await self.send_json(writer, {"t": "fix_submit", "code": 7})
+            await self.send_json(writer, {"t": "terminal_open"})
+            await self.send_json(writer, {"t": "ping", "at": 1})
+            await self.wait_for_type(reader, "pong")
+        finally:
+            writer.close()
+
+    async def test_help_is_rationed_by_the_server_and_answers_stay_on_it(self) -> None:
+        reader, writer, profile = await self.story_client("Сеньор", "9" * 32)
+        try:
+            self.assertNotIn("fireball(aim())", json.dumps(profile["lessons"][0]["task"]))
+            await self.send_json(writer, {"t": "party_create"})
+            party = await self.wait_for_type(reader, "party")
+            self.assertEqual(party["difficulty"], 1)
+            await self.send_json(writer, {"t": "party_difficulty", "level": 3})
+            await self.send_json(writer, {"t": "party_difficulty", "level": "3"})
+            for _ in range(20):
+                party = await self.wait_for_type(reader, "party")
+                if party["difficulty"] == 3:
+                    break
+            self.assertEqual(party["difficulty"], 3)
+            await self.send_json(writer, {"t": "party_ready", "ready": True})
+            start = await self.wait_for_type(reader, "stage_start")
+            self.assertEqual(start["config"]["difficulty"], 3)
+            world = self.app.parties[party["code"]].world
+            terminal = world.terminals[0]
+            mage = world.players[start["you"]]
+            mage.x, mage.y = terminal.x, terminal.y + 40
+            await self.send_json(writer, {"t": "terminal_open"})
+            state = await self.wait_for_type(reader, "terminal_state")
+            self.assertEqual(state["help"], {"hints": 0, "solution": False, "theory": False})
+            await self.send_json(writer, {"t": "terminal_help", "index": 0})
+            self.assertEqual((await self.wait_for_type(reader, "terminal_help"))["kind"], "")
+            await self.send_json(writer, {"t": "terminal_help", "index": "0"})
+            await self.send_json(writer, {"t": "ping", "at": 1})
+            await self.wait_for_type(reader, "pong")
+        finally:
+            writer.close()
+
+    async def test_upgrades_spend_essence_on_the_server(self) -> None:
+        reader, writer, _ = await self.story_client("Маг", "e" * 32)
+        try:
+            await self.send_json(writer, {"t": "upgrade", "stat": "max_hp"})
+            refused = await self.wait_for_type(reader, "profile_update")
+            self.assertIn("токенов", refused["error"])
+            self.app.store.get("e" * 32).essence = 500
+            await self.send_json(writer, {"t": "upgrade", "stat": "max_hp"})
+            bought = await self.wait_for_type(reader, "profile_update")
+            self.assertIsNone(bought["error"])
+            self.assertEqual(bought["profile"]["upgrades"], {"max_hp": 1})
+        finally:
+            writer.close()
+
+    async def test_arena_mages_never_see_a_party_and_party_mages_skip_the_arena(self) -> None:
+        reader_story, writer_story, _ = await self.story_client("Сюжет", "f" * 32)
+        reader_arena, writer_arena = await self.ws_connect()
+        try:
+            await self.send_json(writer_arena, {"t": "join", "name": "Арена"})
+            await self.wait_for_type(reader_arena, "welcome")
+            await self.send_json(writer_story, {"t": "party_create"})
+            await self.wait_for_type(reader_story, "party")
+            await self.send_json(writer_story, {"t": "party_ready", "ready": True})
+            await self.wait_for_type(reader_story, "stage_start")
+            story_state = await self.wait_for_type(reader_story, "state")
+            self.assertEqual([p["name"] for p in story_state["players"]], ["Сюжет"])
+            for _ in range(4):
+                arena_state = await self.wait_for_type(reader_arena, "state")
+            self.assertEqual([p["name"] for p in arena_state["players"]], ["Арена"])
+            self.assertNotIn("monsters", arena_state)
+        finally:
+            writer_story.close()
+            writer_arena.close()
+
     async def test_health_and_world_endpoints(self) -> None:
         status, headers, body = await self.http_get("/health")
         self.assertEqual(status, 200)
@@ -280,6 +506,34 @@ class ServerTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_path_traversal_is_denied(self) -> None:
         status, _, _ = await self.http_get("/../server.py")
         self.assertEqual(status, 403)
+
+    async def wait_for_bots(self, reader: asyncio.StreamReader, wanted: int) -> None:
+        for _ in range(60):
+            state = await self.wait_for_type(reader, "state")
+            if state["stats"]["bots"] == wanted:
+                return
+        self.fail(f"the arena never settled on {wanted} spirits")
+
+    async def test_spirits_go_when_a_second_person_joins_and_return_when_alone(self) -> None:
+        self.app.arena.fill_to = 4
+        reader_a, writer_a = await self.ws_connect()
+        reader_b, writer_b = await self.ws_connect()
+        try:
+            await self.wait_for_type(reader_a, "hello")
+            await self.wait_for_type(reader_b, "hello")
+            await self.send_json(writer_a, {"t": "join", "name": "Первый"})
+            await self.wait_for_type(reader_a, "welcome")
+            await self.wait_for_bots(reader_a, 3)
+
+            await self.send_json(writer_b, {"t": "join", "name": "Второй"})
+            await self.wait_for_type(reader_b, "welcome")
+            await self.wait_for_bots(reader_a, 0)
+
+            writer_b.close()
+            await self.wait_for_bots(reader_a, 3)
+        finally:
+            writer_a.close()
+            writer_b.close()
 
     async def test_websocket_join_and_cast(self) -> None:
         reader, writer = await self.ws_connect()

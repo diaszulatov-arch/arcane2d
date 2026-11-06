@@ -97,9 +97,37 @@
           <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> заклинание</span>
           <span><kbd>Shift</kbd> перекат <span class="roll-hint" id="rollHint">готов</span></span>
           <span><kbd>Ctrl</kbd>+<kbd>↵</kbd> сотворить</span>
+          <span class="story-only"><kbd>L</kbd> журнал рации</span>
         </div>
 
         <div class="toasts" id="toasts" aria-live="polite"></div>
+
+        <div class="story-hud" id="storyHud" hidden>
+          <div class="story-goal">
+            <strong id="storyStage"></strong>
+            <span id="storyGoal"></span>
+          </div>
+          <div class="role-bar" id="roleBar" hidden></div>
+          <div class="boss-bar" id="bossBar" hidden>
+            <span id="bossName"></span>
+            <div class="boss-track"><div class="boss-fill" id="bossFill"></div></div>
+            <div class="deploy" id="deployBar" hidden>
+              <span>Деплой: сорвите его уроном</span>
+              <div class="deploy-track"><div class="deploy-time" id="deployTime"></div></div>
+              <div class="deploy-track"><div class="deploy-break" id="deployBreak"></div></div>
+            </div>
+          </div>
+          <p class="boss-shout" id="bossShout" hidden></p>
+          <div class="curse-bar" id="curseBar" hidden></div>
+        </div>
+        <button class="comms-toggle" id="commsToggle" type="button" title="Журнал рации (L)">Журнал <kbd>L</kbd></button>
+        <div class="party-frames" id="partyFrames" aria-label="Группа"></div>
+        <div class="story-comms" id="storyComms" role="status" hidden></div>
+        <button class="terminal-prompt" id="terminalPrompt" type="button" hidden></button>
+        <div class="intro-card" id="introCard" hidden>
+          <strong id="introName"></strong>
+          <span id="introHint"></span>
+        </div>
       </section>
 
       <aside class="grimoire" id="grimoire" aria-label="Гримуар заклинаний">
@@ -209,6 +237,16 @@
           <span class="name-glyph" aria-hidden="true">ᛉ</span>
           <input id="nameInput" name="name" type="text" maxlength="16" minlength="2" placeholder="Введите имя" autocomplete="nickname" spellcheck="false">
         </div>
+        <div class="mode-picker" id="modePicker" role="radiogroup" aria-label="Режим игры">
+          <button class="mode-card" type="button" role="radio" data-mode="story">
+            <strong>Сюжет</strong>
+            <span>ИИ сломал интернет. Кооп до 4 магов, чините баги на Python</span>
+          </button>
+          <button class="mode-card" type="button" role="radio" data-mode="arena">
+            <strong>Арена</strong>
+            <span>Обычный режим: маги против магов</span>
+          </button>
+        </div>
         <button class="enter-button" id="joinButton" type="submit">
           <span>Войти в арену</span>
           <span class="enter-arrow" aria-hidden="true">→</span>
@@ -230,6 +268,130 @@
       </div>
     </div>
     <p class="login-footnote">Сервер исполняет заклинания в безопасной песочнице. <button type="button" id="loginApiButton">Как это работает?</button></p>
+  </div>
+
+  <aside class="comms-log" id="commsLog" aria-labelledby="commsLogTitle" hidden>
+    <header class="comms-log-head">
+      <h3 id="commsLogTitle">Журнал рации</h3>
+      <button class="text-button" id="commsLogClose" type="button">Закрыть <kbd>L</kbd></button>
+    </header>
+    <div class="comms-log-body" id="commsLogBody" role="log" tabindex="0"></div>
+  </aside>
+
+  <section class="terminal" id="terminal" role="dialog" aria-labelledby="terminalTitle" hidden>
+    <header class="terminal-head">
+      <div>
+        <p class="camp-eyebrow" id="terminalKind"></p>
+        <h3 id="terminalTitle"></h3>
+      </div>
+      <button class="text-button" id="terminalClose" type="button">Выйти <kbd>Esc</kbd></button>
+    </header>
+    <div class="terminal-body">
+      <div class="terminal-text">
+        <p class="terminal-brief" id="terminalBrief"></p>
+        <details class="terminal-theory" id="terminalTheoryBox">
+          <summary>Теория</summary>
+          <div id="terminalTheory"></div>
+          <pre class="lesson-example" id="terminalExample"></pre>
+        </details>
+        <div class="terminal-help" id="terminalHelp" role="status"></div>
+        <div class="terminal-actions">
+          <button class="text-button" id="terminalHint" type="button">Подсказка</button>
+          <button class="text-button pgt" id="terminalAsk" type="button">Спросить PGT</button>
+          <button class="text-button" id="terminalLog" type="button">Журнал рации</button>
+        </div>
+      </div>
+      <div class="terminal-work">
+        <div class="code-body lesson-code">
+          <div class="line-numbers" aria-hidden="true"><div id="terminalGutter"></div></div>
+          <div class="code-pane">
+            <pre class="code-layer" aria-hidden="true"><code id="terminalLayer"></code></pre>
+            <textarea id="terminalInput" class="code-input" aria-label="Код терминала" wrap="off" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+          </div>
+          <div class="code-complete" id="terminalComplete" role="listbox" aria-label="Подсказки" hidden></div>
+        </div>
+        <div class="lesson-actions">
+          <p class="lesson-result" id="terminalResult" role="status"></p>
+          <button class="enter-button" id="terminalApply" type="button" title="Ctrl + Enter"><span>Применить патч</span></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="camp" id="camp" hidden>
+    <section class="camp-entry" id="campEntry">
+      <p class="camp-eyebrow">БАГОПОКАЛИПСИС</p>
+      <h2>PGT сломал интернет</h2>
+      <div class="camp-prologue" id="campPrologue"></div>
+      <button class="enter-button" id="partyCreate" type="button">
+        <span>Создать группу</span>
+        <span class="enter-arrow" aria-hidden="true">→</span>
+      </button>
+      <form class="camp-join" id="partyJoinForm">
+        <input id="partyJoinCode" maxlength="8" placeholder="Код группы" aria-label="Код группы" autocomplete="off" spellcheck="false">
+        <button class="text-button" type="submit">Присоединиться</button>
+      </form>
+      <p class="login-error" id="campEntryError" role="alert"></p>
+      <button class="text-button" id="campBack" type="button">Назад в меню</button>
+    </section>
+
+    <section class="camp-main" id="campMain" hidden>
+      <header class="camp-head">
+        <div>
+          <p class="camp-eyebrow" id="campChapter"></p>
+          <h2 id="campStage"></h2>
+        </div>
+        <div class="camp-pills">
+          <span class="camp-pill" title="Дайте этот код друзьям">Код группы <strong id="partyCode"></strong></span>
+          <span class="camp-pill essence" title="Тратятся на улучшения">Токены <strong id="campEssence">0</strong></span>
+        </div>
+      </header>
+      <p class="camp-banner" id="campBanner" role="status" hidden></p>
+      <div class="camp-body">
+        <aside class="camp-side">
+          <h3>Группа</h3>
+          <ul class="camp-seats" id="campSeats"></ul>
+          <button class="enter-button" id="campReady" type="button"><span>Готов</span></button>
+          <h3>Сложность</h3>
+          <div class="camp-difficulty" id="campDifficulty" aria-label="Сложность"></div>
+          <p class="camp-difficulty-about" id="campDifficultyAbout"></p>
+          <h3>Карта Сети</h3>
+          <div class="camp-map" id="campMap"></div>
+          <button class="text-button" id="campLog" type="button">Журнал рации</button>
+          <button class="text-button" id="campLeave" type="button">Покинуть группу</button>
+        </aside>
+        <div class="camp-content">
+          <nav class="camp-tabs" aria-label="Штаб">
+            <button class="camp-tab active" data-tab="story" type="button">Сюжет</button>
+            <button class="camp-tab" data-tab="lesson" type="button">Брифинг</button>
+            <button class="camp-tab" data-tab="role" type="button" id="roleTab">Роль</button>
+            <button class="camp-tab" data-tab="upgrades" type="button">Улучшения</button>
+          </nav>
+          <section class="camp-panel camp-story" id="tabStory" data-panel="story"></section>
+          <section class="camp-panel lesson" data-panel="lesson" hidden>
+            <div class="lesson-text">
+              <h3 id="lessonTitle"></h3>
+              <p class="lesson-rune" id="lessonRune"></p>
+              <div id="lessonTheory"></div>
+              <pre class="lesson-example" id="lessonExample"></pre>
+            </div>
+            <aside class="lesson-work">
+              <p class="lesson-task-label">Что сломано</p>
+              <p class="lesson-task" id="lessonTask"></p>
+              <p class="lesson-note">Этот код ждёт в терминале этапа. Подойдите к нему и нажмите <kbd>E</kbd>: портал не откроется, пока кто-то из группы его не починит.</p>
+            </aside>
+          </section>
+          <section class="camp-panel role-panel" data-panel="role" hidden>
+            <p class="upgrade-intro" id="roleIntro"></p>
+            <div class="role-cards" id="roleCards"></div>
+          </section>
+          <section class="camp-panel" data-panel="upgrades" hidden>
+            <p class="upgrade-intro">Токены дают за этапы и починенный код. Каждую ветвь проходите сверху вниз: нижнее улучшение не может обогнать верхнее. Работают только в сюжете.</p>
+            <div class="upgrade-tree" id="upgradeTree"></div>
+          </section>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div class="modal-layer" id="apiModal" hidden>
@@ -259,7 +421,7 @@
             <dt><code>direction(x, y)</code></dt><dd>Угол от вашего мага к точке.</dd>
             <dt><code>distance(x1, y1, x2, y2)</code></dt><dd>Расстояние между точками.</dd>
           </dl>
-          <p class="api-note">Автонаводки нет. <code>aim()</code> и <code>cursor()</code> дают только ручной прицел: каждую атаку нужно направлять самостоятельно.</p>
+          <p class="api-note">На арене автонаводки нет. <code>aim()</code> и <code>cursor()</code> дают только ручной прицел. В сюжете урок «Автоприцел своими руками» открывает <code>enemies()</code> и <code>allies()</code>, а у каждой роли есть свои навыки: они описаны в штабе на вкладке «Роль».</p>
         </section>
 
         <section class="api-section">

@@ -73,12 +73,13 @@ function inProse(linePrefix) {
 }
 
 export class SpellEditor {
-  constructor({ input, layer, gutter, popup, costOf }) {
+  constructor({ input, layer, gutter, popup, costOf, isKnown = () => true }) {
     this.input = input;
     this.layer = layer;
     this.gutter = gutter;
     this.popup = popup;
     this.costOf = costOf;
+    this.isKnown = isKnown;
     this.errorLine = null;
     this.items = [];
     this.selected = 0;
@@ -188,7 +189,10 @@ export class SpellEditor {
       }));
     }
     if (!needle) return [];
-    const functions = [...SPELL_API, ...SENSE_API]
+    const functions = [
+      ...SPELL_API.filter((entry) => this.isKnown(entry.name)),
+      ...SENSE_API.filter((entry) => !entry.gated || this.isKnown(entry.name)),
+    ]
       .filter((entry) => entry.name.startsWith(needle))
       .map((entry) => ({
         ...entry,
@@ -303,6 +307,76 @@ export class SpellEditor {
     const end = start + text.length - back;
     this.replaceRange(start, caret, text, end, end);
     this.closeCompletion();
+  }
+
+  /** Tab and Enter behave like a code editor's. Returns true when one was handled. */
+  handleEditingKey(event) {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      this.indentSelection(event.shiftKey);
+      return true;
+    }
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      this.input.selectionStart === this.input.selectionEnd
+    ) {
+      event.preventDefault();
+      this.newLine();
+      return true;
+    }
+    return false;
+  }
+
+  indentSelection(outdent) {
+    const { input } = this;
+    const { value, selectionStart, selectionEnd } = input;
+    const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+
+    if (selectionStart === selectionEnd) {
+      if (!outdent) {
+        this.replaceRange(selectionStart, selectionEnd, "    ", selectionStart + 4, selectionStart + 4);
+        return;
+      }
+      const match = value.slice(lineStart, selectionStart).match(/^( {1,4}|\t)/);
+      if (!match) return;
+      const caret = Math.max(lineStart, selectionStart - match[0].length);
+      this.replaceRange(lineStart, lineStart + match[0].length, "", caret, caret);
+      return;
+    }
+
+    let lineEnd = value.indexOf("\n", selectionEnd);
+    if (lineEnd === -1) lineEnd = value.length;
+    const lines = value.slice(lineStart, lineEnd).split("\n");
+    let firstShift = 0;
+    let totalShift = 0;
+    const changed = lines.map((line, index) => {
+      const removed = outdent ? (line.match(/^( {1,4}|\t)/)?.[0].length ?? 0) : 0;
+      const shift = outdent ? -removed : 4;
+      if (index === 0) firstShift = shift;
+      totalShift += shift;
+      return outdent ? line.slice(removed) : `    ${line}`;
+    });
+    this.replaceRange(
+      lineStart,
+      lineEnd,
+      changed.join("\n"),
+      Math.max(lineStart, selectionStart + firstShift),
+      Math.max(lineStart, selectionEnd + totalShift),
+    );
+  }
+
+  newLine() {
+    const { input } = this;
+    const position = input.selectionStart;
+    const lineStart = input.value.lastIndexOf("\n", position - 1) + 1;
+    const before = input.value.slice(lineStart, position);
+    const indent = before.match(/^[ \t]*/)?.[0] ?? "";
+    const insert = `\n${indent}${before.trimEnd().endsWith(":") ? "    " : ""}`;
+    this.replaceRange(position, position, insert, position + insert.length, position + insert.length);
   }
 
   /** Handle a key aimed at the open list; returns true when it was consumed. */

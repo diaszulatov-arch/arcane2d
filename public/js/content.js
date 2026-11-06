@@ -1,8 +1,11 @@
 /* Spellbook defaults, example scrolls and persistent storage for Arcane 2D. */
 
 const STORAGE_SPELLS = "arcane2d.spells.v1";
+const STORAGE_STORY_SPELLS = "arcane2d.spells.story.v1";
 const STORAGE_NAME = "arcane2d.mage.v1";
 const STORAGE_SOUND = "arcane2d.sound.v1";
+const STORAGE_MODE = "arcane2d.mode.v1";
+const STORAGE_TOKEN = "arcane2d.token.v1";
 
 export const DEFAULT_SPELLS = [
   {
@@ -30,6 +33,27 @@ if me().hp < 55 and ready("heal"):
 if ready("shield"):
     shield()
 
+fireball(aim())
+`,
+  },
+];
+
+export const STORY_SPELLS = [
+  {
+    name: "Первая руна",
+    code: `# Это ваше первое заклинание: огненный шар на курсор
+fireball(aim())
+`,
+  },
+  {
+    name: "Вторая руна",
+    code: `# Запишите сюда заклинание с новой руной
+fireball(aim())
+`,
+  },
+  {
+    name: "Третья руна",
+    code: `# И здесь тоже
 fireball(aim())
 `,
   },
@@ -119,6 +143,21 @@ else:
 ];
 
 export const EXAMPLES = [
+  {
+    name: "Автоприцел",
+    code: `# Ваш код из терминала: бьёт в ближайшего врага
+targets = enemies()
+
+if targets:
+    best = targets[0]
+    for e in targets:
+        if e.dist < best.dist:
+            best = e
+    fireball(direction(best.x, best.y))
+else:
+    fireball(aim())
+`,
+  },
   {
     name: "Веер пламени",
     description: "Пять огненных снарядов разворачиваются в дугу от прицела.",
@@ -288,21 +327,34 @@ function cleanSpell(raw, index) {
   return { name, code };
 }
 
+let spellMode = "arena";
+
+/** The campaign keeps its own spellbook: new mages only know one rune. */
+export function useSpellbook(mode) {
+  spellMode = mode;
+}
+
 export function loadSpellbook() {
+  const story = spellMode === "story";
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_SPELLS) || "null");
+    const stored = JSON.parse(
+      localStorage.getItem(story ? STORAGE_STORY_SPELLS : STORAGE_SPELLS) || "null",
+    );
     if (Array.isArray(stored)) {
       return [0, 1, 2].map((index) => cleanSpell(stored[index], index));
     }
   } catch {
     /* A broken or blocked storage must never prevent the arena from opening. */
   }
-  return DEFAULT_SPELLS.map((spell) => ({ ...spell }));
+  return (story ? STORY_SPELLS : DEFAULT_SPELLS).map((spell) => ({ ...spell }));
 }
 
 export function saveSpellbook(spells) {
   try {
-    localStorage.setItem(STORAGE_SPELLS, JSON.stringify(spells));
+    localStorage.setItem(
+      spellMode === "story" ? STORAGE_STORY_SPELLS : STORAGE_SPELLS,
+      JSON.stringify(spells),
+    );
   } catch {
     /* Private mode can reject storage writes. The game still works in memory. */
   }
@@ -340,6 +392,40 @@ export function saveSoundEnabled(enabled) {
   }
 }
 
+export function loadMode() {
+  try {
+    return localStorage.getItem(STORAGE_MODE) === "arena" ? "arena" : "story";
+  } catch {
+    return "story";
+  }
+}
+
+export function saveMode(mode) {
+  try {
+    localStorage.setItem(STORAGE_MODE, mode);
+  } catch {
+    /* Ignore storage quotas. */
+  }
+}
+
+/** A random secret that ties this browser to its campaign progress on the server. */
+export function loadToken() {
+  const fresh = () =>
+    [...crypto.getRandomValues(new Uint8Array(16))]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  try {
+    let token = localStorage.getItem(STORAGE_TOKEN);
+    if (!token) {
+      token = fresh();
+      localStorage.setItem(STORAGE_TOKEN, token);
+    }
+    return token;
+  } catch {
+    return fresh();
+  }
+}
+
 export const SLOT_RUNES = ["I", "II", "III"];
 
 /* The spell language as the editor sees it: colours, completion and signatures.
@@ -361,13 +447,44 @@ export const SPELL_API = [
   { name: "shield", args: "", about: "Щит на 38, перезарядка 3 с", element: "guard" },
   { name: "dash", args: "angle, dist=170", about: "Рывок на 60–260", element: "guard" },
   { name: "blink", args: "x, y", about: "Перенос в свободную точку", element: "guard" },
+  { name: "firewall", args: "angle", about: "Админ: стена отражает снаряды", element: "guard" },
+  { name: "sudo", args: "", about: "Админ: неуязвимость, враги идут к вам", element: "guard" },
+  { name: "exploit", args: "enemy", about: "Хакер: метка и segfault при смерти", element: "storm" },
+  { name: "hijack", args: "enemy", about: "Хакер: враг воюет за вас 7 с", element: "storm" },
+  { name: "patch", args: "ally", about: "Девопс: лечит союзника издалека", element: "nature" },
+  { name: "rollback", args: "ally", about: "Девопс: откат на 3 с, поднимает павших", element: "nature" },
+  { name: "scan", args: "enemy", about: "Тестировщик: словарь данных, снимает иммунитет", element: "arcane" },
+  { name: "breakpoint", args: "x, y", about: "Тестировщик: стоп-зона для врагов и пуль", element: "arcane" },
 ];
+
+/* What the arena does not have: only the campaign offers these in the editor. */
+export const STORY_ONLY = new Set([
+  "enemies",
+  "allies",
+  "firewall",
+  "sudo",
+  "exploit",
+  "hijack",
+  "patch",
+  "rollback",
+  "scan",
+  "breakpoint",
+]);
+
+export const ROLE_TITLES = {
+  admin: "Админ",
+  hacker: "Хакер",
+  devops: "Девопс",
+  tester: "Тестировщик",
+};
 
 export const SENSE_API = [
   { name: "me", args: "", about: "Ваш маг: .hp .mana .shield .x .y" },
   { name: "aim", args: "", about: "Угол прицела в радианах" },
   { name: "cursor", args: "", about: "Точка под курсором: .x .y .dist" },
   { name: "ready", args: "rune", about: "Хватит ли маны и готова ли руна" },
+  { name: "enemies", args: "", about: "Все враги: .x .y .hp .dist .kind .boss. Под проклятием None", gated: true },
+  { name: "allies", args: "", about: "Вся группа: .x .y .hp .dist .kind .dead. Под проклятием None", gated: true },
   { name: "direction", args: "x, y", about: "Угол от мага к точке" },
   { name: "distance", args: "x1, y1, x2, y2", about: "Расстояние между точками" },
   { name: "log", args: "value", about: "Строка в «Печать»" },
@@ -406,5 +523,8 @@ export const FIELD_API = [
   { name: "name", about: "Имя мага" },
   { name: "x", about: "Координата X" },
   { name: "y", about: "Координата Y" },
-  { name: "dist", about: "Расстояние до курсора" },
+  { name: "dist", about: "Расстояние до цели" },
+  { name: "kind", about: "Вид врага" },
+  { name: "boss", about: "Босс ли это" },
+  { name: "dead", about: "Пал ли союзник" },
 ];

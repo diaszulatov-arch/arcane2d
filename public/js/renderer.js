@@ -1,5 +1,6 @@
 /* Canvas renderer: camera, mages, projectiles, wards, particles and HUD overlays. */
 
+import { ROLE_TITLES } from "./content.js";
 import {
   OBSTACLE_HEIGHT,
   buildFloorCanvas,
@@ -9,6 +10,25 @@ import {
   drawObstacle,
   drawWallTorches,
 } from "./world-art.js";
+import {
+  buildDungeonCanvas,
+  buildMinimap,
+  collectDungeonLights,
+  drawDoors,
+  drawBarriers,
+  drawBreakpoints,
+  drawCables,
+  drawHazards,
+  drawLamps,
+  drawMonster,
+  drawMonsterBar,
+  drawPickups,
+  drawPortal,
+  drawSudo,
+  drawTerminals,
+  drawWeather,
+  themeOf,
+} from "./dungeon-art.js";
 
 const TAU = Math.PI * 2;
 const GOLD = "#d9b56c";
@@ -21,6 +41,8 @@ const AMBIENT_LIGHT = "#6d6682";
 const SELF_LIGHT = "#ffe6c4";
 const LIGHT_SPRITE_SIZE = 96;
 const BLOOM_STRENGTH = 0.42;
+const MINIMAP_WIDTH = 170;
+const MINIMAP_HEIGHT = 120;
 // Blasts open on the floor and mages stand over them, so a fight never hides them.
 const GROUND_EFFECTS = new Set(["scorch", "explosion", "nova"]);
 const QUALITY_FULL = 2;
@@ -118,6 +140,8 @@ function wrapText(ctx, text, maxWidth, maxLines = 3) {
   return lines;
 }
 
+const CURSE_LABELS = { syntax: "SyntaxError", null: "None", mirror: "АВТОКОРРЕКЦИЯ" };
+
 export class ArenaRenderer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -146,7 +170,9 @@ export class ArenaRenderer {
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
     this.camera = { x: 950, y: 550, zoom: 0.8 };
     this.visualPlayers = new Map();
+    this.visualMonsters = new Map();
     this.visualProjectiles = new Map();
+    this.minimap = null;
     this.particles = [];
     this.effects = [];
     this.floaters = [];
@@ -200,6 +226,15 @@ export class ArenaRenderer {
   }
 
   ensureFloor(config) {
+    if (config?.mode === "story") {
+      const key = `map:${config.theme}:${config.map_id}`;
+      if (key !== this.floorKey) {
+        this.floorCanvas = buildDungeonCanvas(config);
+        this.minimap = buildMinimap(config);
+        this.floorKey = key;
+      }
+      return;
+    }
     const width = config?.arena?.w || 1900;
     const height = config?.arena?.h || 1100;
     const border = config?.arena?.border || 46;
@@ -207,6 +242,22 @@ export class ArenaRenderer {
     if (key !== this.floorKey) {
       this.floorCanvas = buildFloorCanvas(config);
       this.floorKey = key;
+    }
+  }
+
+  /** Forget the last place: a new floor must not start with old sparks flying. */
+  resetScene(x, y) {
+    this.visualPlayers.clear();
+    this.visualMonsters.clear();
+    this.visualProjectiles.clear();
+    this.particles = [];
+    this.effects = [];
+    this.floaters = [];
+    this.speeches = [];
+    this.shakeAmount = 0;
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      this.camera.x = x;
+      this.camera.y = y;
     }
   }
 
@@ -328,6 +379,24 @@ export class ArenaRenderer {
     }
     for (const id of this.visualPlayers.keys()) {
       if (!seen.has(id)) this.visualPlayers.delete(id);
+    }
+
+    const seenMonsters = new Set();
+    for (const monster of client.monsters || []) {
+      seenMonsters.add(monster.id);
+      let visual = this.visualMonsters.get(monster.id);
+      if (!visual) {
+        visual = { x: monster.x, y: monster.y, hurt: 0, data: monster };
+        this.visualMonsters.set(monster.id, visual);
+      }
+      visual.data = monster;
+      const smoothing = 1 - Math.exp(-dt * 20);
+      visual.x += (monster.x - visual.x) * smoothing;
+      visual.y += (monster.y - visual.y) * smoothing;
+      visual.hurt = Math.max(0, visual.hurt - dt);
+    }
+    for (const id of this.visualMonsters.keys()) {
+      if (!seenMonsters.has(id)) this.visualMonsters.delete(id);
     }
 
     const seenProjectiles = new Set();
@@ -544,6 +613,11 @@ export class ArenaRenderer {
         break;
       }
       case "impact": {
+        if (event.kind === "orb") {
+          this.burst(event.x, event.y, color, 10, 150, { size: 2, life: 0.35, kind: "spark" });
+          this.addRing(event.x, event.y, 3, 22, color, 0.24, 1.6);
+          break;
+        }
         const shard = event.kind === "frost";
         const spark = event.kind === "spark";
         this.addExplosion(
@@ -609,7 +683,8 @@ export class ArenaRenderer {
           life: 0.28,
           kind: "ember",
         });
-        const hitVisual = this.visualPlayers.get(event.id);
+        const hitVisual =
+          this.visualPlayers.get(event.id) || this.visualMonsters.get(event.id);
         if (hitVisual) hitVisual.hurt = 0.3;
         this.shakeNear(
           client,
@@ -1156,6 +1231,193 @@ export class ArenaRenderer {
         this.addSpeech(event.id, event.text);
         break;
       }
+      case "monster_spawn": {
+        this.addRing(event.x, event.y, 30, 4, color, 0.5, 2.4);
+        this.burst(event.x, event.y, color, 12, 90, { size: 2, life: 0.5, kind: "wisp" });
+        break;
+      }
+      case "monster_death": {
+        const big = Boolean(event.boss);
+        this.addExplosion(event.x, event.y, color, "arcane", big ? 2.2 : 0.9);
+        this.burst(event.x, event.y, color, big ? 70 : 24, big ? 340 : 190, {
+          size: big ? 3.4 : 2.4,
+          life: big ? 1.1 : 0.6,
+          kind: "shard",
+        });
+        this.shakeNear(client, event.x, event.y, big ? 14 : 2.4);
+        break;
+      }
+      case "hazard_blast": {
+        if (event.x2 === null || event.x2 === undefined) {
+          this.addNova(event.x, event.y, event.radius, color, 0.5);
+          this.burst(event.x, event.y, color, 26, 240, { size: 2.6, life: 0.55, kind: "ember" });
+        } else {
+          this.effects.push({
+            kind: "beam",
+            x1: event.x,
+            y1: event.y,
+            x2: event.x2,
+            y2: event.y2,
+            width: event.radius,
+            color,
+            life: 0.32,
+            age: 0,
+          });
+        }
+        this.shakeNear(client, event.x, event.y, 4);
+        break;
+      }
+      case "pickup": {
+        const heal = event.kind === "hp";
+        this.addFloater(event.x, event.y - 16, heal ? "+HP" : "+мана", heal ? "#ff9aa0" : "#9fc0ff", 13);
+        this.burst(event.x, event.y, heal ? "#ff6b7a" : "#6fa8ff", 8, 90, {
+          size: 1.8,
+          life: 0.4,
+          kind: "spark",
+        });
+        break;
+      }
+      case "crit": {
+        this.addFloater(event.x, event.y - 34, "крит!", "#ffe17a", 16);
+        this.burst(event.x, event.y, "#ffe17a", 12, 180, { size: 2, life: 0.35, kind: "spark" });
+        break;
+      }
+      case "resist": {
+        this.addFloater(event.x, event.y - 18, event.text, "#d6dcea", 13);
+        this.addRing(event.x, event.y, 4, 22, "#d6e6ff", 0.25, 1.6);
+        break;
+      }
+      case "pull": {
+        this.addRing(event.x, event.y, 40, 6, VIOLET, 0.5, 2.2);
+        this.burst(event.x, event.y, VIOLET, 18, 120, { size: 2, life: 0.5, kind: "wisp" });
+        break;
+      }
+      case "room_lock":
+      case "room_clear": {
+        this.shake(kind === "room_lock" ? 5 : 3);
+        break;
+      }
+      case "fix_done": {
+        this.addNova(event.x, event.y, 340, "#4fe08a", 0.9);
+        this.addRing(event.x, event.y, 20, 240, "#ffffff", 0.7, 3);
+        this.burst(event.x, event.y, "#4fe08a", 60, 320, { size: 2.6, life: 0.9, kind: "spark" });
+        this.addFloater(event.x, event.y - 70, "ПАТЧ ПРИМЕНЁН", "#7fffb0", 18);
+        this.shake(8);
+        break;
+      }
+      case "deflect": {
+        this.addRing(event.x, event.y, 6, 34, event.color, 0.28, 2.4);
+        this.burst(event.x, event.y, event.color, 12, 200, { size: 2, life: 0.3, kind: "spark" });
+        break;
+      }
+      case "sudo": {
+        this.addRing(event.x, event.y, 30, 300, "#ffd93d", 0.6, 4);
+        this.addFloater(event.x, event.y - 72, "SUDO", "#ffe17a", 18);
+        this.shake(5);
+        break;
+      }
+      case "mark": {
+        if (typeof event.from_x === "number") {
+          this.addLine(event.from_x, event.from_y, event.x, event.y, "#ff4f6a", 0.35, 3);
+        }
+        this.addRing(event.x, event.y, 50, 14, "#ff4f6a", 0.35, 2.4);
+        break;
+      }
+      case "segfault": {
+        this.addNova(event.x, event.y, 170, "#ff4f6a", 0.55);
+        this.burst(event.x, event.y, "#ff8fa0", 34, 300, { size: 2.6, life: 0.5, kind: "spark" });
+        this.addFloater(event.x, event.y - 40, "SEGFAULT", "#ff8fa0", 16);
+        this.shake(6);
+        break;
+      }
+      case "hijack": {
+        this.addRing(event.x, event.y, 70, 16, "#7fffb0", 0.45, 3);
+        this.burst(event.x, event.y, "#7fffb0", 24, 170, { size: 2, life: 0.6, kind: "spark" });
+        this.addFloater(event.x, event.y - 48, "ВЗЛОМ", "#7fffb0", 16);
+        break;
+      }
+      case "patch": {
+        this.addLine(event.from_x, event.from_y, event.x, event.y, "#6fd6ff", 0.32, 4);
+        this.addRing(event.x, event.y, 8, 46, "#6fd6ff", 0.4, 2.4);
+        this.addFloater(event.x, event.y - 44, `+${Math.round(event.amount)}`, "#9fe6ff", 15);
+        break;
+      }
+      case "rollback": {
+        this.addLine(event.from_x, event.from_y, event.x, event.y, "#a6e4ff", 0.6, 6);
+        this.addRing(event.x, event.y, 90, 10, "#a6e4ff", 0.55, 3);
+        this.addFloater(event.x, event.y - 56, "ОТКАТ", "#d6f0ff", 17);
+        this.shake(4);
+        break;
+      }
+      case "scan": {
+        this.addRing(event.x, event.y, 10, 70, "#e08cff", 0.5, 2);
+        this.addRing(event.x, event.y, 10, 44, "#e08cff", 0.36, 2);
+        this.addFloater(event.x, event.y - 48, "СКАН", "#e8c6ff", 14);
+        break;
+      }
+      case "breakpoint": {
+        this.addRing(event.x, event.y, event.radius * 1.5, event.radius, "#d6f0ff", 0.4, 4);
+        this.shake(3);
+        break;
+      }
+      case "gate_open": {
+        this.addRing(event.x, event.y, 200, 20, "#ff4f6a", 0.8, 3);
+        this.shake(8);
+        break;
+      }
+      case "gate_lift": {
+        this.addNova(event.x, event.y, 280, "#ffffff", 0.8);
+        this.addFloater(event.x, event.y - 80, "ЗАЩИТА СНЯТА", "#ffe17a", 18);
+        this.shake(10);
+        break;
+      }
+      case "boss_cast": {
+        this.addRing(event.x, event.y, 30, 150, color, 0.45, 3);
+        this.shake(3);
+        break;
+      }
+      case "curse": {
+        this.addRing(event.x, event.y, 60, 12, "#ff6a7a", 0.4, 3);
+        this.addFloater(event.x, event.y - 54, CURSE_LABELS[event.kind] || "", "#ff9aa0", 15);
+        break;
+      }
+      case "recall": {
+        this.addLine(event.from_x, event.from_y, event.x, event.y, "#a78bff", 0.5, 5);
+        this.addRing(event.x, event.y, 70, 12, "#a78bff", 0.45, 3);
+        this.addFloater(event.x, event.y - 54, "continue", "#d6c6ff", 16);
+        this.shake(4);
+        break;
+      }
+      case "swap_warn": {
+        this.addLine(event.x1, event.y1, event.x2, event.y2, "#ffd27a", 1.1, 2);
+        this.addRing(event.x1, event.y1, 60, 24, "#ffd27a", 1.1, 2);
+        this.addRing(event.x2, event.y2, 60, 24, "#ffd27a", 1.1, 2);
+        break;
+      }
+      case "swap": {
+        this.addLine(event.x1, event.y1, event.x2, event.y2, "#ffffff", 0.3, 6);
+        this.addRing(event.x1, event.y1, 10, 90, "#ffd27a", 0.4, 3);
+        this.addRing(event.x2, event.y2, 10, 90, "#ffd27a", 0.4, 3);
+        this.shake(6);
+        break;
+      }
+      case "deploy_blast": {
+        this.addNova(event.x, event.y, 900, "#ff4f6a", 1);
+        this.addFloater(event.x, event.y - 90, "ВЫКАТИЛ В ПРОД", "#ff9aa0", 20);
+        this.shake(16);
+        break;
+      }
+      case "deploy_broken": {
+        this.addNova(event.x, event.y, 280, "#4fe08a", 0.7);
+        this.addFloater(event.x, event.y - 90, "СБОРКА УПАЛА", "#9ff0c0", 20);
+        this.shake(8);
+        break;
+      }
+      case "boss_dizzy": {
+        this.addRing(event.x, event.y - 30, 10, 60, "#ffe17a", 0.6, 2.4);
+        this.addFloater(event.x, event.y - 70, "уязвим!", "#ffe17a", 16);
+        break;
+      }
       default:
         break;
     }
@@ -1207,14 +1469,36 @@ export class ArenaRenderer {
     };
 
     // What light falls on: the room and everyone standing in it.
+    const dungeon = client.config?.mode === "story";
     applyCamera(worldCtx);
     if (this.floorCanvas) {
-      worldCtx.drawImage(this.floorCanvas, 0, 0);
+      worldCtx.drawImage(
+        this.floorCanvas,
+        0,
+        0,
+        client.config.arena.w,
+        client.config.arena.h,
+      );
     }
-    drawAmbient(worldCtx, client.config, now, zoom);
-    this.drawEffects(worldCtx, now, zoom, true);
-    drawArenaBorder(worldCtx, client.config, now, zoom);
-    drawWallTorches(worldCtx, client.config, now);
+    if (dungeon) {
+      drawDoors(worldCtx, client.story?.doors, client.config, now);
+      drawPortal(worldCtx, client.story, client.config, now);
+      drawPickups(worldCtx, client.pickups, now);
+      this.drawEffects(worldCtx, now, zoom, true);
+      drawLamps(worldCtx, client.config, now);
+      drawTerminals(worldCtx, client.terminals, now);
+      drawCables(worldCtx, client.players, client.terminals, now);
+      drawBreakpoints(worldCtx, client.breakpoints, now);
+      drawBarriers(worldCtx, client.barriers, now);
+      for (const visual of this.visualPlayers.values()) {
+        if (visual.data.sudo) drawSudo(worldCtx, visual.x, visual.y, now);
+      }
+    } else {
+      drawAmbient(worldCtx, client.config, now, zoom);
+      this.drawEffects(worldCtx, now, zoom, true);
+      drawArenaBorder(worldCtx, client.config, now, zoom);
+      drawWallTorches(worldCtx, client.config, now);
+    }
     this.drawScene(worldCtx, client, now, zoom, labels);
     if (this.quality >= QUALITY_LIGHTS) {
       this.applyLighting(client, now, applyCamera);
@@ -1222,6 +1506,7 @@ export class ArenaRenderer {
 
     // What gives light off: magic stays at full brightness on top of the room.
     applyCamera(worldCtx);
+    drawHazards(worldCtx, client.hazards, now);
     this.drawWards(worldCtx, client, now, zoom);
     this.drawEmps(worldCtx, client, now, zoom);
     this.drawClouds(worldCtx, client, now, zoom);
@@ -1238,12 +1523,123 @@ export class ArenaRenderer {
     ctx.drawImage(this.worldCanvas, 0, 0, this.width, this.height);
     ctx.imageSmoothingEnabled = true;
 
+    if (dungeon) {
+      this.drawMonsterBars(ctx);
+      this.drawHazardLabels(ctx, client.hazards);
+      drawWeather(ctx, client.config, this.width, this.height, now);
+    }
     this.drawNameplates(ctx, labels, client, now);
     this.drawFloaties(ctx);
     this.drawOffscreenTargets(ctx, client);
+    if (dungeon) this.drawTerminalMarkers(ctx, client, now);
     this.drawAim(ctx, client, now);
 
     this.drawFrameVignette(ctx);
+    if (dungeon) this.drawMinimap(ctx, client);
+  }
+
+  /** A pointer to broken terminals, on screen or off: they are where the story goes. */
+  drawTerminalMarkers(ctx, client, now) {
+    for (const terminal of client.terminals || []) {
+      if (terminal.solved) continue;
+      const screen = this.worldToScreen(terminal.x, terminal.y);
+      const inside =
+        screen.x > 0 && screen.x < this.width && screen.y > 0 && screen.y < this.height;
+      const bob = Math.sin(now / 180) * 5;
+      ctx.save();
+      if (inside) {
+        ctx.translate(screen.x, screen.y - 76 * this.camera.zoom - 16 + bob);
+        ctx.rotate(Math.PI / 2);
+      } else {
+        const dx = screen.x - this.width / 2;
+        const dy = screen.y - this.height / 2;
+        const scale = Math.min(
+          (this.width / 2 - 34) / Math.max(1, Math.abs(dx)),
+          (this.height / 2 - 34) / Math.max(1, Math.abs(dy)),
+        );
+        ctx.translate(this.width / 2 + dx * scale, this.height / 2 + dy * scale);
+        ctx.rotate(Math.atan2(dy, dx));
+      }
+      ctx.fillStyle = terminal.role === "gate" ? "#ff4f6a" : "#ffd93d";
+      ctx.strokeStyle = "#0a0810";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(12, 0);
+      ctx.lineTo(-8, -10);
+      ctx.lineTo(-3, 0);
+      ctx.lineTo(-8, 10);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  /** PGT signs his lies: the words go on the screen layer so they stay readable. */
+  drawHazardLabels(ctx, hazards) {
+    ctx.save();
+    ctx.font = "bold 14px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const hazard of hazards || []) {
+      if (!hazard.label) continue;
+      const screen = this.worldToScreen(hazard.x, hazard.y);
+      ctx.fillStyle = "rgba(6, 7, 13, 0.75)";
+      ctx.fillRect(screen.x - 42, screen.y - 11, 84, 22);
+      ctx.fillStyle = hazard.color;
+      ctx.fillText(hazard.label, screen.x, screen.y);
+    }
+    ctx.restore();
+  }
+
+  drawMonsterBars(ctx) {
+    for (const visual of this.visualMonsters.values()) {
+      const { hp, max_hp: maxHp, r } = visual.data;
+      if (!(hp < maxHp) || visual.data.arriving || r > 40) continue;
+      const screen = this.worldToScreen(visual.x, visual.y);
+      const lift = (Number(r) || 18) * this.camera.zoom * 2.4 + 8;
+      drawMonsterBar(ctx, screen.x, screen.y - lift, 34, clamp(hp / maxHp, 0, 1));
+    }
+  }
+
+  drawMinimap(ctx, client) {
+    const map = this.minimap;
+    if (!map) return;
+    const scale = Math.min(MINIMAP_WIDTH / map.width, MINIMAP_HEIGHT / map.height);
+    const width = map.width * scale;
+    const height = map.height * scale;
+    const left = this.width - width - 14;
+    const top = 76;
+    const tile = client.config.tile || 48;
+    const at = (x, y) => [left + (x / tile) * scale, top + (y / tile) * scale];
+    ctx.save();
+    ctx.fillStyle = "rgba(6, 7, 13, 0.62)";
+    ctx.fillRect(left - 6, top - 6, width + 12, height + 12);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(map, left, top, width, height);
+    ctx.imageSmoothingEnabled = true;
+    if (client.story?.portal) {
+      const [x, y] = at(client.story.portal[0], client.story.portal[1]);
+      ctx.fillStyle = client.story.portal_ready ? "#f4d99b" : "rgba(244, 217, 155, 0.35)";
+      ctx.fillRect(x - 2, y - 2, 5, 5);
+    }
+    for (const terminal of client.terminals || []) {
+      if (terminal.solved) continue;
+      const [x, y] = at(terminal.x, terminal.y);
+      ctx.fillStyle = "#4fe08a";
+      ctx.fillRect(x - 2, y - 2, 5, 5);
+    }
+    for (const monster of client.monsters || []) {
+      const [x, y] = at(monster.x, monster.y);
+      ctx.fillStyle = "#e76972";
+      ctx.fillRect(x - 1, y - 1, 2, 2);
+    }
+    for (const player of client.players.values()) {
+      const [x, y] = at(player.x, player.y);
+      ctx.fillStyle = player.id === client.selfId ? "#ffffff" : player.color || VIOLET;
+      ctx.fillRect(x - 1.5, y - 1.5, 4, 4);
+    }
+    ctx.restore();
   }
 
   /** Step the effects down, once and for good, if frames stay slow. */
@@ -1282,7 +1678,35 @@ export class ArenaRenderer {
   collectLights(client, now) {
     const lights = this.lights;
     lights.length = 0;
-    collectWorldLights(client.config, now, lights);
+    if (client.config?.mode === "story") {
+      const zoom = this.camera.zoom;
+      collectDungeonLights(client.config, now, lights, {
+        x: this.camera.x,
+        y: this.camera.y,
+        reachX: this.width / zoom,
+        reachY: this.height / zoom,
+      });
+      if (client.story?.portal_ready) {
+        const [x, y] = client.story.portal;
+        lights.push({ x, y, radius: 380, color: themeOf(client.config).accent, power: 1 });
+      }
+      for (const visual of this.visualMonsters.values()) {
+        if (visual.data.r > 30) {
+          lights.push({ x: visual.x, y: visual.y, radius: 260, color: "#ffffff", power: 0.5 });
+        }
+      }
+      for (const terminal of client.terminals || []) {
+        lights.push({
+          x: terminal.x,
+          y: terminal.y,
+          radius: 230,
+          color: terminal.solved ? "#4fe08a" : "#ff6a7a",
+          power: 0.9,
+        });
+      }
+    } else {
+      collectWorldLights(client.config, now, lights);
+    }
 
     for (const visual of this.visualPlayers.values()) {
       const color = visual.data.color || VIOLET;
@@ -1296,7 +1720,7 @@ export class ArenaRenderer {
     }
     for (const visual of this.visualProjectiles.values()) {
       const { kind, color } = visual.data;
-      const radius = kind === "fire" ? 260 : kind === "frost" ? 190 : 130;
+      const radius = kind === "fire" ? 260 : kind === "frost" ? 190 : kind === "orb" ? 110 : 130;
       lights.push({ x: visual.x, y: visual.y, radius, color: color || GOLD, power: 1 });
     }
     for (const ward of client.wards) {
@@ -1387,7 +1811,8 @@ export class ArenaRenderer {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = "source-over";
     ctx.globalAlpha = 1;
-    ctx.fillStyle = AMBIENT_LIGHT;
+    ctx.fillStyle =
+      client.config?.mode === "story" ? themeOf(client.config).ambient : AMBIENT_LIGHT;
     ctx.fillRect(0, 0, this.lightCanvas.width, this.lightCanvas.height);
 
     applyCamera(ctx);
@@ -1483,9 +1908,13 @@ export class ArenaRenderer {
     for (const visual of this.visualPlayers.values()) {
       scene.push({ depth: visual.y, visual });
     }
+    for (const creature of this.visualMonsters.values()) {
+      scene.push({ depth: creature.y, creature });
+    }
     scene.sort((a, b) => a.depth - b.depth);
-    for (const { obstacle, visual } of scene) {
+    for (const { obstacle, visual, creature } of scene) {
       if (obstacle) drawObstacle(ctx, obstacle, now, this.obstacleAlpha(obstacle, self));
+      else if (creature) drawMonster(ctx, creature, now);
       else this.drawPlayer(ctx, visual, client, now, zoom, labels);
     }
   }
@@ -1855,6 +2284,10 @@ export class ArenaRenderer {
     ctx.globalCompositeOperation = "lighter";
     for (const visual of this.visualProjectiles.values()) {
       const projectile = visual.data;
+      if (projectile.kind === "orb") {
+        this.drawOrb(ctx, visual, projectile.color, t);
+        continue;
+      }
       const isFrost = projectile.kind === "frost";
       const isSpark = projectile.kind === "spark";
       const baseColor =
@@ -1980,6 +2413,30 @@ export class ArenaRenderer {
       ctx.restore();
     }
     ctx.restore();
+  }
+
+  /** Enemy shots: small, hard-edged and ringed in dark so they read on any floor. */
+  drawOrb(ctx, visual, color, t) {
+    const pulse = 1 + Math.sin(t * 16 + visual.data.id) * 0.12;
+    const { x, y } = visual;
+    ctx.fillStyle = rgba(color, 0.34);
+    ctx.beginPath();
+    ctx.arc(x, y, 21 * pulse, 0, TAU);
+    ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "#0b0812";
+    ctx.beginPath();
+    ctx.arc(x, y, 12.5, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, 10, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(x - 2, y - 2, 4, 0, TAU);
+    ctx.fill();
+    ctx.globalCompositeOperation = "lighter";
   }
 
   drawWards(ctx, client, now, zoom) {
@@ -2719,24 +3176,28 @@ export class ArenaRenderer {
 
       if (label.dead) {
         const respawn = Number(player.respawn_in || 0);
-        ctx.fillStyle = "rgba(231, 105, 114, 0.7)";
+        const story = client.config?.mode === "story";
+        ctx.fillStyle = "rgba(231, 105, 114, 0.8)";
         ctx.font = "13px 'Cozette', monospace";
         ctx.fillText(
-          `ВОЗРОЖДЕНИЕ ${respawn.toFixed(1)}`,
+          story ? `${player.name}: подойдите, чтобы поднять` : `ВОЗРОЖДЕНИЕ ${respawn.toFixed(1)}`,
           screenX,
           screenY - 46,
         );
+        const revive = Number(player.revive) || 0;
+        if (revive > 0) drawMonsterBar(ctx, screenX, screenY - 40, 60, clamp(revive, 0, 1));
         continue;
       }
 
       const color = player.color || VIOLET;
-      const hp = clamp(Number(player.hp) || 0, 0, 100);
+      const hp = clamp(((Number(player.hp) || 0) / (Number(player.max_hp) || 100)) * 100, 0, 100);
       const barWidth = self ? 60 : 50;
       const barY = nameY + 6;
 
       // Name and a colored identity gem.
       ctx.font = "13px 'Cozette', monospace";
-      const suffix = self ? " · вы" : player.bot ? " · дух" : "";
+      const job = ROLE_TITLES[player.role];
+      const suffix = job ? ` · ${job}` : self ? " · вы" : player.bot ? " · дух" : "";
       const displayName = `${player.name}${suffix}`.toUpperCase();
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(3, 4, 8, 0.9)";

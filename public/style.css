@@ -1419,7 +1419,8 @@ kbd {
   line-height: 17px;
 }
 
-#codeInput {
+#codeInput,
+.code-input {
   position: absolute;
   inset: 0;
   z-index: 1;
@@ -1444,7 +1445,8 @@ kbd {
   scrollbar-gutter: stable;
 }
 
-#codeInput::selection {
+#codeInput::selection,
+.code-input::selection {
   background: rgba(230, 196, 126, 0.3);
 }
 
@@ -3061,5 +3063,1117 @@ body:not(.in-game) .killfeed {
   .scoreboard-head {
     white-space: nowrap;
     letter-spacing: 0.04em;
+  }
+}
+
+/* ---------------------------------------------------------------- game modes */
+.mode-picker {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.mode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--ink-dim);
+  text-align: left;
+  line-height: 1.25;
+}
+
+.mode-card strong {
+  color: var(--ink);
+  font-weight: 400;
+}
+
+.mode-card.active {
+  border-color: var(--gold);
+  background: rgba(217, 181, 108, 0.12);
+}
+
+.mode-card.active strong {
+  color: var(--gold-bright);
+}
+
+body.in-camp .login-overlay {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+body:not(.in-game) .story-hud {
+  display: none;
+}
+
+body.story-mode .scoreboard,
+body.story-mode .killfeed,
+body.story-mode .online-pill .online-label {
+  display: none;
+}
+
+/* ----------------------------------------------------------------- the camp */
+.camp {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  overflow-y: auto;
+  background:
+    radial-gradient(ellipse at 50% 20%, rgba(70, 55, 110, 0.5), transparent 60%),
+    #07070e;
+  color: var(--ink);
+}
+
+.camp[hidden],
+.camp-entry[hidden],
+.camp-main[hidden],
+.camp-panel[hidden] {
+  display: none;
+}
+
+.camp h2 {
+  margin: 0;
+  color: var(--gold-bright);
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 400;
+}
+
+.camp h3 {
+  margin: 14px 0 8px;
+  color: var(--gold);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.camp-eyebrow {
+  margin: 0 0 4px;
+  color: var(--violet);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+}
+
+.camp-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(560px, 100%);
+}
+
+.camp-prologue {
+  color: var(--ink-dim);
+  line-height: 1.5;
+}
+
+.camp-join {
+  display: flex;
+  gap: 8px;
+}
+
+.camp-join input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.04);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.camp-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(1240px, 100%);
+  height: min(860px, 100%);
+}
+
+.camp-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.camp-pills {
+  display: flex;
+  gap: 8px;
+}
+
+.camp-pill {
+  padding: 7px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink-dim);
+}
+
+.camp-pill strong {
+  color: var(--gold-bright);
+  font-weight: 400;
+  letter-spacing: 0.14em;
+}
+
+.camp-pill.essence strong {
+  color: #a8e0ff;
+  letter-spacing: 0;
+}
+
+.camp-banner {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 3px solid #7fe0b0;
+  background: rgba(127, 224, 176, 0.1);
+  color: #c6f6e0;
+}
+
+.camp-banner.lost {
+  border-color: var(--danger);
+  background: rgba(231, 105, 114, 0.12);
+  color: #ffb4b8;
+}
+
+.camp-body {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+}
+
+.camp-side,
+.camp-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 11, 20, 0.8);
+  overflow-y: auto;
+}
+
+.camp-side .text-button {
+  padding-top: 12px;
+}
+
+#campLog {
+  margin-top: auto;
+}
+
+.camp-seats {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.camp-seat {
+  display: grid;
+  grid-template-columns: 10px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.camp-seat.offline {
+  opacity: 0.45;
+}
+
+.camp-seat-dot {
+  width: 10px;
+  height: 10px;
+  background: var(--player-color, var(--gold));
+}
+
+.camp-seat-state {
+  color: var(--muted);
+}
+
+.camp-seat.ready .camp-seat-state {
+  color: #7fe0b0;
+}
+
+.camp-chapter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.camp-chapter-title {
+  color: var(--ink-dim);
+}
+
+.camp-stages {
+  display: flex;
+  gap: 5px;
+}
+
+.camp-stage {
+  width: 34px;
+  height: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink);
+}
+
+.camp-stage:disabled {
+  color: rgba(255, 255, 255, 0.24);
+  cursor: default;
+}
+
+.camp-stage.done {
+  border-color: rgba(127, 224, 176, 0.5);
+  color: #7fe0b0;
+}
+
+.camp-stage.current {
+  border-color: var(--gold);
+  background: rgba(217, 181, 108, 0.22);
+  color: var(--gold-bright);
+}
+
+.camp-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.camp-tab {
+  padding: 7px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--ink-dim);
+}
+
+.camp-tab.active {
+  border-color: var(--gold);
+  color: var(--gold-bright);
+}
+
+.camp-panel {
+  flex: 1;
+  min-height: 0;
+}
+
+.camp-story {
+  max-width: 680px;
+  color: var(--ink-dim);
+  line-height: 1.55;
+}
+
+.lesson {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  gap: 14px;
+}
+
+.lesson-text {
+  min-height: 0;
+  overflow-y: auto;
+  color: var(--ink-dim);
+  line-height: 1.5;
+}
+
+.lesson-text h3 {
+  margin-top: 0;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 18px;
+}
+
+.lesson-rune {
+  margin: 0 0 8px;
+  color: #a8e0ff;
+}
+
+.lesson-example {
+  margin: 10px 0 0;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.4);
+  border-left: 2px solid var(--violet);
+  color: #d9d4c7;
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+}
+
+.lesson-work {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.lesson-task-label {
+  margin: 0;
+  color: var(--gold);
+}
+
+.lesson-task {
+  margin: 0;
+  color: var(--ink);
+  line-height: 1.4;
+}
+
+.lesson-code {
+  flex: 1 1 auto;
+  min-height: 150px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.lesson-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lesson-actions .enter-button {
+  flex: 0 0 150px;
+  margin: 0;
+}
+
+.lesson-result {
+  margin: 0;
+  line-height: 1.35;
+}
+
+.lesson-result.ok {
+  color: #7fe0b0;
+}
+
+.lesson-result.bad {
+  color: #ffb4b8;
+}
+
+.upgrade-intro {
+  margin: 0 0 12px;
+  color: var(--ink-dim);
+}
+
+.upgrade-tree {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.upgrade-branch {
+  --branch: #e76972;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.upgrade-branch.mana {
+  --branch: var(--mana);
+}
+
+.upgrade-branch.might {
+  --branch: #ff9a4d;
+}
+
+.upgrade-branch.grace {
+  --branch: #7fe0b0;
+}
+
+.upgrade-branch.bond {
+  --branch: var(--gold);
+}
+
+.upgrade-branch-title {
+  margin: 0;
+  padding-bottom: 4px;
+  border-bottom: 2px solid var(--branch);
+  color: var(--branch);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.upgrade-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* The rail between rungs: a branch is climbed from the top down. */
+.upgrade-node + .upgrade-node::before {
+  content: "";
+  position: absolute;
+  top: -11px;
+  left: 50%;
+  width: 2px;
+  height: 10px;
+  background: var(--branch);
+  opacity: 0.6;
+}
+
+.upgrade-node.maxed {
+  border-color: var(--branch);
+}
+
+.upgrade-name {
+  color: var(--ink);
+  font-weight: 400;
+}
+
+.upgrade-about {
+  margin: 0;
+  color: var(--ink-dim);
+  line-height: 1.25;
+}
+
+.upgrade-bonus {
+  margin: 0;
+  color: var(--branch);
+}
+
+.upgrade-pips {
+  display: flex;
+  gap: 3px;
+  margin-top: auto;
+}
+
+.upgrade-pips i {
+  flex: 1;
+  height: 7px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.upgrade-pips i.on {
+  background: var(--branch);
+}
+
+.upgrade-buy {
+  padding: 6px 4px;
+  border: 1px solid var(--branch);
+  color: var(--ink);
+  line-height: 1.2;
+}
+
+.upgrade-buy:disabled {
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--muted);
+  cursor: default;
+}
+
+/* -------------------------------------------------------------- dungeon HUD */
+.story-hud {
+  position: absolute;
+  top: 74px;
+  left: 50%;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: min(520px, 90%);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.story-hud[hidden],
+.boss-bar[hidden],
+.intro-card[hidden] {
+  display: none;
+}
+
+.story-goal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 5px 14px;
+  background: rgba(6, 7, 13, 0.62);
+  text-align: center;
+}
+
+.story-goal strong {
+  color: var(--gold-bright);
+  font-weight: 400;
+}
+
+.story-goal span {
+  color: var(--ink-dim);
+}
+
+.boss-bar {
+  width: 100%;
+}
+
+.boss-bar span {
+  display: block;
+  margin-bottom: 3px;
+  color: #ffb4b8;
+  text-align: center;
+}
+
+.boss-track {
+  height: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(6, 7, 13, 0.8);
+}
+
+.boss-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #b83a44, #e76972);
+  transition: width 0.15s linear;
+}
+
+.party-frames {
+  position: absolute;
+  left: 26px;
+  bottom: 118px;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.party-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 150px;
+  padding: 4px 6px;
+  background: rgba(6, 7, 13, 0.62);
+}
+
+.party-frame.dead {
+  opacity: 0.5;
+}
+
+.party-frame-bar {
+  display: block;
+  height: 5px;
+  background: linear-gradient(90deg, #e76972 var(--fill), rgba(255, 255, 255, 0.1) var(--fill));
+}
+
+.party-frame-bar.mana {
+  background: linear-gradient(90deg, var(--mana) var(--fill), rgba(255, 255, 255, 0.1) var(--fill));
+}
+
+.story-comms {
+  position: absolute;
+  left: 50%;
+  bottom: 118px;
+  z-index: 15;
+  width: min(620px, calc(100% - 32px));
+  padding: 9px 13px;
+  border-left: 3px solid var(--violet);
+  background: rgba(6, 7, 13, 0.82);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.story-comms .dialogue {
+  margin: 0;
+}
+
+.terminal-prompt {
+  position: absolute;
+  left: 50%;
+  bottom: 190px;
+  z-index: 16;
+  padding: 8px 14px;
+  border: 1px solid #4fe08a;
+  background: rgba(6, 18, 12, 0.9);
+  color: #9ff0c0;
+  transform: translateX(-50%);
+  animation: terminal-pulse 1.1s ease-in-out infinite;
+}
+
+.terminal-prompt:disabled {
+  border-color: rgba(255, 255, 255, 0.2);
+  color: var(--ink-dim);
+  animation: none;
+}
+
+.terminal-prompt[hidden],
+.story-comms[hidden],
+.terminal[hidden] {
+  display: none;
+}
+
+@keyframes terminal-pulse {
+  50% {
+    box-shadow: 0 0 16px rgba(79, 224, 138, 0.5);
+  }
+}
+
+/* Words spoken by someone: Ada on the radio, the assistant on every channel. */
+.dialogue {
+  margin: 0 0 9px;
+  color: var(--ink);
+  line-height: 1.45;
+}
+
+.dialogue b {
+  display: block;
+  font-weight: 400;
+  color: var(--gold);
+}
+
+.dialogue.continued b {
+  display: none;
+}
+
+.dialogue.ada b {
+  color: #7fe0b0;
+}
+
+.dialogue.pgt b {
+  color: #ff6a7a;
+}
+
+.dialogue.pgt span {
+  color: #ffd2d6;
+}
+
+.role-bar {
+  display: flex;
+  gap: 6px;
+}
+
+.role-bar[hidden] {
+  display: none;
+}
+
+.role-chip {
+  padding: 2px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(6, 7, 13, 0.72);
+  color: var(--ink-dim);
+  font-family: var(--font-mono);
+}
+
+.role-chip.ready {
+  border-color: var(--role-color);
+  color: var(--role-color);
+}
+
+.role-panel {
+  overflow-y: auto;
+}
+
+.role-cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.role-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-top: 3px solid var(--role-color);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.role-card.active {
+  border-color: var(--role-color);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.role-name {
+  margin: 0;
+  color: var(--role-color);
+  font-size: 17px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.role-tagline,
+.role-passive {
+  margin: 0;
+  line-height: 1.35;
+}
+
+.role-tagline {
+  color: var(--ink-dim);
+}
+
+.role-skill {
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  line-height: 1.35;
+}
+
+.role-skill code {
+  color: var(--role-color);
+}
+
+.role-skill p {
+  margin: 3px 0;
+  color: var(--ink-dim);
+}
+
+.role-skill-meta {
+  color: var(--muted);
+}
+
+.role-example summary {
+  color: var(--gold);
+  cursor: pointer;
+}
+
+.role-card .upgrade-buy {
+  margin-top: auto;
+}
+
+.camp-tab.attention {
+  border-color: var(--gold);
+  color: var(--gold-bright);
+  animation: terminal-pulse 1.1s ease-in-out infinite;
+}
+
+.deploy {
+  margin-top: 4px;
+}
+
+.deploy[hidden],
+.boss-shout[hidden],
+.curse-bar[hidden],
+.comms-log[hidden] {
+  display: none;
+}
+
+.boss-bar .deploy span {
+  margin-bottom: 2px;
+  color: #ffd2d6;
+  animation: terminal-pulse 0.7s ease-in-out infinite;
+}
+
+.deploy-track {
+  height: 5px;
+  margin-bottom: 2px;
+  background: rgba(6, 7, 13, 0.8);
+}
+
+.deploy-time {
+  height: 100%;
+  background: #ff4f6a;
+}
+
+.deploy-break {
+  height: 100%;
+  background: #4fe08a;
+}
+
+.boss-shout {
+  margin: 0;
+  padding: 3px 10px;
+  background: rgba(6, 7, 13, 0.82);
+  color: #ff9aa0;
+  font-family: var(--font-mono);
+  text-align: center;
+}
+
+.curse-bar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.curse-chip {
+  padding: 3px 10px;
+  border-left: 3px solid #ff4f6a;
+  background: rgba(40, 8, 14, 0.86);
+  color: #ffd2d6;
+}
+
+.comms-toggle {
+  position: absolute;
+  top: 74px;
+  left: 26px;
+  z-index: 16;
+  padding: 4px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(6, 7, 13, 0.72);
+  color: var(--ink-dim);
+}
+
+.comms-toggle:hover {
+  color: var(--ink);
+}
+
+body:not(.story-mode) .comms-toggle,
+body:not(.story-mode) .story-only {
+  display: none;
+}
+
+.comms-log {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  bottom: 18px;
+  z-index: 95;
+  display: flex;
+  flex-direction: column;
+  width: min(380px, calc(100% - 36px));
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(6, 7, 13, 0.92);
+}
+
+.comms-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.comms-log-head h3 {
+  margin: 0;
+}
+
+.comms-log-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+
+.comms-log-stage {
+  margin: 14px 0 8px;
+  color: var(--gold-bright);
+  font-weight: 400;
+}
+
+.comms-log-stage:first-child {
+  margin-top: 0;
+}
+
+.comms-log-empty {
+  color: var(--ink-dim);
+}
+
+.camp-difficulty {
+  display: flex;
+  gap: 6px;
+}
+
+.camp-difficulty-level {
+  flex: 1;
+  padding: 6px 4px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(6, 7, 13, 0.6);
+  color: var(--ink-dim);
+}
+
+.camp-difficulty-level.active {
+  border-color: var(--gold);
+  color: var(--gold-bright);
+}
+
+.camp-difficulty-level:disabled {
+  cursor: default;
+}
+
+.camp-difficulty-about {
+  margin: 6px 0 0;
+  color: var(--ink-dim);
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+.boss-bar.shielded .boss-fill {
+  background: #6a6f82;
+}
+
+.boss-bar.shielded span {
+  color: #ff8fa0;
+}
+
+.terminal {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(1000px, calc(100vw - 32px));
+  height: min(600px, calc(100dvh - 32px));
+  padding: 14px 16px;
+  border: 1px solid rgba(79, 224, 138, 0.55);
+  background: rgba(7, 10, 12, 0.95);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+  color: var(--ink);
+  transform: translate(-50%, -50%);
+}
+
+.terminal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.terminal-head h3 {
+  margin: 2px 0 0;
+  font-size: 18px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.terminal-body {
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 14px;
+  min-height: 0;
+}
+
+.terminal-text {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.terminal-brief {
+  margin: 0;
+  color: var(--gold-bright);
+  line-height: 1.45;
+}
+
+.terminal-theory {
+  color: var(--ink-dim);
+  line-height: 1.45;
+}
+
+.terminal-theory summary {
+  color: var(--gold);
+  cursor: pointer;
+}
+
+.terminal-help {
+  flex: 1;
+  min-height: 0;
+}
+
+.terminal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.terminal-actions .pgt {
+  color: #ff8fa0;
+}
+
+.terminal-work {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.lesson-note {
+  margin: 8px 0 0;
+  color: var(--ink-dim);
+  line-height: 1.45;
+}
+
+.camp-subject {
+  color: var(--gold-bright);
+}
+
+.intro-card {
+  position: absolute;
+  top: 190px;
+  left: 26px;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 260px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--gold);
+  background: rgba(6, 7, 13, 0.8);
+  color: var(--ink-dim);
+  line-height: 1.3;
+  pointer-events: none;
+}
+
+.intro-card strong {
+  font-weight: 400;
+}
+
+@media (max-width: 900px) {
+  .camp {
+    align-items: flex-start;
+  }
+
+  .camp-main {
+    height: auto;
+  }
+
+  .terminal-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  }
+
+  .role-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .camp-body,
+  .lesson {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .upgrade-tree {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .party-frames {
+    left: 12px;
+    bottom: 196px;
+  }
+
+  .story-comms {
+    bottom: 150px;
+  }
+
+  .terminal-prompt {
+    bottom: 262px;
+  }
+
+  /* Up top it would cover the boss bar, right when the boss arrives. */
+  .intro-card {
+    top: auto;
+    bottom: 300px;
+    left: 12px;
+    width: calc(100% - 24px);
+  }
+
+  .comms-toggle {
+    top: 66px;
+    left: 12px;
   }
 }
