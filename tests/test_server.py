@@ -12,7 +12,14 @@ import struct
 import unittest
 
 from arcane.net import WebSocket
-from server import ArcaneServer, clean_name
+from server import (
+    MAX_CHECKS_PER_SECOND,
+    MAX_CLIENT_BACKLOG,
+    MAX_STALL_SECONDS,
+    ArcaneServer,
+    Client,
+    clean_name,
+)
 
 
 class ServerTestCase(unittest.IsolatedAsyncioTestCase):
@@ -156,6 +163,77 @@ class ServerTestCase(unittest.IsolatedAsyncioTestCase):
             if message.get("t") == kind:
                 return message
         self.fail(f"did not receive {kind}")
+
+    async def test_head_answers_once_with_the_real_length(self) -> None:
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(b"HEAD /app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(), timeout=3)
+        writer.close()
+        with contextlib.suppress(ConnectionError):
+            await writer.wait_closed()
+        self.assertEqual(raw.count(b"HTTP/1.1"), 1, raw)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertEqual(body, b"")
+        _, headers, full = await self.http_get("/app.js")
+        self.assertIn(f"Content-Length: {len(full)}".encode(), head)
+        self.assertEqual(headers["content-length"], str(len(full)))
+
+    async def test_a_visitor_watches_the_arena_before_joining(self) -> None:
+        self.app.arena.add_player("Гость")
+        reader, writer = await self.ws_connect()
+        try:
+            await self.wait_for_type(reader, "hello")
+            state = await self.wait_for_type(reader, "state")
+            self.assertEqual(state["players"][0]["name"], "Гость")
+        finally:
+            writer.close()
+
+    async def test_ping_echoes_the_client_clock(self) -> None:
+        reader, writer = await self.ws_connect()
+        try:
+            await self.send_json(writer, {"t": "ping", "at": 1234.5})
+            self.assertEqual((await self.wait_for_type(reader, "pong"))["at"], 1234.5)
+        finally:
+            writer.close()
+
+    async def test_check_reads_a_spell_without_casting_it(self) -> None:
+        reader, writer = await self.ws_connect()
+        try:
+            await self.send_json(
+                writer, {"t": "check", "slot": 1, "ticket": 7, "code": "fireball(0)"}
+            )
+            good = await self.wait_for_type(reader, "check_result")
+            self.assertTrue(good["ok"])
+            self.assertEqual((good["slot"], good["ticket"]), (1, 7))
+            self.assertEqual(good["cost"], [11, 11])
+
+            await self.send_json(
+                writer, {"t": "check", "slot": 0, "ticket": 8, "code": "x = 1\nimport os"}
+            )
+            bad = await self.wait_for_type(reader, "check_result")
+            self.assertFalse(bad["ok"])
+            self.assertTrue(bad["error"].startswith("Строка 2:"), bad["error"])
+        finally:
+            writer.close()
+
+    async def test_check_cannot_be_used_to_hammer_the_parser(self) -> None:
+        reader, writer = await self.ws_connect()
+        try:
+            for ticket in range(MAX_CHECKS_PER_SECOND + 4):
+                await self.send_json(
+                    writer, {"t": "check", "slot": 0, "ticket": ticket, "code": "x = 1"}
+                )
+            await self.send_json(writer, {"t": "ping", "at": 1})
+            replies = 0
+            while True:
+                message = await self.read_json(reader)
+                if message["t"] == "pong":
+                    break
+                replies += message["t"] == "check_result"
+            self.assertEqual(replies, MAX_CHECKS_PER_SECOND)
+        finally:
+            writer.close()
 
     async def test_health_and_world_endpoints(self) -> None:
         status, headers, body = await self.http_get("/health")
@@ -306,6 +384,60 @@ class WebSocketCloseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(writer.closed)
         await websocket.close()
         self.assertTrue(writer.closed)
+
+
+class StubSocket:
+    """A peer whose socket buffer we control, to play a slow connection."""
+
+    def __init__(self, backlog: int = 0) -> None:
+        self.backlog = backlog
+        self.sent: list[dict] = []
+        self.aborted = False
+        self.last_seen = 0.0
+
+    def send_text_nowait(self, text: str) -> bool:
+        self.sent.append(json.loads(text))
+        return True
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class SlowClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = ArcaneServer(bots=0)
+        self.quick = Client(StubSocket())
+        self.slow = Client(StubSocket())
+        self.app.clients.update((self.quick, self.slow))
+
+    def test_a_stuck_reader_is_skipped_and_others_still_get_the_tick(self) -> None:
+        self.slow.ws.backlog = MAX_CLIENT_BACKLOG + 1
+        self.app.broadcast(1.0, [{"e": "hit"}])
+        self.assertEqual(len(self.quick.ws.sent), 1)
+        self.assertEqual(self.slow.ws.sent, [])
+
+    def test_a_reader_that_recovers_catches_up_on_missed_events(self) -> None:
+        self.slow.ws.backlog = MAX_CLIENT_BACKLOG + 1
+        self.app.broadcast(1.0, [{"e": "death", "id": 1}])
+        self.app.broadcast(1.1, [{"e": "hit", "id": 2}])
+        self.slow.ws.backlog = 0
+        self.app.broadcast(1.2, [{"e": "respawn", "id": 1}])
+        self.assertEqual(len(self.slow.ws.sent), 1)
+        self.assertEqual(
+            [event["e"] for event in self.slow.ws.sent[0]["events"]],
+            ["death", "hit", "respawn"],
+        )
+        self.assertEqual([e["e"] for e in self.quick.ws.sent[-1]["events"]], ["respawn"])
+
+    def test_a_reader_stuck_for_too_long_is_cut_off(self) -> None:
+        player = self.app.arena.add_player("Тормоз")
+        self.slow.player_id = player.id
+        self.slow.ws.backlog = MAX_CLIENT_BACKLOG + 1
+        self.app.broadcast(1.0, [])
+        self.app.broadcast(1.0 + MAX_STALL_SECONDS + 0.1, [])
+        self.assertTrue(self.slow.ws.aborted)
+        self.assertNotIn(self.slow, self.app.clients)
+        self.assertNotIn(player.id, self.app.arena.players)
 
 
 class NameSanitisingTests(unittest.TestCase):

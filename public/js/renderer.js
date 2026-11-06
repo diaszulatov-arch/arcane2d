@@ -1,16 +1,31 @@
 /* Canvas renderer: camera, mages, projectiles, wards, particles and HUD overlays. */
 
 import {
+  OBSTACLE_HEIGHT,
   buildFloorCanvas,
+  collectWorldLights,
   drawAmbient,
-  drawObstacles,
   drawArenaBorder,
+  drawObstacle,
+  drawWallTorches,
 } from "./world-art.js";
 
 const TAU = Math.PI * 2;
 const GOLD = "#d9b56c";
 const VIOLET = "#a997ff";
 const EMP_COLOR = "#b38cff";
+
+// What a stone looks like with no light on it: the room is dim, not black, so
+// nothing a player must read ever disappears.
+const AMBIENT_LIGHT = "#6d6682";
+const SELF_LIGHT = "#ffe6c4";
+const LIGHT_SPRITE_SIZE = 96;
+const BLOOM_STRENGTH = 0.42;
+// Blasts open on the floor and mages stand over them, so a fight never hides them.
+const GROUND_EFFECTS = new Set(["scorch", "explosion", "nova"]);
+const QUALITY_FULL = 2;
+const QUALITY_LIGHTS = 1;
+const SLOW_FRAME = 1 / 28;
 
 function clamp(value, low, high) {
   return Math.max(low, Math.min(high, value));
@@ -113,6 +128,22 @@ export class ArenaRenderer {
     this.pixelScale = 0.5;
     this.worldCanvas = document.createElement("canvas");
     this.worldCtx = this.worldCanvas.getContext("2d", { alpha: false });
+    this.lightCanvas = document.createElement("canvas");
+    this.lightCtx = this.lightCanvas.getContext("2d", { alpha: false });
+    this.bloomCanvas = document.createElement("canvas");
+    this.bloomCtx = this.bloomCanvas.getContext("2d", { alpha: false });
+    this.softCanvas = document.createElement("canvas");
+    this.softCtx = this.softCanvas.getContext("2d", { alpha: false });
+    this.lightSprites = new Map();
+    this.lights = [];
+    // ?fx=0, 1 or 2 pins the effects; otherwise they step down on a slow machine.
+    const pinned = new URLSearchParams(window.location.search).get("fx");
+    this.qualityPinned = pinned === "0" || pinned === "1" || pinned === "2";
+    this.quality = this.qualityPinned ? Number(pinned) : QUALITY_FULL;
+    this.frameAverage = 1 / 60;
+    this.qualityCheckedAt = performance.now();
+    this.calmMotion =
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
     this.camera = { x: 950, y: 550, zoom: 0.8 };
     this.visualPlayers = new Map();
     this.visualProjectiles = new Map();
@@ -144,6 +175,12 @@ export class ArenaRenderer {
     this.pixelScale = 1 / pixelSize;
     this.worldCanvas.width = Math.max(1, Math.round(width * this.pixelScale));
     this.worldCanvas.height = Math.max(1, Math.round(height * this.pixelScale));
+    this.lightCanvas.width = this.worldCanvas.width;
+    this.lightCanvas.height = this.worldCanvas.height;
+    this.bloomCanvas.width = Math.max(1, Math.round(this.worldCanvas.width / 3));
+    this.bloomCanvas.height = Math.max(1, Math.round(this.worldCanvas.height / 3));
+    this.softCanvas.width = Math.max(1, Math.round(this.bloomCanvas.width / 3));
+    this.softCanvas.height = Math.max(1, Math.round(this.bloomCanvas.height / 3));
   }
 
   screenToWorld(x, y) {
@@ -233,7 +270,8 @@ export class ArenaRenderer {
   }
 
   shake(amount) {
-    this.shakeAmount = Math.min(24, this.shakeAmount + amount);
+    const scaled = this.calmMotion ? amount * 0.2 : amount;
+    this.shakeAmount = Math.min(24, this.shakeAmount + scaled);
   }
 
   shakeNear(client, x, y, amount) {
@@ -270,17 +308,8 @@ export class ArenaRenderer {
       const previousY = visual.y;
       const isSelf = player.id === client.selfId;
       if (isSelf && client.prediction?.active && !player.dead) {
-        const snapDistance = Math.hypot(
-          client.prediction.x - visual.x,
-          client.prediction.y - visual.y,
-        );
-        if (snapDistance > 170) {
-          visual.x = client.prediction.x;
-          visual.y = client.prediction.y;
-        } else {
-          visual.x = client.prediction.x;
-          visual.y = client.prediction.y;
-        }
+        visual.x = client.prediction.x;
+        visual.y = client.prediction.y;
         visual.aim = client.aim || 0;
       } else {
         const smoothing = 1 - Math.exp(-dt * 22);
@@ -316,10 +345,15 @@ export class ArenaRenderer {
         this.visualProjectiles.set(projectile.id, visual);
       }
       visual.data = projectile;
-      const smoothing = 1 - Math.exp(-dt * 42);
-      visual.x += (projectile.x - visual.x) * smoothing;
-      visual.y += (projectile.y - visual.y) * smoothing;
+      // Fly on between snapshots at the bolt's own speed, so it moves every
+      // frame rather than in 30 Hz hops, and only drift back toward the server.
       visual.angle = projectile.angle || 0;
+      const speed = Number(projectile.speed) || 0;
+      visual.x += Math.cos(visual.angle) * speed * dt;
+      visual.y += Math.sin(visual.angle) * speed * dt;
+      const correction = 1 - Math.exp(-dt * 14);
+      visual.x += (projectile.x - visual.x) * correction;
+      visual.y += (projectile.y - visual.y) * correction;
       visual.trail.push({ x: visual.x, y: visual.y });
       if (visual.trail.length > 20) visual.trail.shift();
     }
@@ -559,11 +593,11 @@ export class ArenaRenderer {
             event.y - 14,
             `−${Math.max(1, Math.round(damage))}`,
             event.id === client.selfId ? "#ff9aa0" : "#ffd7b0",
-            12,
+            16,
           );
         }
         if (absorbed > 0) {
-          this.addFloater(event.x + 13, event.y - 6, `+${Math.round(absorbed)} щит`, "#a9c6ff", 9);
+          this.addFloater(event.x + 13, event.y - 6, `−${Math.round(absorbed)} щит`, "#a9c6ff", 13);
         }
         this.burst(event.x, event.y, color, 12, 140, {
           size: 2,
@@ -875,7 +909,7 @@ export class ArenaRenderer {
             event.y - 30,
             `+${Math.round(Number(event.healed))}`,
             "#7ce0b6",
-            12,
+            16,
           );
         }
         this.shakeNear(client, event.x, event.y, 3.4);
@@ -943,7 +977,7 @@ export class ArenaRenderer {
           });
         }
         if (event.amount) {
-          this.addFloater(event.x, event.y - 28, `+${Math.round(event.amount)}`, "#7ce0b6", 13);
+          this.addFloater(event.x, event.y - 28, `+${Math.round(event.amount)}`, "#7ce0b6", 16);
         }
         break;
       }
@@ -1134,6 +1168,7 @@ export class ArenaRenderer {
     const dt = clamp(rawDt, 0.001, 0.05);
     this.lastFrame = now;
     this.frame += 1;
+    this.trackPerformance(rawDt, now);
     this.resize();
 
     this.updateCamera(client, dt);
@@ -1159,30 +1194,43 @@ export class ArenaRenderer {
 
     const { zoom, x: camX, y: camY } = this.camera;
     const labels = [];
+    const worldWidth = this.worldCanvas.width;
+    const worldHeight = this.worldCanvas.height;
+    const applyCamera = (target) => {
+      target.setTransform(1, 0, 0, 1, 0, 0);
+      target.translate(
+        worldWidth / 2 + shakeX * pixelScale,
+        worldHeight / 2 + shakeY * pixelScale,
+      );
+      target.scale(zoom * pixelScale, zoom * pixelScale);
+      target.translate(-camX, -camY);
+    };
 
-    worldCtx.save();
-    worldCtx.translate(
-      this.worldCanvas.width / 2 + shakeX * pixelScale,
-      this.worldCanvas.height / 2 + shakeY * pixelScale,
-    );
-    worldCtx.scale(zoom * pixelScale, zoom * pixelScale);
-    worldCtx.translate(-camX, -camY);
-
+    // What light falls on: the room and everyone standing in it.
+    applyCamera(worldCtx);
     if (this.floorCanvas) {
       worldCtx.drawImage(this.floorCanvas, 0, 0);
     }
     drawAmbient(worldCtx, client.config, now, zoom);
-    drawObstacles(worldCtx, client.config, now, zoom);
+    this.drawEffects(worldCtx, now, zoom, true);
     drawArenaBorder(worldCtx, client.config, now, zoom);
+    drawWallTorches(worldCtx, client.config, now);
+    this.drawScene(worldCtx, client, now, zoom, labels);
+    if (this.quality >= QUALITY_LIGHTS) {
+      this.applyLighting(client, now, applyCamera);
+    }
+
+    // What gives light off: magic stays at full brightness on top of the room.
+    applyCamera(worldCtx);
     this.drawWards(worldCtx, client, now, zoom);
     this.drawEmps(worldCtx, client, now, zoom);
     this.drawClouds(worldCtx, client, now, zoom);
     this.drawMeteors(worldCtx, client, now, zoom);
-    this.drawEffects(worldCtx, now, zoom);
-    this.drawPlayers(worldCtx, client, now, zoom, labels);
+    this.drawEffects(worldCtx, now, zoom, false);
     this.drawProjectiles(worldCtx, now, zoom);
     this.drawParticles(worldCtx, now, zoom);
-    worldCtx.restore();
+    worldCtx.setTransform(1, 0, 0, 1, 0, 0);
+    if (this.quality >= QUALITY_FULL) this.drawBloom(worldCtx);
 
     const ctx = this.ctx;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -1196,6 +1244,201 @@ export class ArenaRenderer {
     this.drawAim(ctx, client, now);
 
     this.drawFrameVignette(ctx);
+  }
+
+  /** Step the effects down, once and for good, if frames stay slow. */
+  trackPerformance(rawDt, now) {
+    if (this.qualityPinned || this.quality <= 0 || rawDt > 0.1) return;
+    this.frameAverage += (rawDt - this.frameAverage) * 0.03;
+    if (this.frameAverage > SLOW_FRAME && now - this.qualityCheckedAt > 3000) {
+      this.quality -= 1;
+      this.qualityCheckedAt = now;
+      this.frameAverage = 1 / 60;
+    }
+  }
+
+  // ---------------------------------------------------------------- lighting
+  lightSprite(color) {
+    let sprite = this.lightSprites.get(color);
+    if (!sprite) {
+      const size = LIGHT_SPRITE_SIZE;
+      sprite = document.createElement("canvas");
+      sprite.width = size;
+      sprite.height = size;
+      const ctx = sprite.getContext("2d");
+      const middle = size / 2;
+      const glow = ctx.createRadialGradient(middle, middle, 0, middle, middle, middle);
+      glow.addColorStop(0, rgba(color, 1));
+      glow.addColorStop(0.32, rgba(color, 0.62));
+      glow.addColorStop(0.68, rgba(color, 0.2));
+      glow.addColorStop(1, rgba(color, 0));
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, size, size);
+      this.lightSprites.set(color, sprite);
+    }
+    return sprite;
+  }
+
+  collectLights(client, now) {
+    const lights = this.lights;
+    lights.length = 0;
+    collectWorldLights(client.config, now, lights);
+
+    for (const visual of this.visualPlayers.values()) {
+      const color = visual.data.color || VIOLET;
+      if (visual.dead) {
+        lights.push({ x: visual.x, y: visual.y, radius: 90, color, power: 0.5 });
+      } else if (visual.data.id === client.selfId) {
+        lights.push({ x: visual.x, y: visual.y, radius: 360, color: SELF_LIGHT, power: 1 });
+      } else {
+        lights.push({ x: visual.x, y: visual.y, radius: 210, color, power: 0.85 });
+      }
+    }
+    for (const visual of this.visualProjectiles.values()) {
+      const { kind, color } = visual.data;
+      const radius = kind === "fire" ? 260 : kind === "frost" ? 190 : 130;
+      lights.push({ x: visual.x, y: visual.y, radius, color: color || GOLD, power: 1 });
+    }
+    for (const ward of client.wards) {
+      lights.push({
+        x: ward.x,
+        y: ward.y,
+        radius: ward.armed ? 120 : 70,
+        color: VIOLET,
+        power: 0.7,
+      });
+    }
+    for (const emp of client.emps || []) {
+      lights.push({
+        x: emp.x,
+        y: emp.y,
+        radius: (Number(emp.radius) || 190) * 1.3,
+        color: emp.color || EMP_COLOR,
+        power: 0.85,
+      });
+    }
+    for (const cloud of client.clouds || []) {
+      lights.push({
+        x: cloud.x,
+        y: cloud.y,
+        radius: (Number(cloud.radius) || 110) * 1.5,
+        color: cloud.color || "#86e08a",
+        power: 0.6,
+      });
+    }
+    for (const meteor of client.meteors || []) {
+      const delay = Math.max(0.1, Number(meteor.delay) || 1.15);
+      const nearing = clamp(1 - (Number(meteor.ttl) || 0) / delay, 0, 1);
+      lights.push({
+        x: meteor.x,
+        y: meteor.y,
+        radius: (Number(meteor.radius) || 120) * (0.9 + nearing),
+        color: meteor.color || "#ff7b45",
+        power: 0.35 + nearing * 0.55,
+      });
+    }
+    for (const effect of this.effects) {
+      const fade = 1 - clamp(effect.age / effect.life, 0, 1);
+      if (effect.kind === "explosion") {
+        lights.push({
+          x: effect.x,
+          y: effect.y,
+          radius: 300 * (effect.scale || 1),
+          color: effect.color,
+          power: fade,
+        });
+      } else if (effect.kind === "nova") {
+        lights.push({
+          x: effect.x,
+          y: effect.y,
+          radius: effect.radius * 1.5,
+          color: effect.color,
+          power: fade,
+        });
+      } else if (effect.kind === "beam") {
+        for (let step = 0; step <= 4; step += 1) {
+          lights.push({
+            x: effect.x1 + ((effect.x2 - effect.x1) * step) / 4,
+            y: effect.y1 + ((effect.y2 - effect.y1) * step) / 4,
+            radius: effect.width * 3.2,
+            color: effect.color,
+            power: fade,
+          });
+        }
+      } else if (effect.kind === "bolt") {
+        for (const point of effect.points) {
+          lights.push({
+            x: point.x,
+            y: point.y,
+            radius: 220,
+            color: effect.color,
+            power: fade,
+          });
+        }
+      }
+    }
+    void now;
+  }
+
+  /** Multiply a map of everything that glows over the room behind the magic. */
+  applyLighting(client, now, applyCamera) {
+    const ctx = this.lightCtx;
+    this.collectLights(client, now);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = AMBIENT_LIGHT;
+    ctx.fillRect(0, 0, this.lightCanvas.width, this.lightCanvas.height);
+
+    applyCamera(ctx);
+    ctx.globalCompositeOperation = "lighter";
+    for (const light of this.lights) {
+      const { x, y, radius, power } = light;
+      if (!(radius > 0) || !(power > 0)) continue;
+      ctx.globalAlpha = Math.min(1, power);
+      ctx.drawImage(this.lightSprite(light.color), x - radius, y - radius, radius * 2, radius * 2);
+    }
+    ctx.globalAlpha = 1;
+
+    const world = this.worldCtx;
+    world.setTransform(1, 0, 0, 1, 0, 0);
+    world.globalCompositeOperation = "multiply";
+    world.imageSmoothingEnabled = false;
+    world.drawImage(this.lightCanvas, 0, 0);
+    world.globalCompositeOperation = "source-over";
+  }
+
+  /**
+   * Soft glow over the crisp pixels. Canvas has no threshold, but multiplying
+   * an image by itself pushes everything except the brightest tones to black.
+   * Shrinking twice and stretching back is the blur: it costs two small copies,
+   * where a canvas filter costs a full convolution on every frame. It lands on
+   * the low-res world, so the glow comes out as chunky as the art around it.
+   */
+  drawBloom(ctx) {
+    const bloom = this.bloomCtx;
+    const canvas = this.bloomCanvas;
+    bloom.globalCompositeOperation = "copy";
+    bloom.imageSmoothingEnabled = true;
+    bloom.drawImage(this.worldCanvas, 0, 0, canvas.width, canvas.height);
+    bloom.globalCompositeOperation = "multiply";
+    bloom.drawImage(canvas, 0, 0);
+    bloom.drawImage(canvas, 0, 0);
+
+    const soft = this.softCtx;
+    const small = this.softCanvas;
+    soft.globalCompositeOperation = "copy";
+    soft.imageSmoothingEnabled = true;
+    soft.drawImage(canvas, 0, 0, small.width, small.height);
+
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.imageSmoothingEnabled = true;
+    ctx.globalAlpha = BLOOM_STRENGTH * 0.55;
+    ctx.drawImage(canvas, 0, 0, this.worldCanvas.width, this.worldCanvas.height);
+    ctx.globalAlpha = BLOOM_STRENGTH;
+    ctx.drawImage(small, 0, 0, this.worldCanvas.width, this.worldCanvas.height);
+    ctx.restore();
   }
 
   drawScreenBackdrop(ctx, width = this.width, height = this.height) {
@@ -1230,38 +1473,54 @@ export class ArenaRenderer {
     ctx.fillRect(0, 0, this.width, this.height);
   }
 
-  drawPlayers(ctx, client, now, zoom, labels) {
-    const players = [...this.visualPlayers.values()].sort((a, b) => a.y - b.y);
-    for (const visual of players) {
-      const screen = this.worldToScreen(visual.x, visual.y);
-      if (
-        screen.x < -110 ||
-        screen.x > this.width + 110 ||
-        screen.y < -100 ||
-        screen.y > this.height + 110
-      ) {
-        continue;
-      }
-      this.drawPlayerBody(ctx, visual, client, now, zoom);
-      if (!visual.dead) {
-        labels.push({
-          visual,
-          player: visual.data,
-          self: visual.data.id === client.selfId,
-          screenX: screen.x,
-          screenY: screen.y,
-        });
-      } else {
-        labels.push({
-          visual,
-          player: visual.data,
-          self: visual.data.id === client.selfId,
-          screenX: screen.x,
-          screenY: screen.y,
-          dead: true,
-        });
-      }
+  /** Mages and architecture share one depth order, so you can step behind a pillar. */
+  drawScene(ctx, client, now, zoom, labels) {
+    const self = this.visualPlayers.get(client.selfId);
+    const scene = [];
+    for (const obstacle of client.config?.obstacles || []) {
+      scene.push({ depth: obstacle.y, obstacle });
     }
+    for (const visual of this.visualPlayers.values()) {
+      scene.push({ depth: visual.y, visual });
+    }
+    scene.sort((a, b) => a.depth - b.depth);
+    for (const { obstacle, visual } of scene) {
+      if (obstacle) drawObstacle(ctx, obstacle, now, this.obstacleAlpha(obstacle, self));
+      else this.drawPlayer(ctx, visual, client, now, zoom, labels);
+    }
+  }
+
+  /** Thin out whatever stands in front of the player's own mage. */
+  obstacleAlpha(obstacle, self) {
+    if (!self || self.dead) return 1;
+    const behind = obstacle.y - self.y;
+    const height = OBSTACLE_HEIGHT[obstacle.kind] || 100;
+    const hidden =
+      behind > 0 &&
+      behind < height &&
+      Math.abs(self.x - obstacle.x) < obstacle.r * 1.1 + 14;
+    return hidden ? 0.42 : 1;
+  }
+
+  drawPlayer(ctx, visual, client, now, zoom, labels) {
+    const screen = this.worldToScreen(visual.x, visual.y);
+    if (
+      screen.x < -110 ||
+      screen.x > this.width + 110 ||
+      screen.y < -100 ||
+      screen.y > this.height + 110
+    ) {
+      return;
+    }
+    this.drawPlayerBody(ctx, visual, client, now, zoom);
+    labels.push({
+      visual,
+      player: visual.data,
+      self: visual.data.id === client.selfId,
+      screenX: screen.x,
+      screenY: screen.y,
+      dead: Boolean(visual.dead),
+    });
   }
 
   drawPlayerBody(ctx, visual, client, now, zoom) {
@@ -2159,10 +2418,12 @@ export class ArenaRenderer {
     }
   }
 
-  drawEffects(ctx, now, zoom) {
+  /** One pass for what spreads along the floor, one for what hangs in the air. */
+  drawEffects(ctx, now, zoom, onGround) {
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
     for (const effect of this.effects) {
+      if (GROUND_EFFECTS.has(effect.kind) !== onGround) continue;
       const progress = clamp(effect.age / effect.life, 0, 1);
       const eased = 1 - Math.pow(1 - progress, 3);
       const alpha = 1 - progress;
@@ -2245,9 +2506,9 @@ export class ArenaRenderer {
           radius,
         );
         const hot = effect.element === "frost" ? "#e6fdff" : "#fff5d6";
-        flash.addColorStop(0, rgba(hot, (1 - progress) * 0.95));
-        flash.addColorStop(0.24, rgba(effect.color, (1 - progress) * 0.8));
-        flash.addColorStop(0.56, rgba(effect.color, (1 - progress) * 0.3));
+        flash.addColorStop(0, rgba(hot, (1 - progress) * 0.72));
+        flash.addColorStop(0.24, rgba(effect.color, (1 - progress) * 0.5));
+        flash.addColorStop(0.56, rgba(effect.color, (1 - progress) * 0.18));
         flash.addColorStop(1, rgba(effect.color, 0));
         ctx.fillStyle = flash;
         ctx.beginPath();
@@ -2459,7 +2720,7 @@ export class ArenaRenderer {
       if (label.dead) {
         const respawn = Number(player.respawn_in || 0);
         ctx.fillStyle = "rgba(231, 105, 114, 0.7)";
-        ctx.font = "700 10px 'Cozette', monospace";
+        ctx.font = "13px 'Cozette', monospace";
         ctx.fillText(
           `ВОЗРОЖДЕНИЕ ${respawn.toFixed(1)}`,
           screenX,
@@ -2474,9 +2735,9 @@ export class ArenaRenderer {
       const barY = nameY + 6;
 
       // Name and a colored identity gem.
-      ctx.font = `${self ? "700" : "400"} 10px 'Cozette', monospace`;
-      const displayName = (self ? `${player.name} · вы` : player.name).toUpperCase();
-      const textWidth = Math.min(140, ctx.measureText(displayName).width);
+      ctx.font = "13px 'Cozette', monospace";
+      const suffix = self ? " · вы" : player.bot ? " · дух" : "";
+      const displayName = `${player.name}${suffix}`.toUpperCase();
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(3, 4, 8, 0.9)";
       ctx.strokeText(displayName, screenX, nameY);
@@ -2510,13 +2771,6 @@ export class ArenaRenderer {
         ctx.strokeRect(screenX - barWidth / 2 - 1.5, barY - 1.5, barWidth + 3, 8);
       }
 
-      if (player.bot) {
-        ctx.fillStyle = rgba(GOLD, 0.7);
-        ctx.font = "700 8px 'Cozette', monospace";
-        ctx.fillText("ДУХ", screenX, barY - 6);
-        void textWidth;
-      }
-
       const speech = this.speeches.find((item) => item.id === player.id);
       if (speech) {
         this.drawSpeechBubble(ctx, speech, screenX, nameY - 10);
@@ -2536,13 +2790,13 @@ export class ArenaRenderer {
 
   drawSpeechBubble(ctx, speech, screenX, bottomY) {
     ctx.save();
-    ctx.font = "10.5px 'Pixelify Sans', sans-serif";
-    const lines = wrapText(ctx, speech.text, 190, 3);
+    ctx.font = "13px 'Pixelify Sans', sans-serif";
+    const lines = wrapText(ctx, speech.text, 200, 3);
     if (!lines.length) {
       ctx.restore();
       return;
     }
-    const lineHeight = 14;
+    const lineHeight = 16;
     const width =
       Math.max(...lines.map((line) => ctx.measureText(line).width)) + 20;
     const height = lines.length * lineHeight + 12;

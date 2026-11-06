@@ -34,6 +34,7 @@ async def write_http_response(
     *,
     content_type: str = "text/plain; charset=utf-8",
     extra_headers: Mapping[str, str] | None = None,
+    head_only: bool = False,
 ) -> None:
     reasons = {
         200: "OK",
@@ -56,8 +57,8 @@ async def write_http_response(
     ]
     if extra_headers:
         headers.extend(f"{key}: {value}" for key, value in extra_headers.items())
-    payload = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + body
-    writer.write(payload)
+    payload = ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8")
+    writer.write(payload if head_only else payload + body)
     try:
         await writer.drain()
     except (ConnectionError, RuntimeError):
@@ -86,9 +87,8 @@ class WebSocket:
         self.writer.write(response.encode("ascii"))
         await self.writer.drain()
 
-    async def send_frame(self, opcode: int, payload: bytes) -> bool:
-        if self.closed:
-            return False
+    @staticmethod
+    def _frame(opcode: int, payload: bytes) -> bytes:
         if opcode >= 8 and len(payload) > 125:
             raise ValueError("control frame too large")
         first = 0x80 | (opcode & 0x0F)
@@ -99,16 +99,62 @@ class WebSocket:
             header = struct.pack("!BBH", first, 126, length)
         else:
             header = struct.pack("!BBQ", first, 127, length)
+        return header + payload
+
+    async def send_frame(self, opcode: int, payload: bytes) -> bool:
+        if self.closed:
+            return False
+        frame = self._frame(opcode, payload)
         async with self._write_lock:
             if self.closed:
                 return False
             try:
-                self.writer.write(header + payload)
+                self.writer.write(frame)
                 await self.writer.drain()
                 return True
             except (ConnectionError, RuntimeError):
                 self.closed = True
                 return False
+
+    def _send_nowait(self, opcode: int, payload: bytes) -> bool:
+        """Queue a frame without waiting for the peer to read it.
+
+        The game loop serves every player, so it must never wait on one of
+        them.  ``write`` takes the whole frame at once, which keeps it safe
+        beside a ``send_frame`` that is parked in ``drain``.
+        """
+
+        if self.closed or self.writer.is_closing():
+            return False
+        try:
+            self.writer.write(self._frame(opcode, payload))
+            return True
+        except (ConnectionError, RuntimeError):
+            self.closed = True
+            return False
+
+    def send_text_nowait(self, text: str) -> bool:
+        return self._send_nowait(0x1, text.encode("utf-8"))
+
+    def send_ping_nowait(self) -> bool:
+        return self._send_nowait(0x9, b"arcane")
+
+    @property
+    def backlog(self) -> int:
+        """Bytes written but not yet taken by the peer's socket."""
+
+        transport = self.writer.transport
+        if transport is None or transport.is_closing():
+            return 0
+        return transport.get_write_buffer_size()
+
+    def abort(self) -> None:
+        """Drop a stuck connection at once, without the closing handshake."""
+
+        self.closed = True
+        transport = self.writer.transport
+        if transport is not None:
+            transport.abort()
 
     async def send_text(self, text: str) -> bool:
         try:

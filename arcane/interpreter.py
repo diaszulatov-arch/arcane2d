@@ -26,6 +26,8 @@ MAX_CALL_DEPTH = 10
 MAX_SEQUENCE = 250
 MAX_STRING = 4_000
 MAX_INT_BITS = 2_048
+MAX_WEIGHT = 2_000
+MAX_MANA_ESTIMATE = 999
 
 
 class SpellError(Exception):
@@ -413,6 +415,130 @@ def validate_source(source: str) -> ast.Module:
     return tree
 
 
+def _weigh(value: Any, limit: int = MAX_WEIGHT) -> int:
+    """Count what a value reaches through its containers, stopping past ``limit``.
+
+    One list can reference another 250 times, so a tower of four short lists
+    stands for billions of elements.  ``str`` and ``==`` would walk all of them
+    in C, out of reach of the step budget.  Shared references are counted again
+    on purpose: that repetition is exactly what those operations pay for.
+    """
+
+    weight = 0
+    pending = [value]
+    while pending and weight <= limit:
+        item = pending.pop()
+        if isinstance(item, (list, tuple)):
+            weight += len(item)
+            pending.extend(item)
+        elif isinstance(item, dict):
+            weight += len(item)
+            pending.extend(item.values())
+        elif isinstance(item, str):
+            weight += len(item) // 32
+    return weight
+
+
+def spell_text(value: Any) -> str:
+    """``str(value)`` for spell data, refusing values too costly to render."""
+
+    if _weigh(value) > MAX_WEIGHT:
+        raise SpellRuntimeError("Коллекция слишком велика, чтобы превратить её в текст.")
+    return str(value)
+
+
+def _ordered_items(values: Iterable[Any], name: str) -> None:
+    if not all(isinstance(value, (int, float, str)) for value in values):
+        raise SpellRuntimeError(f"{name}() можно применять только к числам/строкам.")
+
+
+def _loop_count(node: ast.expr) -> int | None:
+    """How many times a ``for`` runs, when that is plain from its source."""
+
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return len(node.elts)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "range"
+        and not node.keywords
+        and all(
+            isinstance(arg, ast.Constant) and type(arg.value) is int
+            for arg in node.args
+        )
+    ):
+        try:
+            return len(range(*(arg.value for arg in node.args)))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
+def mana_estimate(tree: ast.Module, costs: Mapping[str, int]) -> tuple[int, int]:
+    """Cheapest and dearest mana path through a spell, by reading its source.
+
+    A hint for the editor, not a rule: conditions are not evaluated, so the
+    range brackets what a cast may spend.  Runs on unsaved source from any
+    visitor, so it must stay linear: each helper is priced once and remembered,
+    or a chain of helpers calling the next one twice would take 2^n visits.
+    """
+
+    functions = {
+        node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    }
+    priced: dict[str, tuple[int, int]] = {}
+
+    def price(name: str) -> tuple[int, int]:
+        if name not in priced:
+            priced[name] = (0, 0)  # A recursive call adds nothing of its own.
+            priced[name] = block(functions[name].body)
+        return priced[name]
+
+    def expression(node: ast.AST) -> tuple[int, int]:
+        low = high = 0
+        for child in ast.walk(node):
+            if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Name)):
+                continue
+            name = child.func.id
+            if name in costs:
+                low += costs[name]
+                high += costs[name]
+            elif name in functions:
+                body_low, body_high = price(name)
+                low += body_low
+                high += body_high
+        return low, high
+
+    def statement(node: ast.stmt) -> tuple[int, int]:
+        if isinstance(node, ast.FunctionDef):
+            return 0, 0
+        if isinstance(node, ast.If):
+            test_low, test_high = expression(node.test)
+            body_low, body_high = block(node.body)
+            else_low, else_high = block(node.orelse)
+            return test_low + min(body_low, else_low), test_high + max(body_high, else_high)
+        if isinstance(node, ast.For):
+            times = _loop_count(node.iter)
+            body_low, body_high = block(node.body)
+            if times is None:
+                return 0, body_high
+            return body_low * times, body_high * times
+        if isinstance(node, ast.While):
+            return 0, block(node.body)[1]
+        return expression(node)
+
+    def block(statements: list[ast.stmt]) -> tuple[int, int]:
+        low = high = 0
+        for node in statements:
+            node_low, node_high = statement(node)
+            low += node_low
+            high += node_high
+        return low, high
+
+    low, high = block(tree.body)
+    return min(low, MAX_MANA_ESTIMATE), min(high, MAX_MANA_ESTIMATE)
+
+
 def safe_globals(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return the immutable part of a spell's environment."""
 
@@ -442,9 +568,10 @@ def safe_globals(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
             values = args[0]
         else:
             values = args
+        if not values:
+            raise SpellRuntimeError("min() от пустого списка.")
+        _ordered_items(values, "min")
         try:
-            if not values:
-                raise SpellRuntimeError("min() от пустого списка.")
             return min(values)
         except TypeError:
             raise SpellRuntimeError("min() можно применять только к числам/строкам.") from None
@@ -457,9 +584,10 @@ def safe_globals(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
             values = args[0]
         else:
             values = args
+        if not values:
+            raise SpellRuntimeError("max() от пустого списка.")
+        _ordered_items(values, "max")
         try:
-            if not values:
-                raise SpellRuntimeError("max() от пустого списка.")
             return max(values)
         except TypeError:
             raise SpellRuntimeError("max() можно применять только к числам/строкам.") from None
@@ -512,7 +640,7 @@ def safe_globals(extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
     def _to_str(value: Any = "") -> str:
         if isinstance(value, (UnitView, OwnView, PointView)):
             raise SpellRuntimeError("Этот объект нельзя превратить в строку.")
-        text = str(value)
+        text = spell_text(value)
         if len(text) > MAX_STRING:
             raise SpellRuntimeError("Строка получилась слишком длинной.")
         return text
@@ -618,6 +746,16 @@ class Interpreter:
             raise SpellRuntimeError(
                 "Заклинание оказалось слишком сложным и было остановлено."
             )
+
+    def _charge(self, value: Any) -> None:
+        """Bill a C-level walk over a container for every element it may touch."""
+
+        if isinstance(value, (list, tuple, dict)):
+            self.steps += _weigh(value, self.step_limit)
+            if self.steps > self.step_limit:
+                raise SpellRuntimeError(
+                    "Заклинание оказалось слишком сложным и было остановлено."
+                )
 
     def _rt(self, node: ast.AST, message: str) -> SpellRuntimeError:
         return SpellRuntimeError(
@@ -848,6 +986,8 @@ class Interpreter:
         if isinstance(node, ast.Subscript):
             container = self._eval(node.value, env)
             key = self._eval_slice_or_index(node.slice, env)
+            if isinstance(container, dict) and isinstance(key, (list, tuple, dict)):
+                raise self._rt(node, "Ключ словаря должен быть числом или строкой.")
             try:
                 value = container[key]
             except (IndexError, KeyError, TypeError):
@@ -885,7 +1025,10 @@ class Interpreter:
                     inner = self._eval(value_node.value, env)
                     if isinstance(inner, (UnitView, OwnView, PointView)):
                         raise self._rt(node, "Этот объект нельзя вставить в строку.")
-                    part = str(inner)
+                    try:
+                        part = spell_text(inner)
+                    except SpellRuntimeError as exc:
+                        raise self._locate(node, exc) from None
                 else:
                     raise self._rt(node, "Некорректная f-строка.")
                 total += len(part)
@@ -918,6 +1061,12 @@ class Interpreter:
         return bool(value)
 
     def _compare(self, operator: ast.cmpop, left: Any, right: Any, node: ast.AST) -> bool:
+        if not isinstance(operator, (ast.Is, ast.IsNot)):
+            try:
+                self._charge(left)
+                self._charge(right)
+            except SpellRuntimeError as exc:
+                raise self._locate(node, exc) from None
         try:
             if isinstance(operator, ast.Eq):
                 return left == right
@@ -984,6 +1133,8 @@ class Interpreter:
                 if abs(left) > 10**9:
                     raise self._rt(node, "Слишком большое основание степени.")
                 result = left**right
+                if isinstance(result, complex):
+                    raise self._rt(node, "Дробная степень отрицательного числа недоступна.")
             else:
                 raise self._rt(node, "Недопустимая операция.")
         except ZeroDivisionError:
