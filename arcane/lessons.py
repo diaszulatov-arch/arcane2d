@@ -10,12 +10,20 @@ because reading and fixing code is the skill this world has lost.
 from __future__ import annotations
 
 import ast
+import copy
 import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from .game import Arena, Player, SpellSession
-from .interpreter import SpellError, call_function, validate_source
+from .interpreter import (
+    Interpreter,
+    SpellError,
+    SpellRuntimeError,
+    call_function,
+    safe_globals,
+    validate_source,
+)
 
 MAX_TASK_CHARS = 2_000
 ANGLE_TOLERANCE = 0.02
@@ -63,6 +71,56 @@ class Call:
     returns: Any
 
 
+class ScriptRun:
+    """What a program did to the pretend system around it: calls and final names."""
+
+    def __init__(self, calls: list[tuple[str, tuple[Any, ...]]], interpreter: Interpreter) -> None:
+        self.calls = calls
+        self._interpreter = interpreter
+
+    def args(self, name: str) -> list[tuple[Any, ...]]:
+        return [args for called, args in self.calls if called == name]
+
+    def first(self, name: str) -> Any:
+        """The first argument of every call to ``name``, in order."""
+
+        return [args[0] if args else None for args in self.args(name)]
+
+    def value(self, name: str, default: Any = None) -> Any:
+        return self._interpreter.root.values.get(name, default)
+
+    def call(self, name: str, *args: Any) -> Any:
+        function = self._interpreter.root.values.get(name)
+        if not hasattr(function, "body"):
+            raise SpellRuntimeError(f"Функция {name} не найдена.")
+        try:
+            return self._interpreter._call_user_function(
+                function, list(args), {}, function.body[0]
+            )
+        except SpellError:
+            raise
+        except RecursionError:
+            raise SpellRuntimeError("Функция ушла в слишком глубокую рекурсию.") from None
+        except Exception:
+            raise SpellRuntimeError("Внутренняя ошибка функции.") from None
+
+
+@dataclass(frozen=True, slots=True)
+class Script:
+    """Run the program inside a made-up system and judge what it did to it.
+
+    ``data`` are names the program finds already set, ``api`` the functions of
+    the system: each records its calls and answers with a value or a function
+    of its arguments.  It is how a quest asks for real work on a database or a
+    balancer without a single spell being cast.
+    """
+
+    expect: Callable[[ScriptRun], "str | None"]
+    data: tuple[tuple[str, Any], ...] = ()
+    api: tuple[tuple[str, Any], ...] = ()
+    situation: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class Task:
     key: str
@@ -71,7 +129,7 @@ class Task:
     solution: str
     hints: tuple[str, str]
     pgt: str
-    checks: tuple[Trial | Call, ...]
+    checks: tuple[Trial | Call | Script, ...]
     must_use: tuple[type[ast.AST], ...] = ()
     must_call: tuple[str, ...] = ()
     recursive: bool = False
@@ -981,6 +1039,27 @@ def _run_call(code: str, call: Call, known: set[str]) -> str | None:
     return None
 
 
+def _run_script(code: str, script: Script) -> str | None:
+    calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def recorder(name: str, answer: Any) -> Callable[..., Any]:
+        def record(*args: Any) -> Any:
+            calls.append((name, tuple(copy.deepcopy(args))))
+            return answer(*args) if callable(answer) else copy.deepcopy(answer)
+
+        return record
+
+    extra: dict[str, Any] = {"print": recorder("print", None), "log": recorder("log", None)}
+    extra.update({name: copy.deepcopy(value) for name, value in script.data})
+    extra.update({name: recorder(name, answer) for name, answer in script.api})
+    interpreter = Interpreter(code, safe_globals(extra))
+    try:
+        interpreter.run()
+        return script.expect(ScriptRun(calls, interpreter))
+    except SpellError as exc:
+        return str(exc)
+
+
 def _is_recursive(tree: ast.Module) -> bool:
     for function in ast.walk(tree):
         if not isinstance(function, ast.FunctionDef):
@@ -1005,6 +1084,7 @@ CONSTRUCT_NAMES: dict[type[ast.AST], str] = {
     ast.Subscript: "обращение по индексу",
     ast.JoinedStr: "f-строку",
     ast.Slice: "срез",
+    ast.Break: "break",
 }
 
 
@@ -1037,6 +1117,12 @@ def check_task(task: Task, code: str, known: set[str]) -> dict[str, Any]:
         return {"ok": False, "message": "Функция должна вызывать сама себя."}
 
     for check in task.checks:
+        if isinstance(check, Script):
+            failure = _run_script(code, check)
+            if failure:
+                prefix = f"Проверка {check.situation}: " if check.situation else ""
+                return {"ok": False, "message": f"{prefix}{failure}"}
+            continue
         if isinstance(check, Call):
             failure = _run_call(code, check, known)
             if failure:

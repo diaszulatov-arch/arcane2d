@@ -14,6 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .book import BOOK
+from .crew import ATM_BONUS, FRIDGE_HP, has
+from .folk_data import PERSON_BY_KEY
 from .game import CAST_LOCK, MANA_REGEN, MAX_HP, MAX_MANA, MOVE_SPEED, ROLL_COOLDOWN, Player
 
 MAX_UPGRADE_LEVEL = 5
@@ -180,6 +183,7 @@ class Perks:
     ward_shield: float = 0.0
     pierce_guard: bool = False
     weak_scale: float = 1.0
+    catch: bool = False
 
 
 @dataclass(slots=True)
@@ -190,6 +194,14 @@ class Profile:
     upgrades: dict[str, int] = field(default_factory=dict)
     lessons: list[str] = field(default_factory=list)
     role: str = ""
+    relics: list[str] = field(default_factory=list)
+    runes: list[str] = field(default_factory=list)
+    tickets: list[str] = field(default_factory=list)
+    accepted: int = 0
+    endings: list[str] = field(default_factory=list)
+    duty_best: int = 0
+    duty_name: str = ""
+    folk: dict[str, str] = field(default_factory=dict)
 
     def level(self, stat: str) -> int:
         return self.upgrades.get(stat, 0)
@@ -213,16 +225,31 @@ class Profile:
         self.upgrades[stat] = level + 1
         return None
 
+    def buy_rune(self, name: str) -> str | None:
+        """Spend tokens on a rune from the book. Returns why it was refused, if it was."""
+
+        rune = BOOK.get(name)
+        if rune is None:
+            return "Такой руны в Книге нет."
+        if name in self.runes:
+            return "Эта руна у вас уже есть."
+        if self.essence < rune.price:
+            return f"Нужно токенов: {rune.price}."
+        self.essence -= rune.price
+        self.runes.append(name)
+        return None
+
     def bonus(self, stat: str) -> float:
         """The total an upgrade gives at its current level, in its own unit."""
 
         return self.level(stat) * UPGRADES[stat]["step"]
 
     def essence_rate(self) -> float:
-        return 1.0 + self.bonus("fortune") / 100
+        interest = ATM_BONUS if has(self.cleared, "atm") else 0.0
+        return 1.0 + self.bonus("fortune") / 100 + interest
 
     def apply_to(self, player: Player) -> None:
-        player.max_hp = MAX_HP + self.bonus("max_hp")
+        player.max_hp = MAX_HP + self.bonus("max_hp") + (FRIDGE_HP if has(self.cleared, "fridge") else 0.0)
         player.max_mana = MAX_MANA + self.bonus("max_mana")
         player.hp_regen = self.bonus("hp_regen")
         player.mana_regen = MANA_REGEN + self.bonus("mana_regen")
@@ -238,7 +265,9 @@ class Profile:
             pickups=1 + self.bonus("alchemy") / 100,
             pickup_reach=self.level("alchemy") * 50.0,
             ward_shield=self.bonus("ward_shield"),
+            catch=has(self.cleared, "queen"),
         )
+        player.book = frozenset(self.runes)
         player.hp = player.max_hp
         player.mana = player.max_mana
 
@@ -249,6 +278,14 @@ class Profile:
             "upgrades": dict(self.upgrades),
             "lessons": list(self.lessons),
             "role": self.role,
+            "relics": list(self.relics),
+            "runes": list(self.runes),
+            "tickets": list(self.tickets),
+            "accepted": self.accepted,
+            "endings": list(self.endings),
+            "duty_best": self.duty_best,
+            "duty_name": self.duty_name,
+            "folk": dict(self.folk),
         }
 
 
@@ -293,6 +330,18 @@ class ProfileStore:
                 upgrades=dict(entry.get("upgrades", {})),
                 lessons=list(entry.get("lessons", [])),
                 role=str(entry.get("role", "")),
+                relics=list(entry.get("relics", [])),
+                runes=[name for name in entry.get("runes", []) if name in BOOK],
+                tickets=list(entry.get("tickets", [])),
+                accepted=int(entry.get("accepted", 0)),
+                endings=list(entry.get("endings", [])),
+                duty_best=int(entry.get("duty_best", 0)),
+                duty_name=str(entry.get("duty_name", "")),
+                folk={
+                    str(key): str(status)
+                    for key, status in entry.get("folk", {}).items()
+                    if key in PERSON_BY_KEY
+                },
             )
 
     @staticmethod
@@ -309,6 +358,19 @@ class ProfileStore:
 
     def mark(self) -> None:
         self.dirty = True
+
+    def duty_board(self, limit: int = 8) -> list[dict[str, Any]]:
+        """The best shifts on this server. Only the names the mages gave themselves."""
+
+        best = sorted(
+            (profile for profile in self.profiles.values() if profile.duty_best > 0),
+            key=lambda profile: profile.duty_best,
+            reverse=True,
+        )
+        return [
+            {"name": profile.duty_name or "Аноним", "score": profile.duty_best}
+            for profile in best[:limit]
+        ]
 
     def save(self) -> None:
         """Write everything atomically, so a crash cannot leave half a file."""

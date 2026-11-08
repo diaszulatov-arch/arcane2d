@@ -12,6 +12,7 @@ import random
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
+from .boss_moves import autocomplete
 from .game import PLAYER_RADIUS, Player
 
 if TYPE_CHECKING:
@@ -76,6 +77,13 @@ class Monster(Player):
     deploy_hp: float = 0.0
     route_until: float = 0.0
     route_angle: float = 0.0
+    focus: int = 0
+    quest: str = ""
+    text: str = ""
+    elite: str = ""
+    pace: float = 1.0
+    returning_until: float = 0.0
+    tricks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +95,66 @@ class Attack:
 
 
 ATTACKS: dict[str, Attack] = {
+    "flash": Attack(
+        "LoadError: Flash Player is not installed",
+        "В кольце есть проём. Смотрите, где он, и вставайте туда.",
+    ),
+    "followers": Attack(
+        "201 Created: new followers",
+        "Сначала подписчики! Пока они есть, урон до него не дойдёт.",
+    ),
+    "duplicate": Attack(
+        "OSError: file already exists (copy)",
+        "Настоящий один. Копии падают с одного удара, а в коде видно их .hp.",
+    ),
+    "overheat": Attack(
+        "ThermalError: 95°C",
+        "Сейчас рванёт! Уходите из круга. Мороз отодвигает следующий перегрев.",
+    ),
+    "unclosed": Attack(
+        'print("Привет, мир!',
+        "Он забыл закрыть строку, и она ползёт за вами. Закройте её сами: добегите до кавычки в другом конце зала, и Скобка оглохнет.",
+    ),
+    "blink": Attack(
+        "<blink>",
+        "Самый ненавистный тег девяностых: круги горят по очереди. Перебегайте в тот, что сейчас погас.",
+    ),
+    "doomscroll": Attack(
+        "scrollTop += Infinity",
+        "Пол сам едет вниз, а внизу страницы жжётся. Бегите против ленты и ищите проёмы в постах.",
+    ),
+    "bait": Attack(
+        "<title>ВЫ НЕ ПОВЕРИТЕ</title>",
+        "Читайте заголовки. Настоящая аптечка та, что не кричит. Всё, что кричит, взорвётся.",
+    ),
+    "return_none": Attack(
+        "return None",
+        "Всё, что вы в неё бросите, вернётся в вас. Не стреляйте, пока круг не погаснет: потом она уязвима.",
+    ),
+    "del_floor": Attack(
+        "del floor[i]",
+        "Куски пола удаляются. Мигающая клетка скоро станет None, а стоять на None больно.",
+    ),
+    "zero_index": Attack(
+        "safe = rows[?]",
+        "Безопасен один ряд из названных, и считает он с нуля! rows[0] это самый левый, rows[-1] самый правый.",
+    ),
+    "bisect": Attack(
+        "bisect(mages, you)",
+        "Двоичный поиск: он жжёт половину, где вы стоите, и ищет дальше только в ней. Перебегите через середину, и он вас не найдёт.",
+    ),
+    "accept_all": Attack(
+        "accept_all()",
+        "Он бьёт по всему залу. «Принять» рядом и спасёт, но вылечит его и запишется вам в счёт. «Отклонить» честнее, но бежать далеко.",
+    ),
+    "autocomplete": Attack(
+        "# автодополнение: вы пойдёте сюда",
+        "Он дописывает ваше движение и ждёт в конце. Резко сверните или остановитесь.",
+    ),
+    "changes": Attack(
+        "Review: changes requested",
+        "Лучи по линии! А урон проходит, только если руна не та же, что в прошлый раз.",
+    ),
     "pincer": Attack(
         "SyntaxError: '(' was never closed",
         "Скобки смыкаются вокруг вас! Проём сверху и снизу.",
@@ -148,6 +216,10 @@ ATTACKS: dict[str, Attack] = {
     "patch": Attack(
         "# применяю безопасный патч",
         "Он врёт! Зелёное бьёт, красное пустое. Стойте в красном!",
+    ),
+    "oom": Attack(
+        "Out of memory: Killed process",
+        "Утечка выросла до предела и бьёт кольцом. Уходите в просвет между снарядами и добивайте.",
     ),
     "deploy": Attack(
         "git push --force origin main",
@@ -305,6 +377,104 @@ _species(
 )
 
 
+# Mini-bosses: one for the second stage of each chapter, with their small retinues.
+_species(
+    Species(
+        "flashintro", "Flash-заставка", "Кольца с проёмом, это её кнопка «Пропустить». Смотрите, где дыра, и вставайте туда.",
+        hp=340, speed=60, radius=36, contact=10, color="#ff9a2f", cost=0, ai="mini_flash",
+        shot_damage=7, shot_speed=210, boss=True, heavy=True,
+    ),
+    Species(
+        "influencer", "Инфлюенсер", "Пока у него есть подписчики, урон до него не доходит. На 66% и 33% набирает новых.",
+        hp=420, speed=84, radius=32, contact=0, color="#ff6b9e", cost=0, ai="mini_influencer",
+        shot_damage=8, shot_speed=300, interval=1.8, shots=3, spread=0.5, range=520, boss=True, heavy=True,
+    ),
+    Species(
+        "follower", "Подписчик", "Делает всё, что скажет Инфлюенсер. Один удар, и подписка отменена.",
+        hp=22, speed=128, radius=13, contact=5, color="#ffb3cf", cost=0, ai="swarm",
+    ),
+    Species(
+        "duplicate", "Файл (копия) (2)", "Копии выглядят так же, но ломаются от одного удара. У настоящего в .hp число побольше.",
+        hp=520, speed=74, radius=30, contact=0, color="#9fd4ff", cost=0, ai="mini_duplicate",
+        shot_damage=9, shot_speed=320, interval=2.0, range=480, boss=True, heavy=True,
+    ),
+    Species(
+        "dupe", "Файл (копия) (2)", "Пустая копия: один удар, и её нет.",
+        hp=1, speed=74, radius=30, contact=0, color="#9fd4ff", cost=0, ai="decoy",
+        shot_damage=3, shot_speed=320, interval=2.4,
+    ),
+    Species(
+        "hotserver", "Перегретая стойка", "Огонь не берёт. Мороз бьёт вдвое сильнее и отодвигает перегрев: пока держите её в холоде, зал цел.",
+        hp=720, speed=46, radius=38, contact=18, color="#ff7a3c", cost=0, ai="mini_hotserver",
+        shot_damage=9, shot_speed=270, interval=2.2, shots=3, spread=0.7, boss=True, heavy=True,
+        immune=frozenset({"fire"}), weak=frozenset({"frost"}),
+    ),
+    Species(
+        "reviewer", "Код-ревьюер", "Не принимает то, что только что видел. Чередуйте руны: в .text написано, что он видел последним.",
+        hp=880, speed=66, radius=32, contact=0, color="#ffe07a", cost=0, ai="mini_reviewer",
+        shot_damage=10, shot_speed=320, interval=2.2, shots=3, spread=0.4, range=560, boss=True, heavy=True,
+    ),
+)
+
+# Not enemies at all: a mage's own copy, and what the proving ground is furnished with.
+_species(
+    Species(
+        "clone", "Клон", "Ваша копия. Стреляет сама и оттягивает атаки на себя.",
+        hp=90, speed=120, radius=16, contact=0, color="#9fe8ff", cost=0, ai="shooter",
+        shot_damage=9, shot_speed=480, interval=0.9, range=520,
+    ),
+    Species(
+        "dummy", "Манекен", "Стоит и терпит.",
+        hp=1000, speed=0, radius=24, contact=0, color="#c9b48a", cost=0, ai="still", heavy=True,
+    ),
+    Species(
+        "dummy_walker", "Манекен на рельсах", "Ходит туда-сюда: на нём тренируют упреждение.",
+        hp=1000, speed=0, radius=24, contact=0, color="#8ac9b4", cost=0, ai="patrol", heavy=True,
+    ),
+)
+
+
+# Quest creatures: they belong to one problem on one stage, not to a chapter.
+_species(
+    Species(
+        "worker", "Воркер nginx", "Сбежавший процесс. Не дерётся, только удирает: загоните в угол и попадите.",
+        hp=22, speed=205, radius=13, contact=0, color="#7fe0a8", cost=0, ai="flee",
+    ),
+    Species(
+        "leak", "Утечка памяти", "Растёт, пока жива, а большая бьёт кольцом OOM. Бейте сразу.",
+        hp=300, speed=62, radius=30, contact=14, color="#5fd0ff", cost=0, ai="leak",
+        shot_damage=9, shot_speed=260,
+    ),
+    Species(
+        "ratebot", "Бот-запрос", "Не воюет: мчится к шлюзу и съедает токен. Сбейте на подходе.",
+        hp=12, speed=150, radius=12, contact=0, color="#c86bff", cost=0, ai="runner",
+    ),
+    Species(
+        "hotrack", "Горячая стойка", "Не враг, а пациент: frostbolt остужает её, огонь греет.",
+        hp=1000, speed=0, radius=30, contact=0, color="#ffae5c", cost=0, ai="still", heavy=True,
+    ),
+    Species(
+        "failtest", "Упавший тест", "Красный тест стреляет ошибками. Пока он жив, сборка не поедет.",
+        hp=46, speed=0, radius=18, contact=0, color="#ff4f6a", cost=0, ai="turret",
+        shot_damage=8, shot_speed=280, interval=2.1, shots=5, heavy=True,
+    ),
+    Species(
+        "letter", "Письмо", "Прочитайте его. Спам сбивайте, а настоящее письмо пусть дойдёт.",
+        hp=1, speed=52, radius=17, contact=0, color="#e8e4f4", cost=0, ai="runner",
+    ),
+    Species(
+        "phish", "Фишинговый сундук", "Сундук, который хотел ваши данные. Бросается с разбега.",
+        hp=120, speed=120, radius=22, contact=16, color="#d9a441", cost=4, ai="charger",
+    ),
+)
+
+FLEE_NOTICE = 430.0
+RUNNER_ARRIVES = 48.0
+LEAK_GROW_EVERY = 3.5
+LEAK_GROWTH = 1.07
+LEAK_MAX_RADIUS = 58.0
+
+
 def _angle_to(monster: Monster, target: Player) -> float:
     return math.atan2(target.y - monster.y, target.x - monster.x)
 
@@ -316,7 +486,7 @@ def _distance(monster: Monster, target: Player) -> float:
 def _speed(monster: Monster, world: "StoryArena") -> float:
     species = monster.species
     slowed = monster.slow_until > world.now
-    return species.speed * (0.58 if slowed else 1.0)
+    return species.speed * (0.58 if slowed else 1.0) * world.monster_pace * monster.pace
 
 
 def _step(monster: Monster, world: "StoryArena", angle: float, speed: float, dt: float) -> None:
@@ -647,8 +817,12 @@ def boss_syntax(world: "StoryArena", monster: Monster, target: Player, dt: float
         return
     _rest(world, monster, (2.3, 1.9, 1.5)[monster.phase])
     monster.strikes += 1
-    pattern = monster.strikes % 6
-    if pattern == 1:
+    pattern = monster.strikes % 8
+    if pattern in (6, 7):
+        if not world.next_boss_move(monster):
+            monster.spin += 0.4
+            _ring(world, monster, 10 + monster.phase * 4, monster.spin)
+    elif pattern == 1:
         monster.spin += 0.4
         _ring(world, monster, 10 + monster.phase * 4, monster.spin)
     elif pattern == 2:
@@ -754,8 +928,10 @@ def boss_loop(world: "StoryArena", monster: Monster, target: Player, dt: float) 
         return
     _rest_special(world, monster, (6.5, 5.5, 4.5)[monster.phase])
     monster.specials += 1
-    pattern = monster.specials % 3
-    if pattern == 1:
+    pattern = monster.specials % 5
+    if pattern in (3, 4):
+        world.next_boss_move(monster)
+    elif pattern == 1:
         world.announce(monster, "feed")
         _feed(world, monster)
         if monster.phase == 2:
@@ -820,8 +996,10 @@ def boss_null(world: "StoryArena", monster: Monster, target: Player, dt: float) 
         return
     _rest_special(world, monster, (6.5, 5.5, 4.5)[monster.phase])
     monster.specials += 1
-    pattern = monster.specials % 3
-    if pattern == 1:
+    pattern = monster.specials % 5
+    if pattern in (3, 4):
+        world.next_boss_move(monster)
+    elif pattern == 1:
         world.announce(monster, "null")
         _hex(world, monster, radius=125, damage=10, color=NULL_COLOR, effect="null")
     elif pattern == 2:
@@ -944,8 +1122,10 @@ def boss_index(world: "StoryArena", monster: Monster, target: Player, dt: float)
         return
     _rest_special(world, monster, (7.0, 6.0, 5.0)[monster.phase])
     monster.specials += 1
-    pattern = monster.specials % 4
-    if pattern == 1:
+    pattern = monster.specials % 6
+    if pattern in (4, 5):
+        world.next_boss_move(monster)
+    elif pattern == 1:
         world.announce(monster, "sweep")
         _sweep(world, monster, target)
     elif pattern == 2:
@@ -1008,8 +1188,14 @@ def boss_recursor(world: "StoryArena", monster: Monster, target: Player, dt: flo
         return
     _rest(world, monster, 2.2 + monster.generation * 0.4)
     monster.strikes += 1
-    pattern = monster.strikes % (5 if monster.generation < 2 else 3)
-    if pattern == 0:
+    pattern = monster.strikes % (7 if monster.generation == 0 else 5 if monster.generation < 2 else 3)
+    if pattern == 5:
+        world.announce(monster, "autocomplete")
+        autocomplete(world, monster)
+    elif pattern == 6:
+        if world.gate_boss is None:
+            world.next_boss_move(monster)
+    elif pattern == 0:
         monster.state = "windup"
         monster.state_until = now + 0.8
     elif pattern == 1:
@@ -1027,6 +1213,201 @@ def boss_recursor(world: "StoryArena", monster: Monster, target: Player, dt: flo
         _false_patch(world, monster)
 
 
+def flee(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Never fights: shuffles about until a mage comes near, then runs along the halls."""
+
+    if _distance(monster, target) > FLEE_NOTICE:
+        monster.wobble += dt
+        if math.sin(monster.wobble * 1.3 + monster.id) > 0.6:
+            monster.heading += dt * 2.0
+            _step(monster, world, monster.heading, _speed(monster, world) * 0.25, dt)
+        return
+    monster.heading = world.escape_route(monster, target)
+    _step(monster, world, monster.heading, _speed(monster, world), dt)
+
+
+def runner(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Pays no attention to anyone: it is going somewhere, and arriving is the attack."""
+
+    goal = world.quest.runner_goal() if world.quest is not None else None
+    if goal is None:
+        return
+    distance = math.hypot(goal[0] - monster.x, goal[1] - monster.y)
+    if distance <= RUNNER_ARRIVES:
+        world.quest.runner_arrived(monster)
+        return
+    monster.heading = math.atan2(goal[1] - monster.y, goal[0] - monster.x)
+    _step(monster, world, monster.heading, _speed(monster, world), dt)
+
+
+def still(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """A thing, not a creature: it stands there and is shot at."""
+
+
+def leak(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Crawls after the nearest mage and grows; at full size it frees memory the hard way."""
+
+    melee(world, monster, target, dt)
+    if world.now < monster.next_special or monster.generation:
+        return
+    monster.next_special = world.now + LEAK_GROW_EVERY
+    if monster.radius < LEAK_MAX_RADIUS:
+        monster.radius *= LEAK_GROWTH
+        monster.max_hp *= LEAK_GROWTH
+        monster.hp = min(monster.max_hp, monster.hp * LEAK_GROWTH)
+        return
+    world.announce(monster, "oom")
+    _ring(world, monster, 12, monster.spin)
+    monster.spin += 0.26
+
+
+# --------------------------------------------------------------- mini-bosses
+# Each teaches one thing the fights around it never asked for.
+FLASH_RING = 22
+FLASH_GAP = 4
+INFLUENCER_FOLLOWERS = 4
+INFLUENCER_GUARD = 0.25
+DUPE_COUNT = 3
+DUPE_EVERY = 7.0
+DUPE_TIME = 7.0
+HEAT_FUSE = 1.5
+HEAT_RADIUS = 300.0
+HEAT_DAMAGE = 34.0
+HEAT_COOLED = 5.0
+REVIEW_WIDTH = 60.0
+REVIEW_LENGTH = 720.0
+
+
+def mini_flash(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """A ring of shots with a gap in it: the gap is the «Пропустить» nobody ever pressed."""
+
+    species = monster.species
+    _set_phase(world, monster)
+    monster.heading = _angle_to(monster, target)
+    _advance(world, monster, target, dt)
+    _bite(world, monster, target)
+    if world.now >= monster.next_attack:
+        world.announce(monster, "flash")
+        gap = monster.heading + world.rng.uniform(-1.0, 1.0)
+        for index in range(FLASH_RING):
+            angle = gap + (index + FLASH_GAP / 2) / (FLASH_RING + FLASH_GAP) * math.tau
+            world.fire(monster, angle)
+        _rest(world, monster, 3.2 - monster.phase * 0.5)
+    if world.now >= monster.next_special and world.minion_count() < world.minion_limit():
+        world.spawn_near(monster, "popup", 110)
+        _rest_special(world, monster, 7.0)
+
+
+def _followers(world: "StoryArena", monster: Monster) -> list[Monster]:
+    return [other for other in world.monsters.values() if other.species.key == "follower"]
+
+
+def mini_influencer(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Untouchable while anybody follows: at 66% and 33% it simply gets new followers."""
+
+    species = monster.species
+    before = monster.phase
+    _set_phase(world, monster)
+    if monster.strikes == 0 or monster.phase != before:
+        monster.strikes = 1
+        world.announce(monster, "followers")
+        for _ in range(INFLUENCER_FOLLOWERS + monster.phase):
+            world.spawn_near(monster, "follower", 150)
+    if _followers(world, monster):
+        monster.invuln_until = world.now + INFLUENCER_GUARD
+    monster.heading = _angle_to(monster, target)
+    if _distance(monster, target) > species.range * 0.7:
+        _advance(world, monster, target, dt)
+    else:
+        _step(monster, world, monster.heading + math.pi / 2, _speed(monster, world) * 0.6, dt)
+    if world.now >= monster.next_attack and world.sees(monster, target):
+        _fan(world, monster, monster.heading)
+        _rest(world, monster, species.interval)
+
+
+def mini_duplicate(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Copies look the same, die at a touch and hurt little; only one of them has any hp."""
+
+    species = monster.species
+    _set_phase(world, monster)
+    monster.heading = _angle_to(monster, target)
+    if _distance(monster, target) > species.range * 0.7:
+        _advance(world, monster, target, dt)
+    if world.now >= monster.next_attack and world.sees(monster, target):
+        _fan(world, monster, monster.heading)
+        _rest(world, monster, species.interval)
+    if world.now >= monster.next_special:
+        world.announce(monster, "duplicate")
+        world.blink_near(monster, target, 320.0)
+        for _ in range(DUPE_COUNT + monster.phase):
+            copy = world.spawn_near(monster, "dupe", 220)
+            if copy is not None:
+                copy.leaked = True
+                copy.state_until = world.now + DUPE_TIME
+        _rest_special(world, monster, DUPE_EVERY)
+
+
+def mini_hotserver(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Vents the whole room on a fuse. Frost pushes the fuse back and stops it dead."""
+
+    species = monster.species
+    _set_phase(world, monster)
+    monster.heading = _angle_to(monster, target)
+    _advance(world, monster, target, dt)
+    _bite(world, monster, target)
+    if world.now >= monster.next_attack and world.sees(monster, target):
+        _fan(world, monster, monster.heading)
+        _rest(world, monster, species.interval)
+    if world.now >= monster.next_special:
+        world.announce(monster, "overheat")
+        world.place_hazard(
+            monster, monster.x, monster.y,
+            radius=HEAT_RADIUS, delay=HEAT_FUSE, damage=HEAT_DAMAGE,
+            color=species.color, label="ПЕРЕГРЕВ",
+        )
+        _rest_special(world, monster, 7.5 - monster.phase)
+
+
+def cool_down(world: "StoryArena", monster: Monster) -> None:
+    """What a frost hit does to the overheating rack, called from the damage path."""
+
+    monster.next_special = max(monster.next_special, world.now + HEAT_COOLED)
+    monster.stun_until = max(monster.stun_until, world.now + 0.5)
+
+
+def mini_reviewer(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Rejects whatever it has just seen. ``.text`` says what that was, so code can branch."""
+
+    species = monster.species
+    _set_phase(world, monster)
+    monster.heading = _angle_to(monster, target)
+    if _distance(monster, target) > species.range * 0.7:
+        _advance(world, monster, target, dt)
+    if world.now >= monster.next_attack and world.sees(monster, target):
+        _fan(world, monster, monster.heading)
+        _rest(world, monster, species.interval)
+    if world.now >= monster.next_special:
+        world.announce(monster, "changes")
+        for spread in (-0.5, 0.0, 0.5)[: 1 + 2 * min(1, monster.phase)]:
+            angle = monster.heading + spread
+            world.place_beam_hazard(
+                monster, monster.x, monster.y,
+                monster.x + math.cos(angle) * REVIEW_LENGTH,
+                monster.y + math.sin(angle) * REVIEW_LENGTH,
+                width=REVIEW_WIDTH, delay=1.0, damage=24.0, color=species.color,
+            )
+        _rest_special(world, monster, 5.0 - monster.phase * 0.6)
+
+
+def patrol(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    """Up and down the hall, so that aiming with an offset has something to practise on."""
+
+    monster.wobble += dt
+    x, y = monster.origin
+    monster.y = y + math.sin(monster.wobble * 0.8) * 160.0
+    monster.x = x
+
+
 THINKERS: dict[str, Callable[["StoryArena", Monster, Player, float], None]] = {
     "melee": melee,
     "swarm": swarm,
@@ -1034,6 +1415,10 @@ THINKERS: dict[str, Callable[["StoryArena", Monster, Player, float], None]] = {
     "charger": charger,
     "lobber": lobber,
     "summoner": summoner,
+    "flee": flee,
+    "runner": runner,
+    "still": still,
+    "leak": leak,
     "blinker": blinker,
     "turret": turret,
     "smasher": smasher,
@@ -1044,10 +1429,19 @@ THINKERS: dict[str, Callable[["StoryArena", Monster, Player, float], None]] = {
     "boss_null": boss_null,
     "boss_index": boss_index,
     "boss_recursor": boss_recursor,
+    "mini_flash": mini_flash,
+    "mini_influencer": mini_influencer,
+    "mini_duplicate": mini_duplicate,
+    "mini_hotserver": mini_hotserver,
+    "mini_reviewer": mini_reviewer,
+    "patrol": patrol,
 }
 
 
 def think(world: "StoryArena", monster: Monster, target: Player, dt: float) -> None:
+    if monster.elite == "deprecated":
+        flee(world, monster, target, dt)
+        return
     THINKERS[monster.species.ai](world, monster, target, dt)
 
 

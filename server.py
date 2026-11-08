@@ -13,16 +13,24 @@ import re
 import socket
 import sys
 import time
+import traceback
 import webbrowser
 from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from arcane.book import BOOK_COSTS, describe_book
 from arcane.campaign import describe_campaign
+from arcane.codex import describe_codex
+from arcane.crew import describe_crew
+from arcane.folk_data import describe_folk
+from arcane.tickets import describe_tickets
 from arcane.game import SPELL_COSTS, TICK_RATE, Arena
 from arcane.interpreter import SpellError, mana_estimate, validate_source
 from arcane.lessons import GATES, LESSONS
+from arcane.life import RELICS
+from arcane.quest_data import QUESTS, QUEST_TASKS
 from arcane.roles import SKILL_COSTS, describe_roles
 from arcane.net import (
     ProtocolError,
@@ -76,8 +84,31 @@ STORY_MESSAGES = frozenset(
         "terminal_close",
         "terminal_help",
         "fix_submit",
+        "interact",
+        "npc_reply",
+        "quest_pgt",
+        "rune_buy",
+        "party_range",
+        "party_duty",
+        "party_duty_end",
+        "party_continue",
+        "ending_pick",
     }
 )
+
+
+def quest_tasks() -> dict[str, Any]:
+    """Every quest console's task, titled with the quest it belongs to."""
+
+    titles: dict[str, str] = {}
+    for quest in QUESTS.values():
+        for step in quest.steps:
+            if step.kind == "console":
+                titles[str(step.opts["task"])] = f"{quest.tech}: {quest.title}"
+    return {
+        key: {**task.describe(), "title": titles.get(key, "Консоль")}
+        for key, task in QUEST_TASKS.items()
+    }
 
 
 def clean_name(raw: Any) -> str | None:
@@ -127,6 +158,9 @@ class Client:
         return self.player_id is not None
 
 
+CRASH_REPORT_EVERY = 5.0
+
+
 class ArcaneServer:
     def __init__(
         self, *, bots: int, fill_to: int = 0, save_path: Path | None = None
@@ -137,6 +171,7 @@ class ArcaneServer:
         self.store = ProfileStore(save_path)
         self.parties: dict[str, Party] = {}
         self.saved_at = 0.0
+        self.crash_reported: dict[str, float] = {}
 
     # ------------------------------------------------------------------ HTTP
     async def handle_connection(
@@ -438,7 +473,7 @@ class ArcaneServer:
             "ticket": ticket if type(ticket) is int else None,
         }
         try:
-            costs = {**SPELL_COSTS, **SKILL_COSTS} if client.party else SPELL_COSTS
+            costs = {**SPELL_COSTS, **SKILL_COSTS, **BOOK_COSTS} if client.party else SPELL_COSTS
             low, high = mana_estimate(validate_source(code), costs)
         except SpellError as exc:
             reply.update(ok=False, error=str(exc))
@@ -468,6 +503,8 @@ class ArcaneServer:
             await self.enter_party(client, party)
         elif kind == "upgrade":
             await self.handle_upgrade(client, message)
+        elif kind == "rune_buy":
+            await self.handle_rune_buy(client, message)
         elif client.party is not None:
             await self.handle_party_action(client, kind, message)
 
@@ -495,6 +532,16 @@ class ArcaneServer:
                 "gates": {
                     task.key: task.describe() for pair in GATES.values() for task in pair
                 },
+                "quest_tasks": quest_tasks(),
+                "relics": [
+                    {"key": key, "title": title, "about": about, "commit": commit}
+                    for key, title, about, commit in RELICS
+                ],
+                "book": describe_book(),
+                "tickets": describe_tickets(),
+                "crew": describe_crew(),
+                "folk": describe_folk(),
+                "codex": describe_codex(),
                 "roles": describe_roles(),
                 "upgrades": describe_upgrades(),
             }
@@ -574,8 +621,47 @@ class ArcaneServer:
                 await client.ws.send_json({"t": "terminal_help", **step})
         elif kind == "fix_submit":
             await self.handle_fix(client, party, message)
+        elif kind == "interact":
+            if party.world is not None and client.player_id is not None:
+                result = party.world.interact(client.player_id)
+                if not result["ok"]:
+                    await client.ws.send_json({"t": "interact_result", **result})
+        elif kind == "npc_reply":
+            thing, reply = message.get("thing"), message.get("reply")
+            if (
+                party.world is not None
+                and client.player_id is not None
+                and isinstance(thing, int)
+                and isinstance(reply, str)
+            ):
+                result = party.world.npc_reply(client.player_id, thing, reply)
+                if result.get("accepted"):
+                    self.store.get(client.token).accepted += 1
+                    self.store.mark()
+                if not result["ok"]:
+                    await client.ws.send_json({"t": "interact_result", **result})
+        elif kind == "quest_pgt":
+            if party.world is not None and client.player_id is not None:
+                result = party.world.accept_pgt(client.player_id)
+                if result["ok"]:
+                    self.store.get(client.token).accepted += 1
+                    self.store.mark()
+                await client.ws.send_json({"t": "fix_result", "pgt": True, **result})
         elif kind == "party_ready":
             party.set_ready(client.token, message.get("ready") is True, now)
+        elif kind in ("party_range", "party_duty", "party_duty_end", "ending_pick"):
+            if kind == "party_range":
+                error = party.start_range(client.token, now)
+            elif kind == "party_duty":
+                error = party.start_duty(client.token, now)
+            elif kind == "party_duty_end":
+                error = party.end_duty(client.token)
+            else:
+                error = party.pick_ending(client.token, str(message.get("ending", "")))
+            if error:
+                await client.ws.send_json({"t": "party_error", "error": error})
+        elif kind == "party_continue":
+            party.back_to_camp()
         elif kind == "party_stage":
             stage = message.get("stage")
             if type(stage) is int:
@@ -592,6 +678,15 @@ class ArcaneServer:
     async def handle_upgrade(self, client: Client, message: dict[str, Any]) -> None:
         profile = self.store.get(client.token)
         error = profile.buy(str(message.get("stat", "")))
+        if error is None:
+            self.store.mark()
+        await client.ws.send_json(
+            {"t": "profile_update", "profile": profile.describe(), "error": error}
+        )
+
+    async def handle_rune_buy(self, client: Client, message: dict[str, Any]) -> None:
+        profile = self.store.get(client.token)
+        error = profile.buy_rune(str(message.get("name", "")))
         if error is None:
             self.store.mark()
         await client.ws.send_json(
@@ -769,27 +864,43 @@ class ArcaneServer:
     def party_members(self, party: Party) -> list[Client]:
         return [client for client in self.clients if client.party is party]
 
+    def report_crash(self, where: str) -> None:
+        """Say what broke, though not thirty times a second."""
+
+        now = time.monotonic()
+        if now - self.crash_reported.get(where, -CRASH_REPORT_EVERY) >= CRASH_REPORT_EVERY:
+            self.crash_reported[where] = now
+            print(f"Ошибка в {where}:", file=sys.stderr)
+            traceback.print_exc()
+
     def update_parties(self, now: float) -> None:
         for party in list(self.parties.values()):
-            party.tick(now)
-            members = self.party_members(party)
-            for message in party.outbox:
-                self.deliver(party, members, message)
-            party.outbox.clear()
-            if party.world is not None:
-                self.send_world(party.world, members, now, party.world.drain_events())
-            if party.changed:
-                party.changed = False
-                for client in members:
-                    client.ws.send_text_nowait(
-                        json.dumps(
-                            party.describe(client.token),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
+            # A fight that breaks stays broken alone: the others do not notice.
+            try:
+                self.update_party(party, now)
+            except Exception:
+                self.report_crash(f"группе {party.code}")
+
+    def update_party(self, party: Party, now: float) -> None:
+        party.tick(now)
+        members = self.party_members(party)
+        for message in party.outbox:
+            self.deliver(party, members, message)
+        party.outbox.clear()
+        if party.world is not None:
+            self.send_world(party.world, members, now, party.world.drain_events())
+        if party.changed:
+            party.changed = False
+            for client in members:
+                client.ws.send_text_nowait(
+                    json.dumps(
+                        party.describe(client.token),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     )
-            if party.expired(now):
-                del self.parties[party.code]
+                )
+        if party.expired(now):
+            del self.parties[party.code]
 
     def deliver(self, party: Party, members: list[Client], message: dict[str, Any]) -> None:
         for client in members:
@@ -801,9 +912,12 @@ class ArcaneServer:
             if message["t"] == "stage_start" and party.world is not None:
                 mage = party.world.players.get(seat.player_id)
                 personal["role"] = mage.role if mage else ""
+                personal["book"] = sorted(mage.book) if mage else []
+                personal["readout"] = party.readout(client.token, message["stage"]["index"])
             if message["t"] == "stage_end":
                 personal["profile"] = self.store.get(client.token).describe()
                 personal["essence"] = party.rewards.get(client.token, message["essence"])
+                personal["tickets"] = party.closed_tickets.get(client.token, [])
             client.ws.send_text_nowait(
                 json.dumps(personal, ensure_ascii=False, separators=(",", ":"))
             )
@@ -814,23 +928,32 @@ class ArcaneServer:
         last_ping = next_tick
         while True:
             now = asyncio.get_running_loop().time()
-            self.arena.update(now)
-            events = self.arena.drain_events()
+            # One loop runs the arena and every fight at once. If it dies, everybody
+            # freezes for good with their connection still open: nothing may kill it,
+            # and no part of it may take the other parts down.
+            events: list[dict[str, Any]] = []
+            try:
+                self.arena.update(now)
+                events = self.arena.drain_events()
+            except Exception:
+                self.report_crash("арене")
             self.update_parties(now)
-            if now - self.saved_at > SAVE_INTERVAL:
-                self.saved_at = now
-                self.store.save()
-            if self.clients:
-                self.broadcast(now, events)
-                if now - last_ping > 20.0:
-                    last_ping = now
-                    for client in list(self.clients):
-                        client.ws.send_ping_nowait()
-
-            timeout_threshold = 60.0
-            for client in list(self.clients):
-                if now - client.ws.last_seen > timeout_threshold:
-                    self.drop_client(client)
+            try:
+                if now - self.saved_at > SAVE_INTERVAL:
+                    self.saved_at = now
+                    self.store.save()
+                if self.clients:
+                    self.broadcast(now, events)
+                    if now - last_ping > 20.0:
+                        last_ping = now
+                        for client in list(self.clients):
+                            client.ws.send_ping_nowait()
+                timeout_threshold = 60.0
+                for client in list(self.clients):
+                    if now - client.ws.last_seen > timeout_threshold:
+                        self.drop_client(client)
+            except Exception:
+                self.report_crash("рассылке")
 
             next_tick += tick
             delay = next_tick - asyncio.get_running_loop().time()

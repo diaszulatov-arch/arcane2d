@@ -1,6 +1,20 @@
 /* Canvas renderer: camera, mages, projectiles, wards, particles and HUD overlays. */
 
 import { ROLE_TITLES } from "./content.js";
+import { drawBossMoves } from "./boss-art.js";
+import { drawMage, mageGhost } from "./mage-art.js";
+import {
+  blastFrame,
+  drawGlyph,
+  drawJaggedBolt,
+  drawStar,
+  flameFrame,
+  frostShard,
+  pixelLine,
+  pixelRing,
+  puffSprite,
+  scorchSprite,
+} from "./vfx.js";
 import {
   OBSTACLE_HEIGHT,
   buildFloorCanvas,
@@ -18,6 +32,7 @@ import {
   drawBarriers,
   drawBreakpoints,
   drawCables,
+  drawFloorLife,
   drawHazards,
   drawLamps,
   drawMonster,
@@ -27,10 +42,33 @@ import {
   drawSudo,
   drawTerminals,
   drawWeather,
+  spriteColors,
   themeOf,
 } from "./dungeon-art.js";
+import {
+  buildFog,
+  buildFoggedMinimap,
+  darkRooms,
+  drawFog,
+  drawQuestFloor,
+  drawQuestObjects,
+  drawUnitBars,
+  flushLabels,
+  isSeen,
+  label as questLabel,
+  questLights,
+} from "./quest-art.js";
+import {
+  drawGust,
+  drawProps,
+  drawSpamStorm,
+  drawTerrainFloor,
+  terrainLights,
+} from "./terrain-art.js";
 
 const TAU = Math.PI * 2;
+const DUST_EVERY = 0.13;
+const BAKE_TILE = 16;
 const GOLD = "#d9b56c";
 const VIOLET = "#a997ff";
 const EMP_COLOR = "#b38cff";
@@ -44,7 +82,10 @@ const BLOOM_STRENGTH = 0.42;
 const MINIMAP_WIDTH = 170;
 const MINIMAP_HEIGHT = 120;
 // Blasts open on the floor and mages stand over them, so a fight never hides them.
-const GROUND_EFFECTS = new Set(["scorch", "explosion", "nova"]);
+const GROUND_EFFECTS = new Set(["scorch"]);
+const SCORCH_LIMIT = 14;
+const SAVE_DEPTH = 64;
+const ROLE_BANDS = { admin: "#ffd93d", hacker: "#7fffb0", devops: "#6fd6ff", tester: "#e08cff" };
 const QUALITY_FULL = 2;
 const QUALITY_LIGHTS = 1;
 const SLOW_FRAME = 1 / 28;
@@ -142,6 +183,15 @@ function wrapText(ctx, text, maxWidth, maxLines = 3) {
 
 const CURSE_LABELS = { syntax: "SyntaxError", null: "None", mirror: "АВТОКОРРЕКЦИЯ" };
 
+const ELITE_COLORS = {
+  legacy: "#c9a26b",
+  hotfix: "#7fe0a8",
+  fork: "#b18cff",
+  prod: "#ff7a5a",
+  async: "#6fd3ff",
+  deprecated: "#ffd86b",
+};
+
 export class ArenaRenderer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -225,13 +275,61 @@ export class ArenaRenderer {
     };
   }
 
+  /** Rooms nobody has entered stay static: rebuilt only when one loads. */
+  ensureFog(client) {
+    const config = client.config;
+    if (config?.mode !== "story" || !client.story?.seen) {
+      return;
+    }
+    const key = `${this.floorKey}|${client.story.seen.join(",")}`;
+    if (key === this.fogKey) return;
+    this.fogKey = key;
+    this.fogTile = config.tile || 48;
+    this.fog = buildFog(config, new Set(client.story.seen));
+    this.minimap = buildFoggedMinimap(config, this.fog);
+  }
+
+  seen(x, y) {
+    return isSeen(this.fog, x, y, this.fogTile || 48);
+  }
+
+  /** Whether a spot is out of every light in a room with none of its own. */
+  inDark(x, y, client) {
+    const tile = client.config?.tile || 48;
+    const room = (this.darkRooms || []).find(
+      (entry) => x >= entry.x * tile && x <= (entry.x + entry.w) * tile && y >= entry.y * tile && y <= (entry.y + entry.h) * tile,
+    );
+    if (!room) return false;
+    for (const visual of this.visualPlayers.values()) {
+      if (!visual.dead && Math.hypot(visual.x - x, visual.y - y) < 300) return false;
+    }
+    return true;
+  }
+
+  darkInView(client) {
+    const tile = client.config?.tile || 48;
+    const { zoom, x, y } = this.camera;
+    const halfW = this.width / zoom / 2;
+    const halfH = this.height / zoom / 2;
+    return (this.darkRooms || []).some(
+      (room) =>
+        room.x * tile < x + halfW &&
+        (room.x + room.w) * tile > x - halfW &&
+        room.y * tile < y + halfH &&
+        (room.y + room.h) * tile > y - halfH,
+    );
+  }
+
   ensureFloor(config) {
     if (config?.mode === "story") {
-      const key = `map:${config.theme}:${config.map_id}`;
+      const key = `map:${config.theme}:${config.map_id}:${config.tilesVersion || 0}`;
       if (key !== this.floorKey) {
         this.floorCanvas = buildDungeonCanvas(config);
         this.minimap = buildMinimap(config);
         this.floorKey = key;
+        this.fog = null;
+        this.fogKey = "";
+        this.darkRooms = darkRooms(config);
       }
       return;
     }
@@ -369,8 +467,20 @@ export class ArenaRenderer {
         visual.aim = lerpAngle(visual.aim, player.aim || 0, 1 - Math.exp(-dt * 20));
       }
       const moved = Math.hypot(visual.x - previousX, visual.y - previousY);
+      const trailing = clamp(((previousX - visual.x) / dt) * 0.035, -9, 9);
+      visual.cloak = (visual.cloak || 0) + (trailing - (visual.cloak || 0)) * (1 - Math.exp(-dt * 7));
       visual.moving = moved > 0.25;
       visual.step = (visual.step || 0) + Math.min(0.55, moved * 0.11);
+      visual.dust = (visual.dust || 0) - dt;
+      if (visual.moving && visual.dust <= 0 && !player.dead && this.quality >= QUALITY_LIGHTS) {
+        visual.dust = DUST_EVERY;
+        this.burst(visual.x + (Math.random() - 0.5) * 12, visual.y + 8, "#d8d4e4", 1, 22, {
+          kind: "dust",
+          size: 3,
+          life: 0.42,
+          drag: 3.5,
+        });
+      }
       visual.hurt = Math.max(0, visual.hurt - dt);
       visual.cast = Math.max(0, visual.cast - dt);
       visual.roll = Math.max(0, (visual.roll || 0) - dt);
@@ -386,13 +496,18 @@ export class ArenaRenderer {
       seenMonsters.add(monster.id);
       let visual = this.visualMonsters.get(monster.id);
       if (!visual) {
-        visual = { x: monster.x, y: monster.y, hurt: 0, data: monster };
+        visual = { x: monster.x, y: monster.y, hurt: 0, data: monster, born: performance.now(), pace: 0, dirX: 0 };
         this.visualMonsters.set(monster.id, visual);
       }
       visual.data = monster;
       const smoothing = 1 - Math.exp(-dt * 20);
-      visual.x += (monster.x - visual.x) * smoothing;
-      visual.y += (monster.y - visual.y) * smoothing;
+      const stepX = (monster.x - visual.x) * smoothing;
+      const stepY = (monster.y - visual.y) * smoothing;
+      visual.x += stepX;
+      visual.y += stepY;
+      const easing = 1 - Math.exp(-dt * 9);
+      visual.pace += (Math.hypot(stepX, stepY) / dt - visual.pace) * easing;
+      visual.dirX += (stepX / dt - visual.dirX) * easing;
       visual.hurt = Math.max(0, visual.hurt - dt);
     }
     for (const id of this.visualMonsters.keys()) {
@@ -442,6 +557,16 @@ export class ArenaRenderer {
       particle.vx *= Math.exp(-dt * particle.drag);
       particle.vy *= Math.exp(-dt * particle.drag);
       particle.rotation += particle.spin * dt;
+      if (particle.rise) particle.y -= particle.rise * dt;
+      if (particle.gravity) {
+        particle.vy += particle.gravity * dt;
+        if (particle.y > particle.ground) {
+          particle.y = particle.ground;
+          particle.vy *= -0.38;
+          particle.vx *= 0.62;
+          particle.spin *= 0.5;
+        }
+      }
     }
     this.particles = this.particles.filter((particle) => particle.life > 0);
 
@@ -461,6 +586,9 @@ export class ArenaRenderer {
       angle = null,
       spread = Math.PI * 2,
       drag = 3,
+      gravity = 0,
+      ground = 0,
+      rise = 0,
     } = options;
     for (let index = 0; index < count; index += 1) {
       const direction =
@@ -477,6 +605,10 @@ export class ArenaRenderer {
         color,
         kind,
         drag,
+        gravity,
+        ground,
+        rise,
+        glyph: Math.floor(Math.random() * 8),
         rotation: Math.random() * TAU,
         spin: (Math.random() - 0.5) * 9,
       });
@@ -521,9 +653,11 @@ export class ArenaRenderer {
       color,
       element,
       scale,
-      life: element === "frost" ? 0.72 : 0.88,
+      life: element === "frost" ? 0.5 : 0.62,
       age: 0,
     });
+    const marks = this.effects.filter((effect) => effect.kind === "scorch");
+    if (marks.length >= SCORCH_LIMIT) this.effects.splice(this.effects.indexOf(marks[0]), 1);
     this.effects.push({
       kind: "scorch",
       x,
@@ -531,9 +665,61 @@ export class ArenaRenderer {
       color,
       element,
       scale,
-      life: element === "frost" ? 1.7 : 2.4,
+      variant: Math.floor(Math.random() * 4),
+      life: element === "frost" ? 2.6 : 4.2,
       age: 0,
     });
+    if (this.quality < QUALITY_LIGHTS) return;
+    const smoke = element === "frost" ? "#c8e4f0" : element === "emp" ? "#2a2240" : "#26222a";
+    const puffs = Math.round(5 * Math.min(2.4, scale));
+    for (let puff = 0; puff < puffs; puff += 1) {
+      this.burst(x + (Math.random() - 0.5) * 34 * scale, y + (Math.random() - 0.5) * 24 * scale, smoke, 1, 26, {
+        kind: "smoke",
+        size: (11 + Math.random() * 9) * scale,
+        life: 0.9 + Math.random() * 0.7,
+        drag: 1.5,
+        rise: 42 + Math.random() * 34,
+      });
+    }
+  }
+
+  /**
+   * After a frame that threw. Whatever could not be drawn is not worth another try,
+   * and the canvases are still halfway through it: unbalanced save()s, additive
+   * blending, a stray transform. Left alone, every later frame would come out wrong.
+   */
+  recoverFrame() {
+    this.particles.length = 0;
+    this.effects.length = 0;
+    for (const ctx of [this.worldCtx, this.ctx]) {
+      if (!ctx) continue;
+      for (let depth = 0; depth < SAVE_DEPTH; depth += 1) ctx.restore();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+    }
+  }
+
+  /** The silhouettes a fast mover leaves behind. */
+  addGhosts(id, x1, y1, x2, y2, count, color) {
+    const visual = this.visualPlayers.get(id);
+    if (!visual) return;
+    const ghost = mageGhost(visual, color, this.bandOf(visual.data));
+    for (let index = 0; index < count; index += 1) {
+      const at = (index + 0.5) / count;
+      this.effects.push({
+        kind: "ghost",
+        ghost,
+        x: x1 + (x2 - x1) * at,
+        y: y1 + (y2 - y1) * at,
+        life: 0.22 + at * 0.26,
+        age: 0,
+      });
+    }
+  }
+
+  bandOf(player) {
+    return ROLE_BANDS[player?.role] || "#f3d27f";
   }
 
   addLine(x1, y1, x2, y2, color, life = 0.35, width = 3) {
@@ -602,12 +788,10 @@ export class ArenaRenderer {
     const color = event.color || GOLD;
     switch (kind) {
       case "cast": {
-        this.burst(event.x, event.y, color, 20, 170, {
-          size: 2.8,
-          life: 0.58,
-          angle: null,
-        });
-        this.addRing(event.x, event.y, 4, 30, color, 0.36, 2.2);
+        this.burst(event.x, event.y, color, 10, 150, { size: 2.6, life: 0.5, kind: "ember" });
+        // The mage is typing: bits of syntax come off the staff.
+        this.burst(event.x, event.y, color, 5, 66, { size: 3, life: 0.75, kind: "rune", rise: 26 });
+        this.addRing(event.x, event.y, 4, 26, color, 0.28, 1.6);
         const visual = this.visualPlayers.get(event.id);
         if (visual) visual.cast = 0.4;
         break;
@@ -620,41 +804,17 @@ export class ArenaRenderer {
         }
         const shard = event.kind === "frost";
         const spark = event.kind === "spark";
-        this.addExplosion(
-          event.x,
-          event.y,
-          color,
-          shard ? "frost" : "fire",
-          spark ? 0.62 : shard ? 1.12 : 1.45,
-        );
-        this.burst(event.x, event.y, color, spark ? 18 : shard ? 34 : 40, 265, {
-          size: spark ? 2.1 : shard ? 2.7 : 3.4,
-          life: spark ? 0.48 : 0.72,
-          kind: shard ? "shard" : "ember",
-        });
-        this.burst(event.x, event.y, "#fff4dc", spark ? 8 : 14, 160, {
-          size: spark ? 1.4 : 1.8,
-          life: 0.42,
-          kind: "spark",
-        });
-        this.addRing(
-          event.x,
-          event.y,
-          5,
-          spark ? 28 : shard ? 52 : 66,
-          color,
-          spark ? 0.3 : 0.42,
-          spark ? 1.8 : 2.8,
-        );
-        this.addRing(
-          event.x,
-          event.y,
-          2,
-          spark ? 18 : shard ? 30 : 38,
-          "#ffffff",
-          spark ? 0.22 : 0.28,
-          1.2,
-        );
+        if (spark) {
+          this.effects.push({ kind: "star", x: event.x, y: event.y, size: 26, color, life: 0.2, age: 0, turn: Math.random() });
+          this.burst(event.x, event.y, color, 12, 240, { size: 2.1, life: 0.42, kind: "spark" });
+        } else {
+          this.addExplosion(event.x, event.y, color, shard ? "frost" : "fire", shard ? 0.92 : 1.2);
+          this.burst(event.x, event.y, shard ? "#e6fdff" : color, shard ? 22 : 26, 290, {
+            size: shard ? 3 : 3.4,
+            life: 0.7,
+            kind: shard ? "shard" : "ember",
+          });
+        }
         this.shakeNear(client, event.x, event.y, spark ? 2.2 : shard ? 3.6 : 4.8);
         break;
       }
@@ -673,16 +833,8 @@ export class ArenaRenderer {
         if (absorbed > 0) {
           this.addFloater(event.x + 13, event.y - 6, `−${Math.round(absorbed)} щит`, "#a9c6ff", 13);
         }
-        this.burst(event.x, event.y, color, 12, 140, {
-          size: 2,
-          life: 0.45,
-          kind: "spark",
-        });
-        this.burst(event.x, event.y, "#ffe2c2", 5, 70, {
-          size: 1,
-          life: 0.28,
-          kind: "ember",
-        });
+        this.effects.push({ kind: "star", x: event.x, y: event.y, size: 18, color: "#ffe9c8", life: 0.13, age: 0, turn: Math.random() });
+        this.burst(event.x, event.y, color, 9, 150, { size: 2, life: 0.38, kind: "spark" });
         const hitVisual =
           this.visualPlayers.get(event.id) || this.visualMonsters.get(event.id);
         if (hitVisual) hitVisual.hurt = 0.3;
@@ -723,6 +875,7 @@ export class ArenaRenderer {
       case "dash": {
         const dashColor = event.color || VIOLET;
         const blink = event.kind === "blink";
+        this.addGhosts(event.id, event.from_x, event.from_y, event.to_x, event.to_y, blink ? 3 : 6, dashColor);
         this.addLine(
           event.from_x,
           event.from_y,
@@ -749,15 +902,7 @@ export class ArenaRenderer {
       }
       case "roll": {
         const rollColor = event.color || VIOLET;
-        this.addLine(
-          event.x,
-          event.y,
-          event.x2,
-          event.y2,
-          rollColor,
-          0.34,
-          5,
-        );
+        this.addGhosts(event.id, event.x, event.y, event.x2, event.y2, 4, rollColor);
         this.addRing(event.x2, event.y2, 4, 28, rollColor, 0.38, 1.8);
         for (let index = 0; index < 9; index += 1) {
           const at = index / 8;
@@ -967,6 +1112,7 @@ export class ArenaRenderer {
           color: siphonColor,
           life: 0.48,
           age: 0,
+          reverse: true,
         });
         this.burst(event.x2, event.y2, siphonColor, 22, 170, {
           size: 2.2,
@@ -1032,6 +1178,7 @@ export class ArenaRenderer {
       case "heal": {
         this.addRing(event.x, event.y, 7, 58, "#71e0b4", 0.78, 2.6);
         this.addRing(event.x, event.y, 3, 36, "#d8fff0", 0.55, 1.2);
+        this.burst(event.x, event.y - 16, "#9dffcf", 9, 44, { size: 3, life: 1.05, kind: "plus", rise: 60, drag: 2.4 });
         for (let index = 0; index < 24; index += 1) {
           const angle = Math.random() * TAU;
           const startX = event.x + Math.cos(angle) * (8 + Math.random() * 16);
@@ -1047,6 +1194,7 @@ export class ArenaRenderer {
             color: "#80e7bd",
             kind: "rune",
             drag: 0.8,
+            glyph: Math.floor(Math.random() * 8),
             rotation: Math.random() * TAU,
             spin: 2,
           });
@@ -1238,6 +1386,22 @@ export class ArenaRenderer {
       }
       case "monster_death": {
         const big = Boolean(event.boss);
+        const body = this.visualMonsters.get(event.id)?.data;
+        if (body && this.quality >= QUALITY_LIGHTS) {
+          const colors = spriteColors(body.kind);
+          const radius = Number(body.r) || 18;
+          const pieces = big ? 46 : 16;
+          for (let piece = 0; piece < pieces; piece += 1) {
+            this.burst(event.x, event.y - radius * 0.7, colors[piece % colors.length], 1, big ? 420 : 240, {
+              kind: "chunk",
+              size: big ? 7 : 5,
+              life: big ? 1.5 : 0.95,
+              drag: 1.1,
+              gravity: 640,
+              ground: event.y + radius * 0.6 + (Math.random() - 0.5) * radius,
+            });
+          }
+        }
         this.addExplosion(event.x, event.y, color, "arcane", big ? 2.2 : 0.9);
         this.burst(event.x, event.y, color, big ? 70 : 24, big ? 340 : 190, {
           size: big ? 3.4 : 2.4,
@@ -1245,6 +1409,14 @@ export class ArenaRenderer {
           kind: "shard",
         });
         this.shakeNear(client, event.x, event.y, big ? 14 : 2.4);
+        break;
+      }
+      case "string_closed": {
+        // The closing quote goes off along the whole length of the string.
+        for (const [x, y] of event.cells || []) {
+          this.addExplosion(x, y, "#ce9178", "arcane", 0.42);
+        }
+        this.shakeNear(client, event.cells?.[0]?.[0] ?? 0, event.cells?.[0]?.[1] ?? 0, 8);
         break;
       }
       case "hazard_blast": {
@@ -1262,6 +1434,7 @@ export class ArenaRenderer {
             color,
             life: 0.32,
             age: 0,
+            flat: true,
           });
         }
         this.shakeNear(client, event.x, event.y, 4);
@@ -1280,6 +1453,32 @@ export class ArenaRenderer {
       case "crit": {
         this.addFloater(event.x, event.y - 34, "крит!", "#ffe17a", 16);
         this.burst(event.x, event.y, "#ffe17a", 12, 180, { size: 2, life: 0.35, kind: "spark" });
+        break;
+      }
+      case "ping": {
+        this.addRing(event.x, event.y, 20, event.radius, "#7fe0ee", 0.7, 2.6);
+        this.addFloater(event.x, event.y - 30, `ping: ${event.count}`, "#9feeff", 18);
+        for (const [x, y] of event.cracks || []) {
+          this.addRing(x, y, 10, 90, "#ffd27a", 0.9, 3);
+          this.addFloater(x, y - 34, "трещина!", "#ffd27a", 16);
+        }
+        break;
+      }
+      case "gc": {
+        this.addRing(event.x, event.y, 160, 12, "#9fe8c8", 0.5, 2.4);
+        if (event.count) this.addFloater(event.x, event.y - 46, `free: ${event.count}`, "#9fe8c8", 15);
+        break;
+      }
+      case "grep": {
+        for (const [x, y] of event.hits || []) {
+          this.addRing(x, y, 6, 40, "#ffe07a", 0.35, 2);
+          this.burst(x, y, "#ffe07a", 8, 120, { size: 2, life: 0.4, kind: "spark" });
+        }
+        break;
+      }
+      case "caught": {
+        this.addRing(event.x, event.y, 20, 80, "#c7a6e8", 0.6, 3);
+        this.addFloater(event.x, event.y - 50, "except: выжил", "#c7a6e8", 18);
         break;
       }
       case "resist": {
@@ -1340,6 +1539,117 @@ export class ArenaRenderer {
         this.addLine(event.from_x, event.from_y, event.x, event.y, "#6fd6ff", 0.32, 4);
         this.addRing(event.x, event.y, 8, 46, "#6fd6ff", 0.4, 2.4);
         this.addFloater(event.x, event.y - 44, `+${Math.round(event.amount)}`, "#9fe6ff", 15);
+        break;
+      }
+      case "quest_item":
+      case "quest_catch":
+      case "plate_on": {
+        this.addRing(event.x, event.y, 6, 60, "#7fe0ee", 0.6, 3);
+        this.burst(event.x, event.y, "#7fe0ee", 16, 140, { size: 2.2, life: 0.6, kind: "spark" });
+        if (event.label) this.addFloater(event.x, event.y - 30, event.label, "#d6f6fb", 13);
+        break;
+      }
+      case "prop_break": {
+        this.burst(event.x, event.y, "#c8c4b4", 18, 170, { size: 2.6, life: 0.6, kind: "shard" });
+        break;
+      }
+      case "prop_blast": {
+        this.addExplosion(event.x, event.y, "#ffd93d", "arcane", (event.radius || 150) / 110);
+        this.burst(event.x, event.y, "#ffb347", 40, 320, { size: 3, life: 0.8, kind: "shard" });
+        this.shakeNear(client, event.x, event.y, 9);
+        break;
+      }
+      case "surface_ice": {
+        this.addRing(event.x, event.y, 20, 100, "#d6f0ff", 0.6, 3);
+        this.addFloater(event.x, event.y - 40, "лёд", "#d6f0ff", 14);
+        break;
+      }
+      case "surface_shock": {
+        this.addRing(event.x, event.y, 20, 120, "#fff6b0", 0.5, 4);
+        this.addFloater(event.x, event.y - 40, "разряд!", "#fff6b0", 16);
+        this.shakeNear(client, event.x, event.y, 5);
+        break;
+      }
+      case "surface_burn": {
+        this.addFloater(event.x, event.y - 30, "кабель горит", "#ffb347", 14);
+        break;
+      }
+      case "link_jump": {
+        this.addLine(event.from_x, event.from_y, event.x, event.y, "#6fb6ff", 0.5, 4);
+        this.addRing(event.x, event.y, 50, 8, "#6fb6ff", 0.45, 3);
+        break;
+      }
+      case "workshop_open": {
+        this.addRing(event.x, event.y, 20, 200, "#7fe0ee", 0.8, 4);
+        this.addFloater(event.x, event.y - 40, "ЗАМОК ОТКРЫТ", "#bfffd8", 18);
+        break;
+      }
+      case "finds_offered": {
+        this.addRing(event.x, event.y, 10, 170, "#7fe0ee", 0.8, 3);
+        break;
+      }
+      case "quest_note": {
+        this.addFloater(event.x, event.y - 34, event.text, event.good ? "#bfffd8" : "#ffb0aa", 15);
+        break;
+      }
+      case "ns_forged": {
+        this.addExplosion(event.x, event.y, "#ff5a4f", "arcane", 0.9);
+        this.addFloater(event.x, event.y - 60, "6.6.6.6", "#ff8f8f", 18);
+        this.shakeNear(client, event.x, event.y, 4);
+        break;
+      }
+      case "memory_oom": {
+        this.shake(16);
+        break;
+      }
+      case "memory_free": {
+        this.shake(6);
+        break;
+      }
+      case "npc_gone": {
+        this.addRing(event.x, event.y, 8, 90, "#7fe0ee", 0.7, 3);
+        this.burst(event.x, event.y, "#7fe0ee", 24, 200, { size: 2.2, life: 0.7, kind: "spark" });
+        break;
+      }
+      case "quest_burst": {
+        this.addExplosion(event.x, event.y, "#ff5a4f", "arcane", 1.2);
+        this.burst(event.x, event.y, "#ff5a4f", 30, 220, { size: 2.6, life: 0.7, kind: "shard" });
+        this.addFloater(event.x, event.y - 34, event.label ? `${event.label}: вирус!` : "вирус!", "#ffb0aa", 14);
+        this.shakeNear(client, event.x, event.y, 6);
+        break;
+      }
+      case "plate_fail": {
+        this.addRing(event.x, event.y, 4, 80, "#ffe17a", 0.8, 4);
+        this.addFloater(event.x, event.y - 34, "не тот порядок", "#ffe17a", 14);
+        this.shakeNear(client, event.x, event.y, 4);
+        break;
+      }
+      case "zone_on": {
+        this.addRing(event.x, event.y, 74, 20, "#4fe08a", 0.7, 3);
+        if (event.label) this.addFloater(event.x, event.y - 90, `${event.label}: OK`, "#bfffd8", 14);
+        break;
+      }
+      case "loot":
+      case "rest": {
+        this.burst(event.x, event.y, "#ffd27a", 30, 160, { size: 2.4, life: 0.9, kind: "rune" });
+        this.addRing(event.x, event.y, 10, 90, "#ffd27a", 0.7, 3);
+        if (event.amount) this.addFloater(event.x, event.y - 40, `+${event.amount} токенов`, "#ffe9a8", 16);
+        break;
+      }
+      case "unit_down": {
+        this.addExplosion(event.x, event.y, "#ff5a4f", "arcane", 1);
+        this.addFloater(event.x, event.y - 90, "СБОЙ", "#ff8f8f", 18);
+        this.shakeNear(client, event.x, event.y, 6);
+        break;
+      }
+      case "unit_up":
+      case "npc_found": {
+        this.addRing(event.x, event.y, 8, 70, "#9ff0c0", 0.7, 3);
+        break;
+      }
+      case "deal": {
+        this.addRing(event.x, event.y, 10, 140, "#ff4f6a", 0.9, 4);
+        this.burst(event.x, event.y, "#ff4f6a", 40, 220, { size: 2.6, life: 1, kind: "shard" });
         break;
       }
       case "rollback": {
@@ -1448,6 +1758,7 @@ export class ArenaRenderer {
       this.worldCanvas.height,
     );
     this.ensureFloor(client.config);
+    this.ensureFog(client);
 
     this.shakeAmount *= Math.exp(-dt * 6.5);
     if (this.shakeAmount < 0.04) this.shakeAmount = 0;
@@ -1481,7 +1792,19 @@ export class ArenaRenderer {
       );
     }
     if (dungeon) {
+      if (this.quality >= QUALITY_LIGHTS) {
+        const halfW = worldWidth / (2 * zoom * pixelScale);
+        const halfH = worldHeight / (2 * zoom * pixelScale);
+        drawFloorLife(worldCtx, this.floorCanvas?.life, (client.config.tile || 48) / BAKE_TILE, {
+          left: camX - halfW,
+          right: camX + halfW,
+          top: camY - halfH,
+          bottom: camY + halfH,
+        }, now);
+      }
       drawDoors(worldCtx, client.story?.doors, client.config, now);
+      drawTerrainFloor(worldCtx, client.config.terrain, client.terrainState, client.workshop, client.config.tile || 48, now);
+      drawQuestFloor(worldCtx, client.quest, client.config, now);
       drawPortal(worldCtx, client.story, client.config, now);
       drawPickups(worldCtx, client.pickups, now);
       this.drawEffects(worldCtx, now, zoom, true);
@@ -1493,6 +1816,8 @@ export class ArenaRenderer {
       for (const visual of this.visualPlayers.values()) {
         if (visual.data.sudo) drawSudo(worldCtx, visual.x, visual.y, now);
       }
+      drawProps(worldCtx, client.config.terrain, client.terrainState, now);
+      drawQuestObjects(worldCtx, client.quest, this.visualPlayersById(), now);
     } else {
       drawAmbient(worldCtx, client.config, now, zoom);
       this.drawEffects(worldCtx, now, zoom, true);
@@ -1500,12 +1825,15 @@ export class ArenaRenderer {
       drawWallTorches(worldCtx, client.config, now);
     }
     this.drawScene(worldCtx, client, now, zoom, labels);
-    if (this.quality >= QUALITY_LIGHTS) {
-      this.applyLighting(client, now, applyCamera);
+    const eventKind = client.life?.event?.kind;
+    const darkHere = dungeon && (eventKind === "blackout" || this.darkInView(client));
+    if (this.quality >= QUALITY_LIGHTS || darkHere) {
+      this.applyLighting(client, now, applyCamera, this.quality < QUALITY_LIGHTS);
     }
 
     // What gives light off: magic stays at full brightness on top of the room.
     applyCamera(worldCtx);
+    if (dungeon) drawBossMoves(worldCtx, client.bossMoves, this.visualMonsters, now);
     drawHazards(worldCtx, client.hazards, now);
     this.drawWards(worldCtx, client, now, zoom);
     this.drawEmps(worldCtx, client, now, zoom);
@@ -1514,6 +1842,23 @@ export class ArenaRenderer {
     this.drawEffects(worldCtx, now, zoom, false);
     this.drawProjectiles(worldCtx, now, zoom);
     this.drawParticles(worldCtx, now, zoom);
+    if (dungeon) {
+      worldCtx.setTransform(pixelScale, 0, 0, pixelScale, 0, 0);
+      drawWeather(worldCtx, client.config, this.width, this.height, now, this.camera);
+      applyCamera(worldCtx);
+      drawFog(
+        worldCtx,
+        this.fog,
+        client.config,
+        {
+          x: worldWidth / 2 + (shakeX - camX * zoom) * pixelScale,
+          y: worldHeight / 2 + (shakeY - camY * zoom) * pixelScale,
+          scale: zoom * pixelScale,
+          rain: this.quality >= QUALITY_LIGHTS && !this.calmMotion,
+        },
+        now,
+      );
+    }
     worldCtx.setTransform(1, 0, 0, 1, 0, 0);
     if (this.quality >= QUALITY_FULL) this.drawBloom(worldCtx);
 
@@ -1524,14 +1869,24 @@ export class ArenaRenderer {
     ctx.imageSmoothingEnabled = true;
 
     if (dungeon) {
-      this.drawMonsterBars(ctx);
+      this.drawMonsterBars(ctx, client);
+      drawUnitBars(ctx, client.quest, (x, y) => this.worldToScreen(x, y), this.camera.zoom);
+      this.queueMonsterLabels(ctx);
+      flushLabels(
+        ctx,
+        (x, y) => this.worldToScreen(x, y),
+        this.camera.zoom,
+        (x, y) => this.seen(x, y) && !this.inDark(x, y, client),
+      );
       this.drawHazardLabels(ctx, client.hazards);
-      drawWeather(ctx, client.config, this.width, this.height, now);
+      drawGust(ctx, client.terrainState?.gust, this.width, this.height, now);
+      if (eventKind === "storm") drawSpamStorm(ctx, this.width, this.height, now);
     }
     this.drawNameplates(ctx, labels, client, now);
     this.drawFloaties(ctx);
     this.drawOffscreenTargets(ctx, client);
     if (dungeon) this.drawTerminalMarkers(ctx, client, now);
+    if (dungeon) this.drawQuestMarks(ctx, client, now);
     this.drawAim(ctx, client, now);
 
     this.drawFrameVignette(ctx);
@@ -1541,7 +1896,7 @@ export class ArenaRenderer {
   /** A pointer to broken terminals, on screen or off: they are where the story goes. */
   drawTerminalMarkers(ctx, client, now) {
     for (const terminal of client.terminals || []) {
-      if (terminal.solved) continue;
+      if (terminal.solved || !this.seen(terminal.x, terminal.y)) continue;
       const screen = this.worldToScreen(terminal.x, terminal.y);
       const inside =
         screen.x > 0 && screen.x < this.width && screen.y > 0 && screen.y < this.height;
@@ -1592,10 +1947,82 @@ export class ArenaRenderer {
     ctx.restore();
   }
 
-  drawMonsterBars(ctx) {
+  /** Where the quest wants the party: a cyan diamond, or an arrow at the edge. */
+  drawQuestMarks(ctx, client, now) {
+    const marks = client.quest?.marks || [];
+    const self = client.players.get(client.selfId);
+    for (const [x, y] of marks) {
+      // Right next to it, the thing itself is the marker.
+      if (self && Math.hypot(self.x - x, self.y - y) < 240) continue;
+      const screen = this.worldToScreen(x, y);
+      const inside =
+        screen.x > 0 && screen.x < this.width && screen.y > 0 && screen.y < this.height;
+      const bob = Math.sin(now / 200) * 4;
+      ctx.save();
+      ctx.fillStyle = "#7fe0ee";
+      ctx.strokeStyle = "#06121a";
+      ctx.lineWidth = 2;
+      if (inside) {
+        ctx.translate(screen.x, screen.y - 58 * this.camera.zoom - 14 + bob);
+        ctx.beginPath();
+        ctx.moveTo(0, -9);
+        ctx.lineTo(8, 0);
+        ctx.lineTo(0, 9);
+        ctx.lineTo(-8, 0);
+        ctx.closePath();
+      } else {
+        const dx = screen.x - this.width / 2;
+        const dy = screen.y - this.height / 2;
+        const scale = Math.min(
+          (this.width / 2 - 34) / Math.max(1, Math.abs(dx)),
+          (this.height / 2 - 34) / Math.max(1, Math.abs(dy)),
+        );
+        ctx.translate(this.width / 2 + dx * scale, this.height / 2 + dy * scale);
+        ctx.rotate(Math.atan2(dy, dx));
+        ctx.beginPath();
+        ctx.moveTo(11, 0);
+        ctx.lineTo(-6, -8);
+        ctx.lineTo(-2, 0);
+        ctx.lineTo(-6, 8);
+        ctx.closePath();
+      }
+      ctx.stroke();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  visualPlayersById() {
+    const players = new Map();
+    for (const visual of this.visualPlayers.values()) {
+      players.set(visual.data.id, { x: visual.x, y: visual.y });
+    }
+    return players;
+  }
+
+  /** A letter's text, a rack's temperature, the name of a failing test. */
+  queueMonsterLabels(ctx) {
+    for (const visual of this.visualMonsters.values()) {
+      const { text, r, kind } = visual.data;
+      if (!text || visual.data.arriving) continue;
+      let color = "#f4f2fa";
+      if (visual.data.elite) {
+        color = ELITE_COLORS[visual.data.elite] || color;
+      } else if (kind === "hotrack") {
+        const degrees = Number.parseInt(text, 10);
+        color = degrees >= 85 ? "#ff6a5a" : degrees >= 65 ? "#ffb347" : "#7fe0ee";
+      } else if (kind === "failtest") {
+        color = "#ff8f8f";
+      }
+      questLabel(ctx, text, visual.x, visual.y - (Number(r) || 18) * 2.2 - 8, color, kind === "letter" ? 20 : 18);
+    }
+  }
+
+  drawMonsterBars(ctx, client) {
     for (const visual of this.visualMonsters.values()) {
       const { hp, max_hp: maxHp, r } = visual.data;
       if (!(hp < maxHp) || visual.data.arriving || r > 40) continue;
+      if (!this.seen(visual.x, visual.y) || this.inDark(visual.x, visual.y, client)) continue;
       const screen = this.worldToScreen(visual.x, visual.y);
       const lift = (Number(r) || 18) * this.camera.zoom * 2.4 + 8;
       drawMonsterBar(ctx, screen.x, screen.y - lift, 34, clamp(hp / maxHp, 0, 1));
@@ -1611,25 +2038,44 @@ export class ArenaRenderer {
     const left = this.width - width - 14;
     const top = 76;
     const tile = client.config.tile || 48;
-    const at = (x, y) => [left + (x / tile) * scale, top + (y / tile) * scale];
+    // During a DNS failure the map still looks fine. It is simply a mirror.
+    const lying = client.life?.event?.kind === "dns";
+    const at = (x, y) => [
+      lying ? left + width - (x / tile) * scale : left + (x / tile) * scale,
+      top + (y / tile) * scale,
+    ];
     ctx.save();
     ctx.fillStyle = "rgba(6, 7, 13, 0.62)";
     ctx.fillRect(left - 6, top - 6, width + 12, height + 12);
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(map, left, top, width, height);
+    if (lying) {
+      ctx.save();
+      ctx.translate(left + width, top);
+      ctx.scale(-1, 1);
+      ctx.drawImage(map, 0, 0, width, height);
+      ctx.restore();
+    } else {
+      ctx.drawImage(map, left, top, width, height);
+    }
     ctx.imageSmoothingEnabled = true;
-    if (client.story?.portal) {
+    if (client.story?.portal && this.seen(client.story.portal[0], client.story.portal[1])) {
       const [x, y] = at(client.story.portal[0], client.story.portal[1]);
       ctx.fillStyle = client.story.portal_ready ? "#f4d99b" : "rgba(244, 217, 155, 0.35)";
       ctx.fillRect(x - 2, y - 2, 5, 5);
     }
     for (const terminal of client.terminals || []) {
-      if (terminal.solved) continue;
+      if (terminal.solved || !this.seen(terminal.x, terminal.y)) continue;
       const [x, y] = at(terminal.x, terminal.y);
       ctx.fillStyle = "#4fe08a";
       ctx.fillRect(x - 2, y - 2, 5, 5);
     }
+    for (const [markX, markY] of client.quest?.marks || []) {
+      const [x, y] = at(markX, markY);
+      ctx.fillStyle = "#7fe0ee";
+      ctx.fillRect(x - 2, y - 2, 5, 5);
+    }
     for (const monster of client.monsters || []) {
+      if (!this.seen(monster.x, monster.y) || this.inDark(monster.x, monster.y, client)) continue;
       const [x, y] = at(monster.x, monster.y);
       ctx.fillStyle = "#e76972";
       ctx.fillRect(x - 1, y - 1, 2, 2);
@@ -1704,6 +2150,8 @@ export class ArenaRenderer {
           power: 0.9,
         });
       }
+      questLights(client.quest, lights);
+      terrainLights(client.config.terrain, client.terrainState, lights);
     } else {
       collectWorldLights(client.config, now, lights);
     }
@@ -1805,17 +2253,27 @@ export class ArenaRenderer {
   }
 
   /** Multiply a map of everything that glows over the room behind the magic. */
-  applyLighting(client, now, applyCamera) {
+  applyLighting(client, now, applyCamera, onlyDark = false) {
     const ctx = this.lightCtx;
     this.collectLights(client, now);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = "source-over";
     ctx.globalAlpha = 1;
-    ctx.fillStyle =
-      client.config?.mode === "story" ? themeOf(client.config).ambient : AMBIENT_LIGHT;
+    const story = client.config?.mode === "story";
+    const blackout = story && client.life?.event?.kind === "blackout";
+    if (blackout) ctx.fillStyle = "#08070e";
+    else ctx.fillStyle = onlyDark ? "#ffffff" : story ? themeOf(client.config).ambient : AMBIENT_LIGHT;
     ctx.fillRect(0, 0, this.lightCanvas.width, this.lightCanvas.height);
 
     applyCamera(ctx);
+    if (story && this.darkRooms?.length) {
+      // A dark room has no lamps of its own: only what the party carries lights it.
+      const tile = client.config.tile || 48;
+      ctx.fillStyle = "#07060c";
+      for (const room of this.darkRooms) {
+        ctx.fillRect((room.x - 0.5) * tile, (room.y - 1.5) * tile, (room.w + 1) * tile, (room.h + 2) * tile);
+      }
+    }
     ctx.globalCompositeOperation = "lighter";
     for (const light of this.lights) {
       const { x, y, radius, power } = light;
@@ -2085,73 +2543,20 @@ export class ArenaRenderer {
       ctx.stroke();
     }
 
-    const aim = visual.aim || 0;
-    const dx = Math.cos(aim);
-    const dy = Math.sin(aim);
-    const sideX = Math.cos(aim + Math.PI / 2);
-    const sideY = Math.sin(aim + Math.PI / 2);
-
-    // Pixel-art staff, held toward the aim direction.
-    const staffBaseX = sideX * 7;
-    const staffBaseY = sideY * 7;
-    const tipX = dx * 34 + sideX * 3;
-    const tipY = dy * 34 + sideY * 3;
-    ctx.lineCap = "butt";
-    ctx.strokeStyle = "#120d18";
-    ctx.lineWidth = 4.6;
-    ctx.beginPath();
-    ctx.moveTo(staffBaseX, staffBaseY);
-    ctx.lineTo(tipX, tipY);
-    ctx.stroke();
-    ctx.strokeStyle = "#6f4b2c";
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(staffBaseX, staffBaseY);
-    ctx.lineTo(tipX, tipY);
-    ctx.stroke();
-    ctx.strokeStyle = "#c19158";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(staffBaseX, staffBaseY);
-    ctx.lineTo(tipX, tipY);
-    ctx.stroke();
-    ctx.globalCompositeOperation = "lighter";
-    const orbGlow = ctx.createRadialGradient(tipX, tipY, 0, tipX, tipY, 12);
-    orbGlow.addColorStop(0, rgba(color, 0.95));
-    orbGlow.addColorStop(0.28, rgba(color, 0.42));
-    orbGlow.addColorStop(1, rgba(color, 0));
-    ctx.fillStyle = orbGlow;
-    ctx.beginPath();
-    ctx.arc(tipX, tipY, 12, 0, TAU);
-    ctx.fill();
-    ctx.fillStyle = "#fff7df";
-    ctx.fillRect(tipX - 2.6, tipY - 2.6, 5.2, 5.2);
-    ctx.globalCompositeOperation = "source-over";
-
-    this.drawPixelWizard(ctx, visual, color, t, zoom);
+    drawMage(ctx, visual, color, this.bandOf(player), t);
     ctx.lineCap = "round";
 
     if (player.shield > 0) {
       const strength = clamp(player.shield / 38, 0.2, 1);
       const shieldPulse = 0.72 + Math.sin(t * 2.8 + player.id) * 0.12;
-      const bubble = 47;
+      const bubble = 50;
       ctx.globalCompositeOperation = "lighter";
-      ctx.fillStyle = `rgba(105, 178, 246, ${0.035 + strength * 0.045})`;
+      ctx.fillStyle = `rgba(105, 178, 246, ${0.04 + strength * 0.05})`;
       ctx.beginPath();
-      ctx.arc(0, 0, bubble, 0, TAU);
+      ctx.arc(0, -8, bubble, 0, TAU);
       ctx.fill();
-      ctx.strokeStyle = `rgba(154, 214, 255, ${0.36 * strength * shieldPulse})`;
-      ctx.lineWidth = 1.8 / zoom;
-      ctx.beginPath();
-      ctx.arc(0, 0, bubble, 0, TAU);
-      ctx.stroke();
-      ctx.strokeStyle = `rgba(199, 238, 255, ${0.42 * strength})`;
-      ctx.lineWidth = 1 / zoom;
-      for (let index = 0; index < 4; index += 1) {
-        ctx.beginPath();
-        ctx.arc(0, 0, bubble, index * 1.57 + t * 0.35, index * 1.57 + 0.58 + t * 0.35);
-        ctx.stroke();
-      }
+      pixelRing(ctx, 0, -8, bubble, 3, "#9ad6ff", 0.55 * strength * shieldPulse, { turn: t * 0.35 });
+      pixelRing(ctx, 0, -8, bubble - 6, 2.2, "#e0f5ff", 0.4 * strength, { gap: 0.55, seed: player.id, turn: -t * 0.5 });
       ctx.globalCompositeOperation = "source-over";
     }
 
@@ -2185,145 +2590,59 @@ export class ArenaRenderer {
     ctx.restore();
   }
 
-  drawPixelWizard(ctx, visual, color, t, zoom) {
-    const P = 3;
-    const left = -8 * P;
-    const top = 8 - 20 * P;
-    const bob = visual.moving ? Math.sin(visual.step * 2) * 1.1 : 0;
-    const outline = "#0a0711";
-    const skin = "#e4a86f";
-    const skinLight = "#ffd09a";
-    const beard = "#d5cfdd";
-    const beardDark = "#a79eb8";
-    const gold = "#f3d27f";
-    const robe = mixHex("#422b6e", color, 0.05);
-    const robeLight = mixHex("#5a3e92", color, 0.08);
-    const robeDark = "#211531";
-    const hat = color;
-    const hatLight = mixHex(color, "#ffffff", 0.34);
-    const hatDark = mixHex(color, "#000000", 0.36);
-
-    const block = (col, row, width, height, fill, withOutline = true) => {
-      const x = left + col * P;
-      const y = top + row * P + bob;
-      const w = width * P;
-      const h = height * P;
-      if (withOutline) {
-        ctx.fillStyle = outline;
-        ctx.fillRect(x - 0.8, y - 0.8, w + 1.6, h + 1.6);
-      }
-      ctx.fillStyle = fill;
-      ctx.fillRect(x, y, w, h);
-    };
-
-    // Robe, tattered hem and belt.
-    block(3, 14, 10, 3, robeDark);
-    block(2, 17, 4, 3, robeDark);
-    block(4, 17, 8, 3, robe);
-    block(11, 17, 3, 2, robeDark);
-    block(4, 17, 2, 3, robeLight, false);
-    block(4, 10, 8, 4, robe);
-    block(4, 10, 2, 4, robeLight, false);
-    block(4, 13, 8, 1, gold);
-    block(7, 13, 2, 1, "#fff2b6", false);
-    block(8, 15, 1, 1, gold, false);
-    block(5, 16, 1, 1, gold, false);
-    block(10, 15, 1, 1, mixHex(color, "#ffffff", 0.15), false);
-    block(4, 19, 8, 1, "#b98b4a", false);
-
-    // A five-pixel star on the chest.
-    block(8, 11, 1, 1, gold, false);
-    block(7, 11, 1, 1, gold, false);
-    block(9, 11, 1, 1, gold, false);
-    block(8, 10, 1, 1, gold, false);
-    block(8, 12, 1, 1, gold, false);
-
-    // Arms and hands.
-    block(1, 11, 3, 3, robe);
-    block(1, 13, 2, 2, skin);
-    block(12, 11, 3, 3, robe);
-    block(13, 13, 2, 2, skin);
-
-    // Head and beard.
-    block(5, 7, 6, 4, skin);
-    block(6, 8, 1, 1, "#3a2433", false);
-    block(9, 8, 1, 1, "#3a2433", false);
-    block(8, 8, 1, 1, skinLight, false);
-    block(5, 10, 6, 1, beard);
-    block(6, 11, 4, 1, beard);
-    block(7, 12, 2, 1, beardDark);
-
-    // Crooked hat with a broad brim and gold stars.
-    block(2, 6, 12, 2, hatDark);
-    block(3, 6, 10, 1, hat);
-    block(4, 5, 8, 1, gold);
-    block(5, 4, 6, 1, hat);
-    block(6, 3, 5, 1, hat);
-    block(7, 2, 4, 1, hat);
-    block(8, 1, 4, 1, hat);
-    block(10, 0, 3, 1, hatDark);
-    block(5, 4, 2, 1, hatLight, false);
-    block(6, 3, 2, 1, hatLight, false);
-    block(8, 2, 1, 1, "#ffe17a", false);
-    block(10, 4, 1, 1, "#ffe17a", false);
-    block(6, 5, 1, 1, "#fff2b6", false);
-
-    // A tiny spark circling the hat tip.
-    const sparkle = t * 1.8 + visual.data.id;
-    const sx = Math.cos(sparkle) * 4;
-    const sy = top - 10 + Math.sin(sparkle * 1.3) * 3;
-    ctx.fillStyle = rgba(hatLight, 0.9);
-    ctx.fillRect(sx - 1.2, sy - 1.2, 2.4, 2.4);
-    ctx.fillStyle = rgba("#ffffff", 0.8);
-    ctx.fillRect(sx - 0.5, sy - 0.5, 1, 1);
-  }
-
   drawProjectiles(ctx, now, zoom) {
     const t = now / 1000;
     ctx.save();
-    ctx.globalCompositeOperation = "lighter";
+    ctx.imageSmoothingEnabled = false;
     for (const visual of this.visualProjectiles.values()) {
       const projectile = visual.data;
+      ctx.globalCompositeOperation = "lighter";
       if (projectile.kind === "orb") {
         this.drawOrb(ctx, visual, projectile.color, t);
         continue;
       }
       const isFrost = projectile.kind === "frost";
       const isSpark = projectile.kind === "spark";
-      const baseColor =
-        projectile.color || (isSpark ? "#ffe17a" : isFrost ? "#7ce7ff" : "#ff9a4d");
-      const trail = visual.trail;
-      for (let index = 0; index < trail.length; index += 1) {
-        const point = trail[index];
-        const progress = index / trail.length;
-        const radius = (isSpark ? 4.5 : isFrost ? 6 : 14) * (0.2 + progress * 0.9);
-        ctx.fillStyle = rgba(
-          baseColor,
-          progress * (isSpark || isFrost ? 0.28 : 0.22),
-        );
-        ctx.beginPath();
-        ctx.arc(point.x, point.y, radius, 0, TAU);
-        ctx.fill();
-        if (progress > 0.55) {
-          ctx.fillStyle = rgba("#fff4dc", (progress - 0.55) * 0.4);
-          ctx.beginPath();
-          ctx.arc(point.x, point.y, radius * 0.38, 0, TAU);
-          ctx.fill();
+      const baseColor = projectile.color || (isSpark ? "#ffe17a" : isFrost ? "#7ce7ff" : "#ff9a4d");
+      const { x, y, trail } = visual;
+      const seed = projectile.id;
+
+      if (isSpark) {
+        // It crackles along where it has been.
+        if (trail.length > 3) {
+          const path = [];
+          for (let index = 0; index < trail.length; index += 4) path.push(trail[index]);
+          path.push({ x, y });
+          drawJaggedBolt(ctx, path, baseColor, 2.4, 0.5, t + seed, 0);
+        }
+      } else if (isFrost) {
+        for (let index = 0; index < trail.length; index += 2) {
+          const point = trail[index];
+          const progress = index / trail.length;
+          const size = 1.5 + progress * 3.5;
+          const drift = Math.sin(index * 1.7 + seed) * (1 - progress) * 9;
+          ctx.globalAlpha = progress * 0.55;
+          ctx.fillStyle = index % 4 ? baseColor : "#ffffff";
+          ctx.fillRect(point.x + drift - size / 2, point.y - drift - size / 2, size, size);
+        }
+      } else {
+        // Burning on the way, hottest next to the head and smoking at the tail.
+        for (let index = 0; index < trail.length; index += 1) {
+          const point = trail[index];
+          const progress = index / trail.length;
+          const size = 3 + 13 * progress ** 1.4;
+          const shake = Math.sin(index * 7.1 + t * 31 + seed) * (1 - progress) * 7;
+          ctx.globalAlpha = progress * 0.72;
+          ctx.fillStyle = progress > 0.74 ? "#fff1b8" : progress > 0.42 ? baseColor : "#b02a14";
+          ctx.fillRect(point.x + shake - size / 2, point.y - shake - size / 2, size, size);
         }
       }
+      ctx.globalAlpha = 1;
 
-      const x = visual.x;
-      const y = visual.y;
-      const flicker = isFrost || isSpark
-        ? 0.94 + Math.sin(t * 17 + projectile.id) * 0.06
-        : 1 + Math.sin(t * 23 + projectile.id * 1.7) * 0.09;
-      const haloRadius = (isSpark ? 36 : isFrost ? 46 : 72) * flicker;
-
+      const haloRadius = isSpark ? 26 : isFrost ? 36 : 50;
       const glow = ctx.createRadialGradient(x, y, 0, x, y, haloRadius);
-      glow.addColorStop(0, rgba(baseColor, isSpark ? 0.96 : isFrost ? 0.92 : 0.88));
-      glow.addColorStop(0.16, rgba(baseColor, 0.72));
-      glow.addColorStop(0.42, rgba(baseColor, 0.3));
-      glow.addColorStop(0.72, rgba(baseColor, 0.1));
+      glow.addColorStop(0, rgba(baseColor, 0.65));
+      glow.addColorStop(0.45, rgba(baseColor, 0.2));
       glow.addColorStop(1, rgba(baseColor, 0));
       ctx.fillStyle = glow;
       ctx.beginPath();
@@ -2332,87 +2651,22 @@ export class ArenaRenderer {
 
       ctx.save();
       ctx.translate(x, y);
-      ctx.rotate(visual.angle);
       if (isSpark) {
-        ctx.fillStyle = rgba(baseColor, 0.3);
-        ctx.beginPath();
-        ctx.ellipse(-7, 0, 18, 5.5, 0, 0, TAU);
-        ctx.fill();
-        starPath(ctx, 0, 0, 4, 12, 3.4, 0);
-        ctx.fillStyle = rgba(baseColor, 0.92);
-        ctx.fill();
-        starPath(ctx, 0, 0, 4, 7, 2.1, Math.PI / 4);
-        ctx.fillStyle = "rgba(255, 252, 224, 0.94)";
-        ctx.fill();
-        ctx.fillStyle = "#ffffff";
-        ctx.beginPath();
-        ctx.arc(0, 0, 2.8, 0, TAU);
-        ctx.fill();
+        ctx.globalCompositeOperation = "source-over";
+        drawStar(ctx, 0, 0, 13 + Math.sin(t * 30 + seed) * 3, baseColor, 1, t * 7 + seed);
       } else if (isFrost) {
-        ctx.fillStyle = "rgba(124, 231, 255, 0.3)";
-        ctx.beginPath();
-        ctx.arc(0, 0, 21, 0, TAU);
-        ctx.fill();
-        for (const side of [-1, 1]) {
-          ctx.save();
-          ctx.rotate(side * 0.5);
-          ctx.fillStyle = "rgba(214, 251, 255, 0.8)";
-          ctx.beginPath();
-          ctx.moveTo(7, 0);
-          ctx.lineTo(-12, 4.5);
-          ctx.lineTo(-7, 0);
-          ctx.lineTo(-12, -4.5);
-          ctx.closePath();
-          ctx.fill();
-          ctx.restore();
-        }
-        ctx.fillStyle = "#d6fbff";
-        ctx.beginPath();
-        ctx.moveTo(16, 0);
-        ctx.lineTo(-8, 8.5);
-        ctx.lineTo(-4, 0);
-        ctx.lineTo(-8, -8.5);
-        ctx.closePath();
-        ctx.fill();
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
-        ctx.lineWidth = 1.3 / zoom;
-        ctx.beginPath();
-        ctx.moveTo(10, 0);
-        ctx.lineTo(-2, 0);
-        ctx.stroke();
+        ctx.rotate(visual.angle);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(frostShard(baseColor), -30, -16, 56, 30);
       } else {
-        for (let index = 0; index < 10; index += 1) {
-          const angle = (index / 10) * TAU + t * 0.9;
-          const distance = 14 + Math.sin(t * 11 + index * 1.9) * 5;
-          const radius = 6.5 + Math.sin(t * 9 + index) * 2.6;
-          ctx.fillStyle = rgba(index % 2 === 0 ? "#ffd27a" : baseColor, 0.2);
-          ctx.beginPath();
-          ctx.arc(
-            Math.cos(angle) * distance,
-            Math.sin(angle) * distance,
-            radius,
-            0,
-            TAU,
-          );
-          ctx.fill();
-        }
-        const body = ctx.createRadialGradient(-2, -3, 1, 0, 0, 19);
-        body.addColorStop(0, "#fffbe5");
-        body.addColorStop(0.18, "#ffe19a");
-        body.addColorStop(0.55, "#ff9a3d");
-        body.addColorStop(1, "#d93c1f");
-        ctx.fillStyle = body;
-        ctx.beginPath();
-        ctx.arc(0, 0, 17.5, 0, TAU);
-        ctx.fill();
-        ctx.fillStyle = "rgba(255, 255, 255, 0.92)";
-        ctx.beginPath();
-        ctx.arc(-1.5, -2.5, 6.5, 0, TAU);
-        ctx.fill();
+        ctx.rotate(visual.angle);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(flameFrame(baseColor, t + seed * 0.13), -52, -22, 68, 44);
       }
       ctx.restore();
     }
     ctx.restore();
+    void zoom;
   }
 
   /** Enemy shots: small, hard-edged and ringed in dark so they read on any floor. */
@@ -2444,62 +2698,41 @@ export class ArenaRenderer {
     for (const ward of client.wards) {
       const armed = Boolean(ward.armed);
       const pulse = 0.5 + Math.sin(t * 2.6 + ward.id) * 0.5;
-      const alpha = armed ? 0.68 : 0.28;
+      const alpha = armed ? 0.85 : 0.35;
       ctx.save();
       ctx.translate(ward.x, ward.y);
-
-      ctx.strokeStyle = `rgba(169, 151, 255, ${0.1 + pulse * 0.05})`;
-      ctx.lineWidth = 0.8 / zoom;
-      ctx.setLineDash([3, 8]);
-      ctx.beginPath();
-      ctx.arc(0, 0, 38, 0, TAU);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, 23);
-      glow.addColorStop(0, `rgba(173, 143, 255, ${armed ? 0.26 : 0.12})`);
+      const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, 34);
+      glow.addColorStop(0, `rgba(173, 143, 255, ${armed ? 0.3 : 0.12})`);
       glow.addColorStop(1, "rgba(173, 143, 255, 0)");
       ctx.fillStyle = glow;
       ctx.beginPath();
-      ctx.arc(0, 0, 23, 0, TAU);
+      ctx.arc(0, 0, 34, 0, TAU);
       ctx.fill();
-
-      ctx.rotate(t * (armed ? 0.28 : 0.1) + ward.id);
-      ctx.strokeStyle = `rgba(217, 181, 108, ${alpha})`;
-      ctx.lineWidth = 1.1 / zoom;
-      ctx.beginPath();
-      ctx.arc(0, 0, 14, 0, TAU);
-      ctx.stroke();
-      ctx.beginPath();
-      for (let index = 0; index < 6; index += 1) {
-        const angle = (index / 6) * TAU;
-        const x = Math.cos(angle) * 14;
-        const y = Math.sin(angle) * 14;
-        if (index === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+      pixelRing(ctx, 0, 0, 38, 2.2, VIOLET, 0.2 + pulse * 0.14, { gap: 0.4, seed: ward.id, turn: t * 0.2 });
+      const spin = t * (armed ? 0.5 : 0.14) + ward.id;
+      pixelRing(ctx, 0, 0, 20, 2.6, "#f3d27f", alpha, { turn: spin });
+      // A hexagram of two triangles, one turning against the other.
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = VIOLET;
+      for (const [turn, tone] of [[spin, VIOLET], [-spin, "#f3d27f"]]) {
+        ctx.fillStyle = tone;
+        for (let corner = 0; corner < 3; corner += 1) {
+          const from = turn + (corner / 3) * TAU;
+          const to = turn + ((corner + 1) / 3) * TAU;
+          pixelLine(ctx, Math.cos(from) * 18, Math.sin(from) * 18, Math.cos(to) * 18, Math.sin(to) * 18, 2);
+        }
       }
-      ctx.closePath();
-      ctx.strokeStyle = `rgba(169, 151, 255, ${alpha * 0.8})`;
-      ctx.stroke();
-      starPath(ctx, 0, 0, 3, 9, 3.2, -Math.PI / 2);
-      ctx.fillStyle = `rgba(244, 217, 155, ${armed ? 0.34 : 0.13})`;
-      ctx.fill();
+      ctx.globalAlpha = 1;
       ctx.restore();
-
       if (armed) {
-        ctx.strokeStyle = `rgba(169, 151, 255, ${0.16 + pulse * 0.12})`;
-        ctx.lineWidth = 0.9 / zoom;
-        ctx.beginPath();
-        ctx.arc(ward.x, ward.y, 21 + pulse * 4, 0, TAU);
-        ctx.stroke();
+        pixelRing(ctx, ward.x, ward.y, 26 + pulse * 5, 2, VIOLET, 0.18 + pulse * 0.2, { gap: 0.5, seed: ward.id });
       }
       if (ward.ttl < 2.4) {
         ctx.fillStyle = `rgba(255, 140, 130, ${0.45 + pulse * 0.4})`;
-        ctx.beginPath();
-        ctx.arc(ward.x + 16, ward.y - 15, 1.5, 0, TAU);
-        ctx.fill();
+        ctx.fillRect(ward.x + 15, ward.y - 17, 4, 4);
       }
     }
+    void zoom;
   }
 
   drawEmps(ctx, client, now, zoom) {
@@ -2509,89 +2742,49 @@ export class ArenaRenderer {
       const radius = Number(emp.radius) || 190;
       const delay = Math.max(0.1, Number(emp.delay) || 1.5);
       const ttl = Math.max(0, Number(emp.ttl) || 0);
-      const pullTtl = Math.max(0, Number(emp.pull_ttl) || 0);
-      const pulled = pullTtl <= 0.001;
+      const pulled = Math.max(0, Number(emp.pull_ttl) || 0) <= 0.001;
       const progress = clamp(1 - ttl / delay, 0, 1);
       const pulse = 0.5 + Math.sin(t * 7.2 + emp.id) * 0.5;
       const color = emp.color || EMP_COLOR;
       ctx.save();
       ctx.translate(emp.x, emp.y);
-
-      ctx.strokeStyle = rgba(color, 0.2 + progress * 0.38);
-      ctx.lineWidth = (1.2 + progress * 0.8) / zoom;
-      ctx.setLineDash([4, 7]);
-      ctx.beginPath();
-      ctx.arc(0, 0, radius, 0, TAU);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      ctx.strokeStyle = rgba(color, 0.32 + pulse * 0.18);
-      ctx.lineWidth = 0.9 / zoom;
-      ctx.beginPath();
-      ctx.arc(0, 0, radius * (0.62 + progress * 0.3), 0, TAU);
-      ctx.stroke();
-
-      const orbRadius = 12 + progress * 12 + pulse * 2.2;
-      const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, orbRadius * 3.4);
-      glow.addColorStop(0, rgba("#f0e8ff", 0.72 + progress * 0.2));
-      glow.addColorStop(0.22, rgba(color, 0.55));
-      glow.addColorStop(0.58, rgba(color, 0.2));
+      // Where it will reach, and a second ring closing in as the moment comes.
+      pixelRing(ctx, 0, 0, radius, 3, color, 0.3 + progress * 0.45, { gap: 0.3, seed: emp.id, turn: t * 0.15 });
+      pixelRing(ctx, 0, 0, radius * (1 - progress * 0.9), 3.6, "#efe6ff", 0.3 + progress * 0.5, { gap: 0.2, seed: emp.id + 1 });
+      const orb = 12 + progress * 12 + pulse * 2.2;
+      ctx.globalCompositeOperation = "lighter";
+      const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, orb * 3.2);
+      glow.addColorStop(0, rgba("#f0e8ff", 0.75));
+      glow.addColorStop(0.3, rgba(color, 0.5));
       glow.addColorStop(1, rgba(color, 0));
       ctx.fillStyle = glow;
       ctx.beginPath();
-      ctx.arc(0, 0, orbRadius * 3.4, 0, TAU);
+      ctx.arc(0, 0, orb * 3.2, 0, TAU);
       ctx.fill();
-
-      ctx.fillStyle = rgba("#f7f1ff", 0.86);
-      ctx.beginPath();
-      ctx.arc(0, 0, orbRadius, 0, TAU);
-      ctx.fill();
-      ctx.fillStyle = rgba(color, 0.42 + pulse * 0.2);
-      ctx.beginPath();
-      ctx.arc(0, 0, orbRadius * 1.45, 0, TAU);
-      ctx.fill();
-
-      if (pulled) {
-        ctx.strokeStyle = rgba("#f1e9ff", 0.34 + pulse * 0.28);
-        ctx.lineWidth = 1.5 / zoom;
-        for (let index = 0; index < 8; index += 1) {
-          const angle = (index / 8) * TAU + t * 0.8;
-          const outer = radius * (0.48 + pulse * 0.1);
-          const inner = 18;
-          ctx.beginPath();
-          ctx.moveTo(Math.cos(angle) * outer, Math.sin(angle) * outer);
-          ctx.lineTo(Math.cos(angle) * inner, Math.sin(angle) * inner);
-          ctx.stroke();
-          ctx.fillStyle = rgba("#f6efff", 0.42 + pulse * 0.3);
-          ctx.beginPath();
-          ctx.arc(Math.cos(angle) * 11, Math.sin(angle) * 11, 1.6, 0, TAU);
-          ctx.fill();
-        }
-      }
-
-      ctx.rotate(t * (0.8 + progress * 1.8) + emp.id * 0.4);
-      ctx.strokeStyle = rgba(color, 0.42 + progress * 0.32);
-      ctx.lineWidth = 1.5 / zoom;
-      for (let index = 0; index < 4; index += 1) {
-        const start = (index / 4) * TAU;
-        ctx.beginPath();
-        ctx.arc(0, 0, radius * (0.38 + index * 0.1), start, start + 0.5);
-        ctx.stroke();
-      }
-
-      for (let index = 0; index < 10; index += 1) {
-        const angle = (index / 10) * TAU + t * 0.35;
-        const outer = radius * (0.72 + Math.sin(t * 3 + index) * 0.04);
-        const inner = outer - 18 - progress * 22;
-        ctx.strokeStyle = rgba(index % 2 === 0 ? "#f0e8ff" : color, 0.28 + progress * 0.4);
-        ctx.lineWidth = 1 / zoom;
-        ctx.beginPath();
-        ctx.moveTo(Math.cos(angle) * outer, Math.sin(angle) * outer);
-        ctx.lineTo(Math.cos(angle) * inner, Math.sin(angle) * inner);
-        ctx.stroke();
+      ctx.globalCompositeOperation = "source-over";
+      this.drawPixelDisc(ctx, 0, 0, orb, ["#f7f1ff", "#d8c6ff", color, "#ffffff"], Math.floor(t * 9) + emp.id);
+      ctx.globalCompositeOperation = "lighter";
+      // Arcs reaching out from the middle, each lasting one flicker.
+      const arcs = pulled ? 7 : 4;
+      for (let arc = 0; arc < arcs; arc += 1) {
+        const angle = (arc / arcs) * TAU + Math.floor(t * 7) * 1.3 + emp.id;
+        const reach = radius * (0.34 + progress * 0.42);
+        drawJaggedBolt(
+          ctx,
+          [
+            { x: Math.cos(angle) * orb, y: Math.sin(angle) * orb },
+            { x: Math.cos(angle) * reach, y: Math.sin(angle) * reach },
+          ],
+          color,
+          2.2,
+          0.5 + progress * 0.4,
+          t + arc,
+          0,
+        );
       }
       ctx.restore();
     }
+    void zoom;
   }
 
   drawClouds(ctx, client, now, zoom) {
@@ -2601,64 +2794,38 @@ export class ArenaRenderer {
       const radius = Number(cloud.radius) || 110;
       const color = cloud.color || "#86e08a";
       const pulse = 0.5 + Math.sin(t * 2.2 + cloud.id) * 0.5;
-      const ttl = Math.max(0, Number(cloud.ttl) || 0);
-      const fade = clamp(ttl / 1.2, 0, 1);
+      const fade = clamp(Math.max(0, Number(cloud.ttl) || 0) / 1.2, 0, 1);
       ctx.save();
       ctx.translate(cloud.x, cloud.y);
-      ctx.globalCompositeOperation = "source-over";
-
-      const haze = ctx.createRadialGradient(0, 0, radius * 0.08, 0, 0, radius);
-      haze.addColorStop(0, rgba(color, 0.16 * fade));
-      haze.addColorStop(0.58, rgba(color, 0.11 * fade));
-      haze.addColorStop(1, rgba(color, 0));
-      ctx.fillStyle = haze;
-      ctx.beginPath();
-      ctx.arc(0, 0, radius, 0, TAU);
-      ctx.fill();
-
-      for (let index = 0; index < 9; index += 1) {
-        const angle =
-          (index / 9) * TAU + t * (0.1 + (index % 3) * 0.025) + cloud.id * 0.7;
-        const orbit = radius * (0.28 + (index % 4) * 0.11);
-        const puff = radius * (0.24 + ((index * 5) % 4) * 0.035);
-        const x = Math.cos(angle) * orbit;
-        const y = Math.sin(angle * 0.85) * orbit * 0.55;
-        const puffGradient = ctx.createRadialGradient(x, y, 0, x, y, puff);
-        puffGradient.addColorStop(
-          0,
-          rgba(index % 2 === 0 ? "#c8ffd2" : color, (0.13 + pulse * 0.05) * fade),
+      ctx.imageSmoothingEnabled = false;
+      for (let index = 0; index < 10; index += 1) {
+        const angle = (index / 10) * TAU + t * (0.1 + (index % 3) * 0.03) + cloud.id * 0.7;
+        const orbit = radius * (0.2 + (index % 4) * 0.16);
+        const size = radius * (0.72 + (index % 3) * 0.16) + Math.sin(t * 1.4 + index) * 5;
+        ctx.globalAlpha = (0.2 + pulse * 0.05) * fade;
+        ctx.drawImage(
+          puffSprite(color, index % 3),
+          Math.cos(angle) * orbit - size / 2,
+          Math.sin(angle * 0.85) * orbit * 0.62 - size / 2,
+          size,
+          size,
         );
-        puffGradient.addColorStop(1, rgba(color, 0));
-        ctx.fillStyle = puffGradient;
-        ctx.beginPath();
-        ctx.arc(x, y, puff, 0, TAU);
-        ctx.fill();
       }
-
-      ctx.strokeStyle = rgba(color, 0.18 + pulse * 0.12);
-      ctx.lineWidth = 1 / zoom;
-      ctx.setLineDash([3, 8]);
-      ctx.beginPath();
-      ctx.arc(0, 0, radius, 0, TAU);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      for (let index = 0; index < 6; index += 1) {
-        const angle = (index / 6) * TAU + t * 0.4;
-        const drift = radius * (0.35 + Math.sin(t * 1.6 + index) * 0.2);
-        ctx.fillStyle = rgba("#d5ffc9", 0.3 * fade);
-        ctx.beginPath();
-        ctx.arc(
-          Math.cos(angle) * drift,
-          Math.sin(angle) * drift * 0.6,
-          1.5 + Math.sin(t * 2 + index) * 0.6,
-          0,
-          TAU,
-        );
-        ctx.fill();
+      // Bubbles that come up and pop.
+      for (let index = 0; index < 8; index += 1) {
+        const rise = (t * 0.45 + index * 0.37 + cloud.id * 0.2) % 1;
+        const across = Math.sin(index * 2.4 + cloud.id) * radius * 0.7;
+        const up = Math.cos(index * 1.3 + cloud.id) * radius * 0.42 - rise * 34;
+        const size = 2 + (index % 3);
+        ctx.globalAlpha = (1 - rise) * 0.75 * fade;
+        ctx.fillStyle = "#d5ffc9";
+        ctx.fillRect(across - size / 2, up - size / 2, size, size);
       }
+      ctx.globalAlpha = 1;
+      pixelRing(ctx, 0, 0, radius, 2.6, color, (0.2 + pulse * 0.16) * fade, { gap: 0.5, seed: cloud.id, turn: t * 0.1 });
       ctx.restore();
     }
+    void zoom;
   }
 
   drawPixelDisc(ctx, x, y, radius, colors, seed) {
@@ -2820,38 +2987,17 @@ export class ArenaRenderer {
       ctx.save();
       ctx.translate(meteor.x, meteor.y);
 
-      const danger = ctx.createRadialGradient(0, 0, 0, 0, 0, radius);
-      danger.addColorStop(
-        0,
-        rgba(color, (0.05 + progress * 0.1) * strength),
-      );
-      danger.addColorStop(
-        0.72,
-        rgba(color, (0.08 + progress * 0.14) * strength),
-      );
-      danger.addColorStop(1, rgba(color, 0));
-      ctx.fillStyle = danger;
+      ctx.fillStyle = rgba(color, (0.05 + progress * 0.13) * strength);
       ctx.beginPath();
       ctx.arc(0, 0, radius, 0, TAU);
       ctx.fill();
-
-      ctx.strokeStyle = rgba(
-        color,
-        (0.3 + progress * 0.42) * strength,
-      );
-      ctx.lineWidth = (1.2 + progress * 1.2) / zoom;
-      ctx.setLineDash([4, 7]);
-      ctx.beginPath();
-      ctx.arc(0, 0, radius, 0, TAU);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
+      pixelRing(ctx, 0, 0, radius, 3, color, (0.4 + progress * 0.5) * strength, { gap: 0.25, seed: meteor.id, turn: t * 0.2 });
       if (isMain) {
-        ctx.strokeStyle = rgba(color, 0.22 + pulse * 0.2);
-        ctx.lineWidth = 0.9 / zoom;
-        ctx.beginPath();
-        ctx.arc(0, 0, radius * (0.54 + progress * 0.22), 0, TAU);
-        ctx.stroke();
+        // The closer ring is how long there is left to get out.
+        pixelRing(ctx, 0, 0, radius * (1 - progress * 0.92), 3.6, "#fff1b8", 0.35 + pulse * 0.25 + progress * 0.3);
+        ctx.fillStyle = rgba("#fff1b8", 0.5 + pulse * 0.3);
+        ctx.fillRect(-14, -1.5, 28, 3);
+        ctx.fillRect(-1.5, -14, 3, 28);
       }
       ctx.restore();
 
@@ -2878,6 +3024,7 @@ export class ArenaRenderer {
   /** One pass for what spreads along the floor, one for what hangs in the air. */
   drawEffects(ctx, now, zoom, onGround) {
     ctx.save();
+    ctx.imageSmoothingEnabled = false;
     ctx.globalCompositeOperation = "lighter";
     for (const effect of this.effects) {
       if (GROUND_EFFECTS.has(effect.kind) !== onGround) continue;
@@ -2885,245 +3032,168 @@ export class ArenaRenderer {
       const eased = 1 - Math.pow(1 - progress, 3);
       const alpha = 1 - progress;
       if (effect.kind === "scorch") {
-        const fade = 1 - progress;
+        const size = 118 * (effect.scale || 1);
         ctx.globalCompositeOperation = "source-over";
-        const radius = (38 + progress * 18) * (effect.scale || 1);
-        const scorch = ctx.createRadialGradient(
-          effect.x,
-          effect.y,
-          0,
-          effect.x,
-          effect.y,
-          radius,
+        ctx.globalAlpha = Math.min(1, alpha * 2.4);
+        ctx.drawImage(
+          scorchSprite(effect.element, effect.color, effect.variant || 0),
+          effect.x - size / 2,
+          effect.y - size / 2,
+          size,
+          size,
         );
-        if (effect.element === "frost") {
-          scorch.addColorStop(0, `rgba(195, 247, 255, ${0.3 * fade})`);
-          scorch.addColorStop(0.5, `rgba(94, 208, 255, ${0.14 * fade})`);
-          scorch.addColorStop(1, "rgba(94, 208, 255, 0)");
-        } else if (effect.element === "emp") {
-          scorch.addColorStop(0, `rgba(220, 207, 255, ${0.32 * fade})`);
-          scorch.addColorStop(0.45, `rgba(117, 82, 218, ${0.2 * fade})`);
-          scorch.addColorStop(1, "rgba(45, 25, 95, 0)");
-        } else {
-          scorch.addColorStop(0, `rgba(255, 142, 65, ${0.32 * fade})`);
-          scorch.addColorStop(0.45, `rgba(126, 54, 44, ${0.22 * fade})`);
-          scorch.addColorStop(1, "rgba(40, 18, 20, 0)");
-        }
-        ctx.fillStyle = scorch;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, radius, 0, TAU);
-        ctx.fill();
+        ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "lighter";
-      } else if (effect.kind === "beam") {
-        const fade = 1 - progress;
-        const x1 = effect.x1;
-        const y1 = effect.y1;
-        const x2 = effect.x2;
-        const y2 = effect.y2;
-        const width = effect.width * (0.8 + 0.2 * Math.sin(progress * Math.PI));
-        ctx.lineCap = "square";
-        const layers = [
-          [width * 1.6, 0.08],
-          [width, 0.16],
-          [width * 0.55, 0.42],
-          [width * 0.22, 0.9],
-        ];
-        for (const [lineWidth, layerAlpha] of layers) {
-          ctx.strokeStyle = rgba(effect.color, fade * layerAlpha);
-          ctx.lineWidth = lineWidth;
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.stroke();
-        }
-        ctx.strokeStyle = rgba("#ffffff", fade * 0.95);
-        ctx.lineWidth = Math.max(1.5, width * 0.08);
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
-        for (let index = 0; index < 7; index += 1) {
-          const at = ((index / 7 + progress * 1.8) % 1) * 0.94 + 0.03;
-          const px = x1 + (x2 - x1) * at;
-          const py = y1 + (y2 - y1) * at;
-          ctx.fillStyle = rgba("#ffffff", fade * 0.7);
-          ctx.fillRect(px - width * 0.09, py - width * 0.09, width * 0.18, width * 0.18);
-        }
-        ctx.lineCap = "round";
       } else if (effect.kind === "explosion") {
         const scale = effect.scale || 1;
-        const radius = (28 + eased * 72) * scale;
-        const coreRadius = (16 + eased * 26) * scale;
-        const flash = ctx.createRadialGradient(
-          effect.x,
-          effect.y,
-          0,
-          effect.x,
-          effect.y,
-          radius,
-        );
         const hot = effect.element === "frost" ? "#e6fdff" : "#fff5d6";
-        flash.addColorStop(0, rgba(hot, (1 - progress) * 0.72));
-        flash.addColorStop(0.24, rgba(effect.color, (1 - progress) * 0.5));
-        flash.addColorStop(0.56, rgba(effect.color, (1 - progress) * 0.18));
-        flash.addColorStop(1, rgba(effect.color, 0));
-        ctx.fillStyle = flash;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, radius, 0, TAU);
-        ctx.fill();
-
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.9);
-        ctx.lineWidth = 5.5 / zoom;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, coreRadius + 30 * eased, 0, TAU);
-        ctx.stroke();
-        ctx.strokeStyle = rgba(hot, alpha * 0.65);
-        ctx.lineWidth = 2 / zoom;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, coreRadius + 52 * eased, 0, TAU);
-        ctx.stroke();
-
-        if (effect.element === "fire" || effect.element === "arcane") {
-          const tongues = effect.element === "arcane" ? 10 : 8;
-          ctx.fillStyle = rgba(effect.color, alpha * 0.34);
-          for (let index = 0; index < tongues; index += 1) {
-            const angle = (index / tongues) * TAU + progress * 0.8;
-            const length = (16 + eased * 30) * scale;
-            const ignite = Math.sin(Math.PI * progress) * 0.5 + 0.5;
-            ctx.beginPath();
-            ctx.arc(
-              effect.x + Math.cos(angle) * radius * 0.58,
-              effect.y + Math.sin(angle) * radius * 0.58,
-              length * ignite,
-              0,
-              TAU,
-            );
-            ctx.fill();
-          }
+        if (progress < 0.24) {
+          const flash = ctx.createRadialGradient(effect.x, effect.y, 0, effect.x, effect.y, 92 * scale);
+          flash.addColorStop(0, rgba(hot, (1 - progress / 0.24) * 0.85));
+          flash.addColorStop(1, rgba(hot, 0));
+          ctx.fillStyle = flash;
+          ctx.beginPath();
+          ctx.arc(effect.x, effect.y, 92 * scale, 0, TAU);
+          ctx.fill();
         }
+        const size = 142 * scale;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(blastFrame(effect.element, effect.color, progress), effect.x - size / 2, effect.y - size / 2, size, size);
+        ctx.globalCompositeOperation = "lighter";
+        pixelRing(ctx, effect.x, effect.y, (20 + eased * 92) * scale, 4.4 * Math.min(1.5, scale), hot, alpha ** 1.5 * 0.95, { gap: 0.18, seed: effect.x });
       } else if (effect.kind === "ring") {
         const radius = effect.from + (effect.to - effect.from) * eased;
         if (radius <= 0) continue;
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.7);
-        ctx.lineWidth = effect.width / zoom;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, radius, 0, TAU);
-        ctx.stroke();
-        if (effect.runes) {
-          ctx.fillStyle = rgba(effect.color, alpha * 0.55);
-          for (let index = 0; index < 8; index += 1) {
-            const angle = (index / 8) * TAU + progress * 0.8;
-            const x = effect.x + Math.cos(angle) * radius;
-            const y = effect.y + Math.sin(angle) * radius;
-            ctx.save();
-            ctx.translate(x, y);
-            ctx.rotate(angle + Math.PI / 2);
-            ctx.fillRect(-0.7, -3, 1.4, 6);
-            ctx.restore();
-          }
-        }
+        pixelRing(ctx, effect.x, effect.y, radius, Math.max(2.4, effect.width * 1.5), effect.color, alpha * 0.85, {
+          gap: effect.runes ? 0.3 : 0.08,
+          seed: effect.y,
+        });
       } else if (effect.kind === "nova") {
         const radius = effect.radius * eased;
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.75);
-        ctx.lineWidth = 3.2 / zoom;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, radius, 0, TAU);
-        ctx.stroke();
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.28);
-        ctx.lineWidth = 1.2 / zoom;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, radius * 0.72, 0, TAU);
-        ctx.stroke();
-        ctx.strokeStyle = rgba("#f4d99b", alpha * 0.35);
-        for (let index = 0; index < 16; index += 1) {
-          const angle = (index / 16) * TAU + progress * 0.9;
+        if (progress < 0.2) {
+          const flash = ctx.createRadialGradient(effect.x, effect.y, 0, effect.x, effect.y, effect.radius * 0.6);
+          flash.addColorStop(0, rgba(effect.color, (1 - progress / 0.2) * 0.5));
+          flash.addColorStop(1, rgba(effect.color, 0));
+          ctx.fillStyle = flash;
           ctx.beginPath();
-          ctx.moveTo(
-            effect.x + Math.cos(angle) * radius * 0.58,
-            effect.y + Math.sin(angle) * radius * 0.58,
-          );
-          ctx.lineTo(
-            effect.x + Math.cos(angle) * radius,
-            effect.y + Math.sin(angle) * radius,
-          );
-          ctx.stroke();
-        }
-        const flash = ctx.createRadialGradient(
-          effect.x,
-          effect.y,
-          0,
-          effect.x,
-          effect.y,
-          Math.max(8, radius * 0.55),
-        );
-        flash.addColorStop(0, rgba(effect.color, alpha * 0.12));
-        flash.addColorStop(1, rgba(effect.color, 0));
-        ctx.fillStyle = flash;
-        ctx.beginPath();
-        ctx.arc(effect.x, effect.y, Math.max(8, radius * 0.55), 0, TAU);
-        ctx.fill();
-      } else if (effect.kind === "bolt") {
-        const points = effect.points;
-        if (!points || points.length < 2) continue;
-        const width = effect.width || 4;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.18);
-        ctx.lineWidth = (width * 2.6) / zoom;
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        for (let index = 1; index < points.length; index += 1) {
-          ctx.lineTo(points[index].x, points[index].y);
-        }
-        ctx.stroke();
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.72);
-        ctx.lineWidth = width / zoom;
-        ctx.stroke();
-        ctx.strokeStyle = rgba("#ffffff", alpha * 0.9);
-        ctx.lineWidth = Math.max(0.8, width * 0.28) / zoom;
-        ctx.stroke();
-        for (let index = 1; index < points.length; index += 1) {
-          const point = points[index];
-          ctx.fillStyle = rgba("#ffffff", alpha * 0.8);
-          ctx.beginPath();
-          ctx.arc(point.x, point.y, (width * 0.42) / zoom, 0, TAU);
+          ctx.arc(effect.x, effect.y, effect.radius * 0.6, 0, TAU);
           ctx.fill();
         }
+        pixelRing(ctx, effect.x, effect.y, radius, 7 - progress * 4, effect.color, alpha, { turn: progress });
+        pixelRing(ctx, effect.x, effect.y, radius - 11, 3.4, "#ffffff", alpha * 0.8, { gap: 0.35, seed: effect.x });
+        pixelRing(ctx, effect.x, effect.y, radius * 0.72, 2.6, effect.color, alpha * 0.45, { gap: 0.5, seed: effect.y });
+        // What the wave is throwing ahead of itself.
+        ctx.fillStyle = rgba("#fff1c8", alpha * 0.8);
+        for (let index = 0; index < 18; index += 1) {
+          const angle = (index / 18) * TAU + 0.3;
+          const reach = radius * (0.84 + ((index * 7) % 5) * 0.05);
+          const size = 2.4 + (index % 3);
+          ctx.fillRect(effect.x + Math.cos(angle) * reach - size / 2, effect.y + Math.sin(angle) * reach - size / 2, size, size);
+        }
+      } else if (effect.kind === "bolt") {
+        drawJaggedBolt(ctx, effect.points, effect.color, (effect.width || 4) * 1.15, alpha, effect.age);
+        const end = effect.points[effect.points.length - 1];
+        drawStar(ctx, end.x, end.y, 20 * alpha + 6, effect.color, alpha);
       } else if (effect.kind === "line") {
-        ctx.strokeStyle = rgba(effect.color, alpha * 0.6);
-        ctx.lineWidth = effect.width / zoom;
-        ctx.beginPath();
-        ctx.moveTo(effect.x1, effect.y1);
-        ctx.lineTo(effect.x2, effect.y2);
-        ctx.stroke();
-        ctx.strokeStyle = rgba("#ffffff", alpha * 0.18);
-        ctx.lineWidth = (effect.width * 0.34) / zoom;
-        ctx.stroke();
+        const across = Math.hypot(effect.x2 - effect.x1, effect.y2 - effect.y1);
+        ctx.save();
+        ctx.translate(effect.x1, effect.y1);
+        ctx.rotate(Math.atan2(effect.y2 - effect.y1, effect.x2 - effect.x1));
+        ctx.fillStyle = rgba(effect.color, alpha * 0.45);
+        ctx.fillRect(0, -effect.width * 0.6, across, effect.width * 1.2);
+        ctx.fillStyle = rgba("#ffffff", alpha * 0.5);
+        ctx.fillRect(0, -effect.width * 0.16, across, effect.width * 0.32);
+        ctx.restore();
+      } else if (effect.kind === "beam") {
+        const across = Math.hypot(effect.x2 - effect.x1, effect.y2 - effect.y1);
+        const reached = across * Math.min(1, progress * 7);
+        const width = effect.width * (1 - progress ** 2.4) * (0.86 + Math.sin(effect.age * 60) * 0.14);
+        const flow = effect.reverse ? -1 : 1;
+        ctx.save();
+        ctx.translate(effect.x1, effect.y1);
+        ctx.rotate(Math.atan2(effect.y2 - effect.y1, effect.x2 - effect.x1));
+        ctx.fillStyle = rgba(effect.color, 0.2);
+        ctx.fillRect(0, -width * 0.62, reached, width * 1.24);
+        ctx.fillStyle = rgba(effect.color, 0.5);
+        ctx.fillRect(0, -width * 0.36, reached, width * 0.72);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+        ctx.fillRect(0, -width * 0.14, reached, width * 0.28);
+        // Packets of light running down it, and bits coming off the edges.
+        ctx.fillStyle = "rgba(255, 255, 255, 0.75)";
+        for (let packet = 0; packet < 16; packet += 1) {
+          const along = (((packet * 58 + flow * effect.age * 1500) % reached) + reached) % reached;
+          ctx.fillRect(along, -width * 0.26, 20, width * 0.52);
+        }
+        ctx.fillStyle = rgba(effect.color, 0.9);
+        for (let bit = 0; bit < 22; bit += 1) {
+          const along = (bit * 73 + Math.floor(effect.age * 40) * 41) % Math.max(1, reached);
+          const off = ((bit * 37) % 100) / 100 - 0.5;
+          ctx.fillRect(along, off * width * 1.5, 5, 5);
+        }
+        ctx.restore();
+        if (!effect.flat) {
+          drawStar(ctx, effect.x1, effect.y1, width * 0.7, effect.color, alpha + 0.3, effect.age * 5);
+          if (progress * 7 >= 1) drawStar(ctx, effect.x2, effect.y2, width * 0.9, effect.color, alpha + 0.3, -effect.age * 5);
+        }
+      } else if (effect.kind === "ghost") {
+        const { image, facing, left, top, width, height } = effect.ghost;
+        ctx.save();
+        ctx.translate(effect.x, effect.y);
+        ctx.scale(facing, 1);
+        ctx.globalAlpha = alpha * 0.55;
+        ctx.drawImage(image, left, top, width, height);
+        ctx.restore();
+      } else if (effect.kind === "star") {
+        drawStar(ctx, effect.x, effect.y, effect.size * (0.6 + eased * 0.6), effect.color, alpha, effect.turn || 0);
       }
     }
     ctx.restore();
     void now;
+    void zoom;
   }
 
   drawParticles(ctx, now, zoom) {
     ctx.save();
-    ctx.globalCompositeOperation = "lighter";
+    // Things with a body first: dust, smoke and debris do not glow.
     for (const particle of this.particles) {
+      const { kind } = particle;
+      if (kind !== "chunk" && kind !== "dust" && kind !== "smoke") continue;
       const alpha = clamp(particle.life / particle.maxLife, 0, 1);
       if (alpha <= 0) continue;
-      ctx.fillStyle = rgba(particle.color, alpha * 0.8);
-      const size = Math.max(0.35, particle.size * (0.45 + alpha * 0.55));
-      if (particle.kind === "spark") {
-        ctx.strokeStyle = rgba(particle.color, alpha * 0.75);
-        ctx.lineWidth = Math.max(0.5, size * 0.55);
+      ctx.fillStyle = particle.color;
+      if (kind === "dust") {
+        const puff = particle.size * (1.6 - alpha * 0.8);
+        ctx.globalAlpha = alpha * 0.2;
+        ctx.fillRect(particle.x - puff / 2, particle.y - puff / 2, puff, puff);
+      } else if (kind === "smoke") {
+        const puff = particle.size * (1.7 - alpha * 0.9);
+        ctx.globalAlpha = Math.min(0.42, alpha * 0.55);
+        ctx.fillRect(particle.x - puff / 2, particle.y - puff / 2, puff, puff);
+        ctx.globalAlpha *= 0.55;
+        ctx.fillRect(particle.x - puff * 0.7, particle.y - puff * 0.32, puff * 1.4, puff * 0.64);
+      } else {
+        ctx.globalAlpha = Math.min(1, alpha * 1.8);
+        ctx.fillRect(particle.x - particle.size / 2, particle.y - particle.size / 2, particle.size, particle.size);
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "lighter";
+    for (const particle of this.particles) {
+      const { kind } = particle;
+      if (kind === "chunk" || kind === "dust" || kind === "smoke") continue;
+      const alpha = clamp(particle.life / particle.maxLife, 0, 1);
+      if (alpha <= 0) continue;
+      const size = Math.max(0.8, particle.size * (0.5 + alpha * 0.6));
+      ctx.globalAlpha = Math.min(1, alpha * 1.1);
+      ctx.fillStyle = particle.color;
+      if (kind === "spark") {
+        ctx.strokeStyle = particle.color;
+        ctx.lineWidth = Math.max(1, size * 0.7);
         ctx.beginPath();
         ctx.moveTo(particle.x, particle.y);
-        ctx.lineTo(
-          particle.x - particle.vx * 0.02,
-          particle.y - particle.vy * 0.02,
-        );
+        ctx.lineTo(particle.x - particle.vx * 0.024, particle.y - particle.vy * 0.024);
         ctx.stroke();
-      } else if (particle.kind === "shard") {
+      } else if (kind === "shard") {
         ctx.save();
         ctx.translate(particle.x, particle.y);
         ctx.rotate(particle.rotation);
@@ -3135,23 +3205,18 @@ export class ArenaRenderer {
         ctx.closePath();
         ctx.fill();
         ctx.restore();
-      } else if (particle.kind === "rune") {
-        ctx.save();
-        ctx.translate(particle.x, particle.y);
-        ctx.rotate(particle.rotation);
-        ctx.fillRect(-size * 0.45, -size, size * 0.9, size * 2);
-        ctx.fillRect(-size, -size * 0.2, size * 2, size * 0.5);
-        ctx.restore();
-      } else if (particle.kind === "wisp") {
-        ctx.globalAlpha = alpha * 0.7;
-        ctx.beginPath();
-        ctx.arc(particle.x, particle.y, size * 1.7, 0, TAU);
-        ctx.fill();
-        ctx.globalAlpha = 1;
+      } else if (kind === "rune") {
+        drawGlyph(ctx, particle.x, particle.y, Math.max(1.4, size * 0.75), particle.glyph);
+      } else if (kind === "plus") {
+        ctx.fillRect(particle.x - size * 1.5, particle.y - size * 0.5, size * 3, size);
+        ctx.fillRect(particle.x - size * 0.5, particle.y - size * 1.5, size, size * 3);
+      } else if (kind === "wisp") {
+        ctx.globalAlpha = alpha * 0.55;
+        ctx.fillRect(particle.x - size, particle.y - size, size * 2, size * 2);
       } else {
-        ctx.beginPath();
-        ctx.arc(particle.x, particle.y, size, 0, TAU);
-        ctx.fill();
+        // Embers start white-hot and cool down into their own colour.
+        if (alpha > 0.72) ctx.fillStyle = "#fff4d0";
+        ctx.fillRect(particle.x - size / 2, particle.y - size / 2, size, size);
       }
     }
     ctx.restore();
@@ -3168,7 +3233,7 @@ export class ArenaRenderer {
     for (const label of labels) {
       const { visual, player, self, screenX, screenY } = label;
       if (screenX < -40 || screenX > this.width + 40) continue;
-      const verticalOffset = 54 + 18 * zoom;
+      const verticalOffset = 66 + 18 * zoom;
       const nameY = screenY - verticalOffset;
       if (nameY < 66 && screenY < 180) {
         // Keep labels clear of the top navigation while still drawing off-screen hints.
@@ -3446,15 +3511,3 @@ export class ArenaRenderer {
   }
 }
 
-function starPath(ctx, cx, cy, points, outer, inner, rotation = 0) {
-  ctx.beginPath();
-  for (let index = 0; index < points * 2; index += 1) {
-    const radius = index % 2 === 0 ? outer : inner;
-    const angle = rotation + (index * Math.PI) / points;
-    const x = cx + Math.cos(angle) * radius;
-    const y = cy + Math.sin(angle) * radius;
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.closePath();
-}

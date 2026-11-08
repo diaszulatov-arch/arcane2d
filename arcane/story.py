@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import math
 import random
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .book import BOOK, BOOK_COSTS, Deferred, RuneShelf, run_deferred
 from .campaign import DIFFICULTIES, WAVES_PER_ROOM, Stage
+from .elites import ELITES, elite_died, elite_tick, maybe_crown
 from .dungeon import TILE, DungeonMap, Room, build_dungeon
 from .game import (
     PLAYER_RADIUS,
@@ -28,9 +31,17 @@ from .game import (
     SPELL_COSTS,
 )
 from .lessons import GATES, LESSONS, Task, check_task, runes_for_stage
-from .monsters import ATTACKS, SPECIES, Monster, Species, first_strike_delay, think
+from .monsters import ATTACKS, SPECIES, Monster, Species, cool_down, first_strike_delay, think
+from .boss_moves import MOVES, ROTATION, BossMove, ReturnNone
+from .folk import StageFolk
+from .life import StageLife
 from .profiles import Perks
+from .quest_data import FIRST_SPECIALS, QUESTS, SPECIAL_KINDS
+from .quests import TRAP_OWNER, QuestUnit, StageQuest
 from .roles import ROLES, SKILL_COSTS, SKILLS, SkillBook
+from .terrain import Prop, StageTerrain
+from .tickets import StageStats
+from .workshop import Workshop
 
 MONSTER_ID_BASE = 100_000
 MAX_MONSTERS = 48
@@ -105,6 +116,11 @@ CRIT_MULTIPLIER = 2.0
 WARD_SHIELD_TIME = 8.0
 CORNER_SLIP = 12.0
 CORNER_NUDGE = 2.0
+REVEAL_REACH = 1.2
+FOCUS_BREAK = 130.0
+REVEAL_EVERY = 0.2
+DARK_FROM_STAGE = 4
+DARK_CHANCE = 0.45
 FLOW_REFRESH = 0.3
 ROUTE_REFRESH = 0.16
 RECURSION_DEPTH = 2
@@ -185,7 +201,12 @@ class Pickup:
     y: float
 
 
-ALL_COSTS = {**SPELL_COSTS, **SKILL_COSTS}
+ALL_COSTS = {**SPELL_COSTS, **SKILL_COSTS, **BOOK_COSTS}
+DUTY_TOUGHNESS = 0.12
+DUTY_BITE = 0.07
+DUTY_CROWD = 0.08
+CATCH_SHARE = 1 / 3
+CATCH_GRACE = 1.5
 
 
 def _segments_cross(
@@ -211,19 +232,48 @@ class StoryArena(Arena):
         seed: int | None = None,
         now: float = 0.0,
         difficulty: int = 1,
+        plain: bool = False,
+        duty: int = 0,
+        known_upto: int | None = None,
+        folk_known: dict[str, str] | None = None,
     ) -> None:
+        self.plain = plain
+        self.duty = duty
+        self.known_upto = stage.index if known_upto is None else known_upto
+        self.trial_runes = False
+        self.deferred: list[Deferred] = []
+        self.stats = StageStats(started=now)
+        self.caught: set[int] = set()
+        self.pgt_boost = 1.0
+        self.boss_moves: list[BossMove] = []
+        self.accepted_in_battle: list[int] = []
+        self.terrain: StageTerrain | None = None
+        self.workshop: Workshop | None = None
+        self.life: StageLife | None = None
+        self.folk: StageFolk | None = None
+        self.monster_pace = 1.0
+        self.monster_bite = 1.0 + DUTY_BITE * duty
+        self.wave_extra = 1.0 + DUTY_CROWD * duty
         self.stage = stage
         self.difficulty = DIFFICULTIES[difficulty]
         self.party_size = max(1, party_size)
         self.seed = seed if seed is not None else random.randrange(1 << 30)
         self.rng = random.Random(self.seed)
-        self.dungeon: DungeonMap = build_dungeon(stage.layout, self.rng)
+        quest = QUESTS.get(stage.quest) if stage.quest else None
+        self.dungeon: DungeonMap = self._build_map(quest)
+        self.exit_room: Room = self.dungeon.path[-1]
+        self.quest: StageQuest | None = None
+        self.locks: dict[str, set[tuple[int, int]]] = {}
+        self.revealed: set[int] = {0}
+        self.reveal_at = 0.0
         self.field_w = self.dungeon.width * TILE
         self.field_h = self.dungeon.height * TILE
         self.monsters: dict[int, Monster] = {}
         self.hazards: list[Hazard] = []
         self.pickups: list[Pickup] = []
-        self.known_runes = runes_for_stage(stage.index)
+        self.known_runes = runes_for_stage(self.known_upto)
+        fights = [room for room in self.dungeon.path if room.kind == "combat"]
+        self.mini_room: Room | None = fights[-1] if stage.mini and fights and not plain else None
         self.active_room: Room | None = None
         self.cleared_rooms: set[int] = set()
         self.wave = 0
@@ -258,8 +308,296 @@ class StoryArena(Arena):
         self._next_pickup_id = 1
         super().__init__(bots=0)
         self.now = now
-        self.portal = self.dungeon.rooms[-1].center
+        self.portal = self.exit_room.center
+        if quest is not None:
+            self.quest = StageQuest(self, quest, stage.chapter_index, stage.index == 0)
+            self.lock("exit", self.exit_room.doors)
+            if not plain:
+                self.terrain = StageTerrain(self)
+                room = next((r for r in self.dungeon.sides if r.kind == "workshop"), None)
+                if room is not None:
+                    self.workshop = Workshop(self, room)
+                self.life = StageLife(self)
+                if not duty:
+                    self.folk = StageFolk(self, folk_known)
         self._place_stage_terminal()
+
+    def _build_map(self, quest: Any) -> DungeonMap:
+        """The way through, the quest's side rooms, and a couple of odd ones."""
+
+        stage = self.stage
+        sides = list(quest.sides) if quest is not None else []
+        specials: list[str] = []
+        if not stage.is_boss:
+            specials = list(FIRST_SPECIALS) if stage.index == 0 else self.rng.sample(SPECIAL_KINDS, 2)
+            if not self.plain:
+                specials += ["workshop", "secret"]
+        dungeon = build_dungeon(
+            stage.layout,
+            self.rng,
+            [side.kind for side in sides] + specials,
+            None if self.plain or stage.is_boss else stage.chapter_index,
+        )
+        for room, side in zip(dungeon.sides, sides):
+            room.tag = side.tag
+            room.guarded = side.guarded
+            room.dark = side.dark
+        fights = [room for room in dungeon.path if room.kind == "combat"]
+        if stage.index >= DARK_FROM_STAGE and len(fights) > 1 and self.rng.random() < DARK_CHANCE:
+            self.rng.choice(fights[1:]).dark = True
+        return dungeon
+
+    # ------------------------------------------------------------------- doors
+    def lock(self, name: str, tiles: Any) -> None:
+        self.locks[name] = set(tiles)
+        self._sync_doors()
+
+    def unlock(self, name: str) -> None:
+        if self.locks.pop(name, None) is not None:
+            self._sync_doors()
+
+    def _sync_doors(self) -> None:
+        closed: set[tuple[int, int]] = set()
+        for tiles in self.locks.values():
+            closed |= tiles
+        self.dungeon.set_closed(closed)
+
+    def gather(self, room: Room) -> None:
+        """Whoever is outside a room that is about to shut joins the rest inside."""
+
+        leader = next(
+            (p for p in self.players.values() if not p.dead and room.holds(p.x, p.y, 0.5)),
+            None,
+        )
+        if leader is None:
+            return
+        for player in self.players.values():
+            if player.id in self.linked or room.holds(player.x, player.y, 0.5):
+                continue
+            player.x, player.y = leader.x, leader.y
+            self._settle(player)
+            if not player.dead:
+                player.invuln_until = max(player.invuln_until, self.now + 1.0)
+            self.emit({"e": "pull", "id": player.id, "x": round(player.x, 1), "y": round(player.y, 1)})
+
+    def quest_solved(self) -> None:
+        self.unlock("exit")
+        self.emit({"e": "exit_open"})
+
+    def trap_beam(
+        self, x: float, y: float, x2: float, y2: float, width: float, delay: float, damage: float
+    ) -> None:
+        self._add_hazard(
+            Hazard(
+                self._next_hazard_id, TRAP_OWNER, x, y, width, self.now + delay, delay,
+                damage, "#ffb347", x2, y2,
+            )
+        )
+
+    def trap_blast(self, x: float, y: float, radius: float, delay: float, damage: float) -> None:
+        self._add_hazard(
+            Hazard(
+                self._next_hazard_id, TRAP_OWNER, x, y, radius, self.now + delay, delay,
+                damage, "#ff8a5c",
+            )
+        )
+
+    def trap_mark(self, x: float, y: float, radius: float, delay: float, label: str) -> None:
+        """A warning on the floor with no blast behind it: what follows is not damage."""
+
+        self._add_hazard(
+            Hazard(
+                self._next_hazard_id, TRAP_OWNER, x, y, radius, self.now + delay, delay,
+                0.0, "#ff4f6a", label=label,
+            )
+        )
+
+    def _secret_tiles(self) -> set[tuple[int, int]]:
+        """A door nobody should see yet, even when the fight shuts every door around it."""
+
+        if self.life is None or not self.life.secret_hidden:
+            return set()
+        return set(self.life.secret_gate)
+
+    # ------------------------------------------------------------ the rune book
+    def ping(self, player: Player, x: float, y: float, radius: float) -> int:
+        count = sum(
+            1
+            for monster in self.monsters.values()
+            if monster.hacked_until <= self.now and math.hypot(monster.x - x, monster.y - y) <= radius
+        )
+        room = self.dungeon.room_at(x, y)
+        if room is not None and room.kind != "secret" and room.index not in self.revealed:
+            self.revealed.add(room.index)
+            self.emit({"e": "reveal", "room": room.index, "kind": room.kind})
+        cracks = []
+        if self.terrain is not None:
+            cracks = [
+                [round(prop.x, 1), round(prop.y, 1)]
+                for prop in self.terrain.props.values()
+                if prop.kind == "crack" and math.hypot(prop.x - x, prop.y - y) <= radius
+            ]
+        self.emit(
+            {
+                "e": "ping",
+                "id": player.id,
+                "x": round(x, 1),
+                "y": round(y, 1),
+                "radius": radius,
+                "count": count,
+                "cracks": cracks,
+            }
+        )
+        return count
+
+    def collect_garbage(self, player: Player, reach: float, clean: float) -> int:
+        count = 0
+        for pickup in self.pickups:
+            if math.hypot(pickup.x - player.x, pickup.y - player.y) <= reach:
+                pickup.x, pickup.y = player.x, player.y
+                count += 1
+        self.clouds = [
+            cloud
+            for cloud in self.clouds
+            if cloud.owner == player.id
+            or math.hypot(cloud.x - player.x, cloud.y - player.y) > clean
+        ]
+        self.emit({"e": "gc", "id": player.id, "x": round(player.x, 1), "y": round(player.y, 1), "count": count})
+        return count
+
+    def grep(self, player: Player, text: str, reach: float, damage: float) -> int:
+        hits = [
+            foe
+            for foe in self.foes_for(player.id)
+            if math.hypot(foe.x - player.x, foe.y - player.y) <= reach
+            and isinstance(foe, Monster)
+            and (text in foe.species.key.lower() or text in foe.species.title.lower())
+        ]
+        self.emit(
+            {
+                "e": "grep",
+                "id": player.id,
+                "hits": [[round(foe.x, 1), round(foe.y, 1)] for foe in hits],
+            }
+        )
+        for foe in hits:
+            self.damage(target=foe, amount=damage, source=player, kind="grep", hit_x=foe.x, hit_y=foe.y)
+        return len(hits)
+
+    def undo(self, player: Player) -> None:
+        states = self.history.get(player.id)
+        if not states:
+            return
+        x, y, hp, _mana = states[0]
+        from_x, from_y = player.x, player.y
+        if self._safe_to_return(player, x, y):
+            player.x, player.y = x, y
+        player.hp = max(player.hp, min(hp, player.max_hp))
+        self.emit(
+            {
+                "e": "rollback",
+                "id": player.id,
+                "from_x": round(from_x, 1),
+                "from_y": round(from_y, 1),
+                "x": round(player.x, 1),
+                "y": round(player.y, 1),
+            }
+        )
+
+    def make_clone(self, player: Player, seconds: float) -> None:
+        clone = self.spawn_monster("clone", player.x, player.y)
+        if clone is None:
+            return
+        clone.hacked_until = self.now + seconds
+        clone.hacked_by = player.id
+        clone.spawned_at = self.now
+        clone.next_attack = self.now + 0.3
+        clone.leaked = True
+        clone.text = player.name
+        self.emit({"e": "hijack", "id": clone.id, "x": round(clone.x, 1), "y": round(clone.y, 1)})
+
+    def _update_clones(self, now: float) -> None:
+        for monster in list(self.monsters.values()):
+            if monster.species.key == "clone" and monster.hacked_until <= now:
+                self.remove_monster(monster)
+
+    def scout(self) -> None:
+        """Somebody ran on ahead: one quiet side room is already loaded."""
+
+        rooms = [
+            room
+            for room in self.dungeon.sides
+            if room.kind != "secret" and room.index not in self.revealed
+        ]
+        if rooms:
+            room = self.rng.choice(rooms)
+            self.revealed.add(room.index)
+            self.emit({"e": "reveal", "room": room.index, "kind": room.kind})
+
+    def foes_for(self, owner_id: int) -> list[Player]:
+        return [t for t in self.targets_for(owner_id) if not isinstance(t, Prop)]
+
+    def interact(self, player_id: int) -> dict[str, Any]:
+        player = self.players.get(player_id)
+        if player is None or player.dead or player_id in self.linked or self.quest is None:
+            return {"ok": False, "error": "Сейчас нечего делать."}
+        return self.quest.interact(player)
+
+    def npc_reply(self, player_id: int, thing_id: int, key: str) -> dict[str, Any]:
+        if self.folk is None:
+            return {"ok": False, "error": "Здесь не с кем говорить."}
+        return self.folk.reply(player_id, thing_id, key)
+
+    def accept_pgt(self, player_id: int) -> dict[str, Any]:
+        """Let the assistant "fix" a quest console: done at once, with a bug for later."""
+
+        terminal = self.linked.get(player_id)
+        if terminal is None or terminal.solved or terminal.role != "quest":
+            return {"ok": False, "message": "PGT здесь не поможет."}
+        terminal.solved = True
+        self.stats.pgt += 1
+        self.unlink(player_id)
+        self.emit({"e": "fix_done", "id": player_id, "name": self.players[player_id].name, "role": "quest", "x": round(terminal.x, 1), "y": round(terminal.y, 1), "pgt": True})
+        if self.quest is not None:
+            self.quest.console_done(terminal, by_pgt=True)
+        return {"ok": True}
+
+    def walk_angle(self, body: Player, target: Player) -> float:
+        """Toward the nearest mage along the corridors, for whoever follows the party."""
+
+        straight = math.atan2(target.y - body.y, target.x - body.x)
+        if self.dungeon.path_clear(body.x, body.y, target.x, target.y, body.radius * 0.85):
+            return straight
+        return self._flow_angle(body, straight, away=False)
+
+    def escape_route(self, monster: Monster, target: Player) -> float:
+        """Away from the mages along the corridors: into dead ends, if it is unlucky."""
+
+        away = math.atan2(monster.y - target.y, monster.x - target.x)
+        return self._flow_angle(monster, away, away=True)
+
+    def _flow_angle(self, body: Player, fallback: float, *, away: bool) -> float:
+        x = int(body.x // TILE)
+        y = int(body.y // TILE)
+        here = self.flow.get((x, y))
+        if here is None:
+            return fallback
+        best: tuple[int, int] | None = None
+        for step_x in (-1, 0, 1):
+            for step_y in (-1, 0, 1):
+                tile = (x + step_x, y + step_y)
+                distance = self.flow.get(tile)
+                if distance is None or (distance <= here if away else distance >= here):
+                    continue
+                if step_x and step_y and (
+                    self.dungeon.solid(x + step_x, y) or self.dungeon.solid(x, y + step_y)
+                ):
+                    continue
+                here = distance
+                best = tile
+        if best is None:
+            return fallback
+        return math.atan2((best[1] + 0.5) * TILE - body.y, (best[0] + 0.5) * TILE - body.x)
 
     # ------------------------------------------------------------- engine hooks
     def targets_for(self, owner_id: int) -> list[Player]:
@@ -270,12 +608,14 @@ class StoryArena(Arena):
             if owner is not None and owner.hacked_until > now:
                 return [m for m in hostile if m.hacked_until <= now]
             mages: list[Player] = [p for p in self.players.values() if not p.dead]
-            return mages + [m for m in hostile if m.hacked_until > now]
+            units: list[Player] = list(self.quest.targets()) if self.quest is not None else []
+            return mages + units + [m for m in hostile if m.hacked_until > now]
+        props: list[Player] = list(self.terrain.props.values()) if self.terrain is not None else []
         return [
             monster
             for monster in self.monsters.values()
             if not monster.dead and monster.spawned_at <= now and monster.hacked_until <= now
-        ]
+        ] + props
 
     def describe_target(self, target: Player) -> tuple[str, bool]:
         return target.species.key, target.species.boss
@@ -289,14 +629,23 @@ class StoryArena(Arena):
         return self.cursed(player, "null")
 
     def rune_known(self, name: str, player: Player | None = None) -> bool:
+        if name in BOOK:
+            return self.trial_runes or (player is not None and name in player.book)
         skill = SKILLS.get(name)
         if skill is None:
+            if self.quest is not None and self.quest.sealed(name, player):
+                return False
             return name in self.known_runes
         return (
             player is not None
             and player.role == skill.role
             and self.stage.index >= skill.stage
         )
+
+    def sealed_message(self, name: str, player: Player | None = None) -> str:
+        if self.quest is not None and self.quest.sealed(name, player):
+            return f"Руна {name} отключена испытанием: здесь работает только {self.quest.trial['rune']}."
+        return super().sealed_message(name, player)
 
     def rune_costs(self) -> dict[str, int]:
         return ALL_COSTS
@@ -305,7 +654,11 @@ class StoryArena(Arena):
         return player.skill_ready.get(name, 0.0) - self.now
 
     def extra_runes(self, session: SpellSession) -> dict[str, Any]:
-        return SkillBook(self, session).api()
+        runes = SkillBook(self, session).api()
+        runes.update(RuneShelf(self, session).api())
+        if self.workshop is not None:
+            runes.update(self.workshop.runes(session))
+        return runes
 
     def shot_held(self, projectile: Projectile) -> bool:
         if not self.breakpoints or not self._hostile_shot(projectile):
@@ -363,7 +716,7 @@ class StoryArena(Arena):
         return not self.dungeon.blocked(x, y, radius)
 
     def can_blink(self, player: Player, x: float, y: float) -> bool:
-        return self.can_stand(x, y) and self.dungeon.path_clear(player.x, player.y, x, y)
+        return self.can_stand(x, y) and self.dungeon.path_clear(player.x, player.y, x, y, shot=True)
 
     def ray_end(
         self, x: float, y: float, dx: float, dy: float, length: float
@@ -373,7 +726,7 @@ class StoryArena(Arena):
     def shot_blocked(
         self, old_x: float, old_y: float, new_x: float, new_y: float, radius: float
     ) -> bool:
-        return not self.dungeon.path_clear(old_x, old_y, new_x, new_y, min(radius, SHOT_WIDTH))
+        return not self.dungeon.path_clear(old_x, old_y, new_x, new_y, min(radius, SHOT_WIDTH), shot=True)
 
     def try_move(self, player: Player, dx: float, dy: float) -> None:
         start_x, start_y = player.x, player.y
@@ -450,6 +803,7 @@ class StoryArena(Arena):
                 ):
                     player.x, player.y = x, y
                     return
+        player.x, player.y = self.dungeon.open_near(player.x, player.y, player.radius)
 
     # ------------------------------------------------------------------ damage
     def damage(
@@ -462,19 +816,57 @@ class StoryArena(Arena):
         hit_x: float,
         hit_y: float,
     ) -> float:
-        if isinstance(target, Monster):
+        if isinstance(target, Prop):
+            if self.terrain is not None:
+                self.terrain.prop_hit(target, source, kind)
+            return 0.0
+        if isinstance(target, Monster) and source is not None and self._mini_refuses(target, kind, hit_x, hit_y):
+            return 0.0
+        if isinstance(target, Monster) and target.returning_until > self.now and source is not None:
+            for move in self.boss_moves:
+                if isinstance(move, ReturnNone) and move.monster is target:
+                    move.refuses(source)
+            return 0.0
+        if self.terrain is not None and source is not None and source.id < MONSTER_ID_BASE:
+            self.terrain.on_damage(kind, hit_x, hit_y, source)
+        if (
+            isinstance(target, Monster)
+            and target.quest
+            and self.quest is not None
+            and self.quest.spell_hit(target, source, kind)
+        ):
+            return 0.0
+        if isinstance(target, QuestUnit):
+            amount *= self.difficulty.damage
+        elif isinstance(target, Monster):
             if target.invuln_until <= self.now:
                 amount = self._boosted_damage(target, amount, source, hit_x, hit_y)
                 amount = self._shaped_damage(target, amount, source, kind, hit_x, hit_y)
                 if amount <= 0:
                     return 0.0
         else:
-            amount *= (1 - target.perks.armor) * self.difficulty.damage
+            amount *= (1 - target.perks.armor) * self.difficulty.damage * self.monster_bite
             if self._covered_by_sudo(target):
                 amount *= SUDO_SHARE
         return super().damage(
             target=target, amount=amount, source=source, kind=kind, hit_x=hit_x, hit_y=hit_y
         )
+
+    def _mini_refuses(self, monster: Monster, kind: str, hit_x: float, hit_y: float) -> bool:
+        """The house rules of mini-bosses. True if the hit does nothing at all."""
+
+        key = monster.species.key
+        if key == "influencer" and monster.invuln_until > self.now:
+            self.emit({"e": "resist", "id": monster.id, "x": hit_x, "y": hit_y, "text": "подписчики"})
+            return True
+        if key == "reviewer":
+            if kind == monster.text:
+                self.emit({"e": "resist", "id": monster.id, "x": hit_x, "y": hit_y, "text": "дублирование"})
+                return True
+            monster.text = kind
+        elif key == "hotserver" and kind == "frost":
+            cool_down(self, monster)
+        return False
 
     def _boosted_damage(
         self, monster: Monster, amount: float, source: Player | None, hit_x: float, hit_y: float
@@ -483,6 +875,8 @@ class StoryArena(Arena):
         if perks is None:
             return amount
         amount *= perks.power
+        if self.quest is not None:
+            amount *= self.quest.power
         if perks.crit and self.rng.random() < perks.crit:
             amount *= CRIT_MULTIPLIER
             self.emit({"e": "crit", "id": monster.id, "x": round(hit_x, 1), "y": round(hit_y, 1)})
@@ -519,7 +913,18 @@ class StoryArena(Arena):
         return amount
 
     def _kill(self, target: Player, killer: Player | None, kind: str = "") -> None:
+        if isinstance(target, QuestUnit):
+            if self.quest is not None:
+                self.quest.unit_down(target)
+            return
         if not isinstance(target, Monster):
+            if getattr(target.perks, "catch", False) and target.id not in self.caught:
+                self.caught.add(target.id)
+                target.hp = target.max_hp * CATCH_SHARE
+                target.invuln_until = self.now + CATCH_GRACE
+                self.emit({"e": "caught", "id": target.id, "x": round(target.x, 1), "y": round(target.y, 1)})
+                return
+            self.stats.deaths += 1
             super()._kill(target, killer, kind)
             target.revive = 0.0
             target.curses.clear()
@@ -533,7 +938,8 @@ class StoryArena(Arena):
         species = target.species
         # A leak pays nothing, or an unpatched terminal would be a farm.
         if not target.leaked:
-            self.essence += max(1, round(species.cost))
+            pay = ELITES[target.elite].pay if target.elite else 1
+            self.essence += max(1, round(species.cost)) * pay
         if killer is not None:
             killer.score += 1
             perks = killer.perks
@@ -550,6 +956,8 @@ class StoryArena(Arena):
             }
         )
         self._drop_pickup(target)
+        if target.elite:
+            elite_died(self, target)
         if target.marked_until > self.now:
             self._segfault(target)
         if species.on_death == "cloud":
@@ -566,6 +974,10 @@ class StoryArena(Arena):
                     generation=target.generation + 1,
                     scale=RECURSION_SCALE[target.generation + 1],
                 )
+        if self.quest is not None:
+            self.quest.monster_died(target)
+        if self.folk is not None:
+            self.folk.monster_died(target, killer, kind)
 
     def _drop_pickup(self, monster: Monster) -> None:
         roll = self.rng.random()
@@ -594,6 +1006,9 @@ class StoryArena(Arena):
         species = SPECIES[key]
         per_mage = BOSS_HP_PER_EXTRA_MAGE if species.boss else HP_PER_EXTRA_MAGE
         hp = species.hp * scale * (1 + per_mage * (self.party_size - 1)) * self.difficulty.toughness
+        hp *= 1 + DUTY_TOUGHNESS * self.duty
+        if species.on_death == "recurse":
+            hp *= self.pgt_boost
         monster = Monster(
             id=self._next_monster_id,
             name=species.title,
@@ -629,6 +1044,8 @@ class StoryArena(Arena):
         if key not in self.seen_species:
             self.seen_species.add(key)
             self.emit({"e": "intro", "kind": key})
+        if self.quest is not None:
+            self.quest.adopt(monster)
         return monster
 
     @staticmethod
@@ -660,6 +1077,8 @@ class StoryArena(Arena):
                     # A hacked process forks hacked children.
                     child.hacked_until = monster.hacked_until
                     child.hacked_by = monster.hacked_by
+                    if monster.species.key == key:
+                        child.quest = monster.quest
                 return child
         return None
 
@@ -769,7 +1188,7 @@ class StoryArena(Arena):
     def room_box(self) -> tuple[float, float, float, float]:
         """The walkable floor of the fight: left, top, right, bottom."""
 
-        room = self.active_room or self.dungeon.rooms[-1]
+        room = self.active_room or self.exit_room
         return (
             (room.x + 1) * TILE,
             (room.y + 1) * TILE,
@@ -785,6 +1204,53 @@ class StoryArena(Arena):
         self.timers = [(at, action) for at, action in self.timers if at > now]
         for action in due:
             action()
+
+    def start_boss_move(self, monster: Monster, key: str) -> None:
+        self.announce(monster, key)
+        self.boss_moves.append(MOVES[key](self, monster))
+
+    def next_boss_move(self, monster: Monster) -> bool:
+        """Its next trick in turn, if nothing it started is still going on."""
+
+        if self.boss_moves:
+            return False
+        rotation = ROTATION[monster.species.key]
+        self.start_boss_move(monster, rotation[monster.tricks % len(rotation)])
+        monster.tricks += 1
+        return True
+
+    def _update_boss_moves(self, now: float, dt: float) -> None:
+        """A boss's trick outlives neither the boss nor its own end."""
+
+        kept: list[BossMove] = []
+        for move in self.boss_moves:
+            if move.monster.id not in self.monsters:
+                continue
+            try:
+                if move.update(now, dt):
+                    kept.append(move)
+            except Exception:
+                # A trick that breaks ends there: the fight, and the server, go on.
+                traceback.print_exc()
+        self.boss_moves = kept
+
+    def announce_error(self, monster: Monster, error: str) -> None:
+        """A shout that is not one of the fixed attacks: it depends on what just happened."""
+
+        self.emit(
+            {
+                "e": "boss_cast",
+                "id": monster.id,
+                "x": round(monster.x, 1),
+                "y": round(monster.y, 1),
+                "color": monster.color,
+                "error": error,
+                "tip": "",
+            }
+        )
+
+    def quest_say(self, speaker: str, text: str) -> None:
+        self.emit({"e": "radio", "lines": [[speaker, text]], "urgent": True})
 
     def announce(self, monster: Monster, key: str) -> None:
         """Name the attack out loud: the banner shows the real Python error behind it.
@@ -1001,14 +1467,16 @@ class StoryArena(Arena):
     def _place_stage_terminal(self) -> None:
         """Every stage holds its lesson's repair where the party has to pass."""
 
-        task = LESSONS[self.stage.index].task
+        # On shift the broken code can be any of what has been taught so far.
+        index = self.rng.randrange(self.known_upto + 1) if self.duty else self.stage.index
+        task = LESSONS[index].task
         if self.stage.is_boss:
             room = self.dungeon.rooms[0]
-            self.dungeon.set_closed(room.doors)
+            self.lock("door", room.doors)
             x, y = room.center
             self._add_terminal(x, y - 60, task, "door")
         else:
-            x, y = self.dungeon.rooms[-1].center
+            x, y = self.exit_room.center
             self._add_terminal(x, y - 110, task, "portal")
 
     def _add_terminal(self, x: float, y: float, task: Task, role: str) -> Terminal:
@@ -1088,6 +1556,8 @@ class StoryArena(Arena):
     def roll(self, player_id: int, aim: float | None = None) -> dict[str, Any]:
         if player_id in self.linked:
             return {"ok": False, "error": "Вы подключены к терминалу."}
+        if self.quest is not None and self.quest.carrier() == player_id:
+            return {"ok": False, "error": "С пакетом в руках не перекатишься."}
         return super().roll(player_id, aim)
 
     def cast(
@@ -1111,7 +1581,15 @@ class StoryArena(Arena):
                 if target_x is not None and target_y is not None:
                     target_x = 2 * player.x - target_x
                     target_y = 2 * player.y - target_y
-        return super().cast(player_id, code, slot, aim, target_x, target_y)
+        result = super().cast(player_id, code, slot, aim, target_x, target_y)
+        # "runes" is there only if the code really ran, so a cooldown is not a bug.
+        if "runes" in result:
+            self.stats.runes.update(result["runes"])
+            if not result["ok"]:
+                self.stats.errors += 1
+            if self.folk is not None and player is not None:
+                self.folk.spell_cast(player, result["runes"], list(result.get("log") or []), result["ok"])
+        return result
 
     def help_plan(self) -> dict[str, Any]:
         """What the terminal's help panel should offer on this difficulty."""
@@ -1130,6 +1608,7 @@ class StoryArena(Arena):
         if not 0 <= index < len(steps):
             return {"kind": "", "text": ""}
         kind, text = steps[index]
+        self.stats.hints += 1
         return {"kind": kind, "text": text}
 
     def submit_fix(self, player_id: int, code: str) -> dict[str, Any]:
@@ -1159,10 +1638,13 @@ class StoryArena(Arena):
         )
         self.unlink(player.id)
         if terminal.role == "door":
-            self.dungeon.set_closed(())
+            self.unlock("door")
         elif terminal.role == "portal":
             self._purge_bugs()
             self.portal_ready = True
+        elif terminal.role == "quest":
+            if self.quest is not None:
+                self.quest.console_done(terminal)
         else:
             self._lift_gate()
 
@@ -1180,7 +1662,7 @@ class StoryArena(Arena):
         if boss.state == "deploy":
             boss.state = "idle"
         task = self.gates_left.pop(0)
-        room = self.active_room or self.dungeon.rooms[-1]
+        room = self.active_room or self.exit_room
         x, y = self._gate_spot(room, boss)
         self._add_terminal(x, y, task, "gate")
         self.emit({"e": "gate_open", "id": boss.id, "x": round(x, 1), "y": round(y, 1)})
@@ -1222,9 +1704,9 @@ class StoryArena(Arena):
         """A broken node keeps leaking bugs until somebody patches it."""
 
         terminal = next((t for t in self.terminals if t.role == "portal"), None)
-        if terminal is None or terminal.solved or now < self.trickle_at or self.monsters:
+        if terminal is None or terminal.solved or now < self.trickle_at or self._fighters():
             return
-        room = self.dungeon.rooms[-1]
+        room = self.exit_room
         if not any(
             not player.dead and room.holds(player.x, player.y, 0.0)
             for player in self.players.values()
@@ -1453,7 +1935,21 @@ class StoryArena(Arena):
         self._update_curses(now)
         self._update_role_effects(now, dt)
         self._update_timers(now)
+        run_deferred(self, now)
+        self._update_clones(now)
+        self._update_reveal(now)
         self._update_rooms(now)
+        if self.quest is not None:
+            self.quest.update(now, dt)
+        if self.terrain is not None:
+            self.terrain.update(now, dt)
+        if self.workshop is not None:
+            self.workshop.update(now)
+        if self.life is not None:
+            self.life.update(now)
+        if self.folk is not None:
+            self.folk.update(now, dt)
+        self._update_boss_moves(now, dt)
         self._update_trickle(now)
         self._watch_gates()
         self._update_monsters(now, dt)
@@ -1463,10 +1959,26 @@ class StoryArena(Arena):
         self._update_portal(dt)
         self._update_wipe(now)
 
+    def _update_reveal(self, now: float) -> None:
+        """A room loads when a mage steps into its doorway, and stays loaded."""
+
+        if now < self.reveal_at:
+            return
+        self.reveal_at = now + REVEAL_EVERY
+        for room in self.dungeon.rooms:
+            if room.index in self.revealed:
+                continue
+            if any(
+                not player.dead and room.holds(player.x, player.y, -REVEAL_REACH)
+                for player in self.players.values()
+            ):
+                self.revealed.add(room.index)
+                self.emit({"e": "reveal", "room": room.index, "kind": room.kind})
+
     def _refresh_flow(self, now: float) -> None:
         """Distance in tiles from every open floor tile to the nearest mage."""
 
-        if now < self.flow_at or not self.monsters:
+        if now < self.flow_at or not (self.monsters or (self.quest and self.quest.needs_flow())):
             return
         self.flow_at = now + FLOW_REFRESH
         dungeon = self.dungeon
@@ -1490,7 +2002,7 @@ class StoryArena(Arena):
     def sees(self, monster: Monster, target: Player) -> bool:
         """Line of fire, as wide as a shot: a bolt that clips a pillar is a wasted bolt."""
 
-        return self.dungeon.path_clear(monster.x, monster.y, target.x, target.y, SHOT_WIDTH)
+        return self.dungeon.path_clear(monster.x, monster.y, target.x, target.y, SHOT_WIDTH, shot=True)
 
     def route(self, monster: Monster, target: Player) -> float:
         """Which way to walk: straight at the target if open, else along the flow."""
@@ -1529,13 +2041,27 @@ class StoryArena(Arena):
             )
         return monster.route_angle
 
+    def _fighters(self, room: Room | None = None) -> bool:
+        """Whether a monster that belongs to the fight is still up: quest ones do not.
+
+        With a room, only those behind its doors count: a bug left outside when they
+        shut can never get in, and must not keep them shut for good.
+        """
+
+        return any(
+            not monster.quest
+            and monster.species.key != "clone"
+            and (room is None or room.holds(monster.x, monster.y))
+            for monster in self.monsters.values()
+        )
+
     def _update_rooms(self, now: float) -> None:
         if self.active_room is None:
             self._maybe_enter_room()
             return
-        if self.monsters:
-            return
         room = self.active_room
+        if self._fighters(room):
+            return
         if self.wave < self._waves_in(room):
             if now >= self.next_wave_at:
                 self._spawn_wave(room)
@@ -1544,7 +2070,8 @@ class StoryArena(Arena):
 
     def _maybe_enter_room(self) -> None:
         for room in self.dungeon.rooms:
-            if room.kind not in ("combat", "boss") or room.index in self.cleared_rooms:
+            fights = room.kind in ("combat", "boss") or room.guarded
+            if not fights or room.index in self.cleared_rooms:
                 continue
             walkers = [
                 player
@@ -1559,9 +2086,11 @@ class StoryArena(Arena):
         self.active_room = room
         self.wave = 0
         self.next_wave_at = self.now + 0.9
-        self.dungeon.set_closed(room.doors)
+        self.lock("fight", room.doors)
         # The party stays one party: whoever lagged behind joins the fight.
         for player in self.players.values():
+            if player.id in self.linked:
+                continue
             if not room.holds(player.x, player.y, 0.5):
                 player.x, player.y = leader.x, leader.y
                 self._settle(player)
@@ -1575,7 +2104,7 @@ class StoryArena(Arena):
         self.emit({"e": "room_lock", "room": room.index, "boss": room.kind == "boss"})
 
     def _waves_in(self, room: Room) -> int:
-        if room.kind == "boss":
+        if room.kind == "boss" or room.side:
             return 1
         return WAVES_PER_ROOM + (1 if room.index == len(self.dungeon.rooms) - 2 else 0)
 
@@ -1583,7 +2112,7 @@ class StoryArena(Arena):
         chapter = self.stage.chapter
         growth = 1 + (self.stage.number - 1) * 0.18
         party = 1 + BUDGET_PER_EXTRA_MAGE * (self.party_size - 1)
-        return chapter.budget * growth * party * self.difficulty.crowd
+        return chapter.budget * growth * party * self.difficulty.crowd * self.wave_extra
 
     def _spawn_wave(self, room: Room) -> None:
         self.wave += 1
@@ -1593,14 +2122,22 @@ class StoryArena(Arena):
             x, y = room.center
             self.spawn_monster(self.stage.chapter.boss, x, y - 100)
             return
+        if room is self.mini_room and self.wave >= self._waves_in(room):
+            x, y = self.dungeon.open_near(*room.center, SPECIES[self.stage.mini].radius)
+            self.spawn_monster(self.stage.mini, x, y)
+            return
         budget = self._wave_budget()
+        wave: list[Monster] = []
         roster = [SPECIES[key] for key in self.stage.roster]
         cheapest = min(species.cost for species in roster)
         while budget >= cheapest:
             species = self.rng.choice([s for s in roster if s.cost <= budget])
             budget -= species.cost
             for _ in range(species.pack):
-                self._spawn_in_room(room, species)
+                monster = self._spawn_in_room(room, species)
+                if monster is not None:
+                    wave.append(monster)
+        maybe_crown(self, wave)
 
     def _spawn_in_room(self, room: Room, species: Species) -> Monster | None:
         living = [player for player in self.players.values() if not player.dead]
@@ -1613,8 +2150,8 @@ class StoryArena(Arena):
     def _clear_room(self, room: Room) -> None:
         self.cleared_rooms.add(room.index)
         self.active_room = None
-        self.dungeon.set_closed(())
-        x, y = room.center
+        self.unlock("fight")
+        x, y = self.dungeon.open_near(*room.center, 20.0)
         for _ in range(max(1, self.party_size)):
             self._add_pickup("hp", x + self.rng.uniform(-60, 60), y + self.rng.uniform(-60, 60))
             self._add_pickup("mana", x + self.rng.uniform(-60, 60), y + self.rng.uniform(-60, 60))
@@ -1626,6 +2163,8 @@ class StoryArena(Arena):
             self.portal_ready = True
             self.portal = room.center
         self.emit({"e": "room_clear", "room": room.index, "portal": self.portal_ready})
+        if self.life is not None:
+            self.life.room_cleared(room)
 
     def _update_monsters(self, now: float, dt: float) -> None:
         # Whoever is at a terminal is not on the field: monsters hunt the rest.
@@ -1639,6 +2178,8 @@ class StoryArena(Arena):
             monster.last_x, monster.last_y = monster.x, monster.y
             if monster.stun_until > now or self._frozen(monster):
                 continue
+            if monster.elite and elite_tick(self, monster):
+                continue
             target = self._target_of(monster, living)
             if target is not None:
                 think(self, monster, target, dt)
@@ -1647,6 +2188,18 @@ class StoryArena(Arena):
         """Who this monster goes for: the nearest enemy, unless sudo says otherwise."""
 
         now = self.now
+        if monster.focus and self.quest is not None and monster.hacked_until <= now:
+            unit = self.quest.unit(monster.focus)
+            if unit is None:
+                monster.focus = 0
+            else:
+                mage = min(
+                    living,
+                    key=lambda p: (p.x - monster.x) ** 2 + (p.y - monster.y) ** 2,
+                    default=None,
+                )
+                if mage is None or math.hypot(mage.x - monster.x, mage.y - monster.y) > FOCUS_BREAK:
+                    return unit
         if monster.hacked_until > now:
             prey: list[Player] = [
                 other
@@ -1837,13 +2390,33 @@ class StoryArena(Arena):
                 "map_id": self.seed,
                 "theme": self.stage.chapter.theme,
                 "tile": TILE,
-                "tiles": self.dungeon.rows(),
+                "tiles": self.dungeon.rows(self.life.secret_hidden if self.life is not None else ()),
                 "rooms": [
-                    {"x": room.x, "y": room.y, "w": room.w, "h": room.h, "kind": room.kind}
+                    {
+                        "x": room.x,
+                        "y": room.y,
+                        "w": room.w,
+                        "h": room.h,
+                        "kind": room.kind,
+                        "dark": room.dark,
+                        "side": room.side,
+                    }
                     for room in self.dungeon.rooms
                 ],
+                "corridors": [
+                    [hall.x, hall.y, hall.w, hall.h, hall.a, hall.b] for hall in self.dungeon.corridors
+                ],
+                "quest": self.quest.describe() if self.quest is not None else None,
+                "signs": [
+                    *(self.quest.signs() if self.quest is not None else []),
+                    *([self.workshop.sign()] if self.workshop is not None else []),
+                ],
+                "terrain": self.terrain.describe() if self.terrain is not None else None,
                 "torches": self.dungeon.torches(),
-                "runes": sorted(self.known_runes),
+                "runes": sorted(
+                    self.known_runes
+                    | set(self.workshop.rune_names() if self.workshop is not None else ())
+                ),
                 "difficulty": self.difficulty.level,
                 "spell_costs": ALL_COSTS,
                 "skills": {
@@ -1855,12 +2428,50 @@ class StoryArena(Arena):
                     for name, skill in SKILLS.items()
                 },
                 "bestiary": {
-                    key: {"title": species.title, "hint": species.hint, "color": species.color}
-                    for key, species in SPECIES.items()
+                    **{
+                        key: {"title": species.title, "hint": species.hint, "color": species.color}
+                        for key, species in SPECIES.items()
+                    },
+                    **{
+                        f"elite_{key}": {"title": elite.title, "hint": elite.hint, "color": elite.color}
+                        for key, elite in ELITES.items()
+                    },
                 },
             }
         )
         return config
+
+    def _monster_entry(self, monster: Monster) -> dict[str, Any]:
+        """Flags that are off stay home: a full room is forty of these, thirty times a second."""
+
+        entry: dict[str, Any] = {
+            "id": monster.id,
+            "kind": monster.species.key,
+            "x": round(monster.x, 1),
+            "y": round(monster.y, 1),
+            "hp": round(monster.hp, 1),
+            "max_hp": round(monster.max_hp, 1),
+            "aim": round(monster.heading, 2),
+            "state": self._monster_state(monster),
+            "r": round(monster.radius, 1),
+        }
+        now = self.now
+        flags = {
+            "gen": monster.generation,
+            "arriving": monster.spawned_at > now,
+            "shielded": monster is self.gate_boss
+            or (monster.species.key == "influencer" and monster.invuln_until > now),
+            "elite": monster.elite,
+            "marked": monster.marked_until > now,
+            "hacked": monster.hacked_until > now,
+            "exposed": monster.exposed_until > now,
+            "frozen": self._frozen(monster),
+            "slow": monster.slow_until > now,
+            "stun": monster.stun_until > now,
+            "text": monster.text,
+        }
+        entry.update({key: value for key, value in flags.items() if value})
+        return entry
 
     def _monster_state(self, monster: Monster) -> str:
         if monster.dizzy_until > self.now:
@@ -1887,29 +2498,7 @@ class StoryArena(Arena):
                 for skill in (ROLES[player.role].skills if player.role else ())
                 if self.stage.index >= skill.stage
             }
-        state["monsters"] = [
-            {
-                "id": monster.id,
-                "kind": monster.species.key,
-                "x": round(monster.x, 1),
-                "y": round(monster.y, 1),
-                "hp": round(monster.hp, 1),
-                "max_hp": round(monster.max_hp, 1),
-                "aim": round(monster.heading, 2),
-                "state": self._monster_state(monster),
-                "r": round(monster.radius, 1),
-                "gen": monster.generation,
-                "arriving": monster.spawned_at > self.now,
-                "shielded": monster is self.gate_boss,
-                "marked": monster.marked_until > self.now,
-                "hacked": monster.hacked_until > self.now,
-                "exposed": monster.exposed_until > self.now,
-                "frozen": self._frozen(monster),
-                "slow": monster.slow_until > self.now,
-                "stun": monster.stun_until > self.now,
-            }
-            for monster in self.monsters.values()
-        ]
+        state["monsters"] = [self._monster_entry(monster) for monster in self.monsters.values()]
         state["hazards"] = [
             {
                 "id": hazard.id,
@@ -1964,8 +2553,25 @@ class StoryArena(Arena):
             }
             for terminal in self.terminals
         ]
+        state["quest"] = self.quest.snapshot() if self.quest is not None else None
+        if self.terrain is not None:
+            state["terrain"] = self.terrain.snapshot()
+        if self.workshop is not None:
+            state["workshop"] = self.workshop.snapshot()
+        if self.life is not None:
+            state["life"] = self.life.snapshot()
+            state["quest"]["marks"] += self.life.marks()
+        if self.boss_moves:
+            state["boss_moves"] = [move.view() for move in self.boss_moves]
+        if self.folk is not None:
+            state["folk"] = self.folk.snapshot()
+            state["quest"]["marks"] += self.folk.marks()
         state["story"] = {
-            "doors": [list(tile) for tile in sorted(self.dungeon.closed)],
+            "seen": sorted(self.revealed),
+            "doors": [
+                list(tile)
+                for tile in sorted(self.dungeon.closed - self._secret_tiles())
+            ],
             "portal": [round(self.portal[0], 1), round(self.portal[1], 1)],
             "portal_ready": self.portal_ready,
             "portal_hold": round(self.portal_held / PORTAL_HOLD, 2),

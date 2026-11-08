@@ -171,6 +171,7 @@ class Player:
     roll_cooldown: float = ROLL_COOLDOWN
     perks: Any = None
     role: str = ""
+    book: frozenset[str] = frozenset()
     shield_power: float = SHIELD_POWER
     skill_ready: dict[str, float] = field(default_factory=dict)
     curses: dict[str, float] = field(default_factory=dict)
@@ -359,6 +360,12 @@ if ready("shield") and me().mana >= 30:
 }
 
 
+_PER_CAST_COUNTERS = (
+    "says", "dashes", "blinks", "novas", "wards_placed", "beams", "volleys",
+    "emps_placed", "chains", "strikes", "meteors", "siphons", "clouds",
+)
+
+
 class SpellSession:
     """The complete API exposed to one casting of player code."""
 
@@ -392,6 +399,17 @@ class SpellSession:
         self.siphons = 0
         self.clouds = 0
         self.spent: list[str] = []
+        self.interpreter: Any = None
+
+    def rewind(self, now: float) -> None:
+        """Start over for a function the spell left behind: a new moment, new limits."""
+
+        self.now = now
+        self.actions = 0
+        self.logs = []
+        self.spent = []
+        for counter in _PER_CAST_COUNTERS:
+            setattr(self, counter, 0)
 
     # -------------------------------------------------------------- read side
     def me(self) -> OwnView:
@@ -435,7 +453,7 @@ class SpellSession:
         if self._jammed():
             return None
         views = []
-        for other in self.arena.targets_for(self.player.id):
+        for other in self.arena.foes_for(self.player.id):
             kind, boss = self.arena.describe_target(other)
             views.append(self._view(other, kind, boss))
         return views
@@ -463,6 +481,7 @@ class SpellSession:
             dist=round(math.hypot(other.x - player.x, other.y - player.y), 2),
             boss=boss,
             dead=other.dead,
+            text=getattr(other, "text", ""),
         )
 
     def ready(self, name: Any) -> bool:
@@ -832,7 +851,7 @@ class SpellSession:
         start_y = player.y + dy * (PLAYER_RADIUS + 6)
         first: Player | None = None
         best_projection = float("inf")
-        for other in self.arena.targets_for(player.id):
+        for other in self.arena.foes_for(player.id):
             offset_x = other.x - player.x
             offset_y = other.y - player.y
             distance = math.hypot(offset_x, offset_y)
@@ -857,7 +876,7 @@ class SpellSession:
             previous = selected[-1]
             next_target: Player | None = None
             nearest = float("inf")
-            for other in self.arena.targets_for(player.id):
+            for other in self.arena.foes_for(player.id):
                 if other in selected:
                     continue
                 distance = math.hypot(other.x - previous.x, other.y - previous.y)
@@ -898,7 +917,7 @@ class SpellSession:
         dy = math.sin(angle)
         target_player: Player | None = None
         best_projection = float("inf")
-        for other in self.arena.targets_for(player.id):
+        for other in self.arena.foes_for(player.id):
             offset_x = other.x - player.x
             offset_y = other.y - player.y
             distance = math.hypot(offset_x, offset_y)
@@ -1055,8 +1074,10 @@ class SpellSession:
         self.logs.append(line)
 
     def _sealed(self, name: str) -> Any:
+        message = self.arena.sealed_message(name, self.player)
+
         def rune(*_args: Any, **_kwargs: Any) -> None:
-            raise SpellRuntimeError(f"Руна {name} ещё не изучена.")
+            raise SpellRuntimeError(message)
 
         return rune
 
@@ -1169,6 +1190,14 @@ class Arena:
 
     def rune_known(self, name: str, player: Player | None = None) -> bool:
         return True
+
+    def sealed_message(self, name: str, player: Player | None = None) -> str:
+        return f"Руна {name} ещё не изучена."
+
+    def foes_for(self, owner_id: int) -> list[Player]:
+        """Who a spell can aim at: what it can merely hit may be a wider list."""
+
+        return self.targets_for(owner_id)
 
     def rune_costs(self) -> dict[str, int]:
         return SPELL_COSTS
@@ -1478,7 +1507,7 @@ class Arena:
         globals_ = session.globals()
         error: str | None = None
         try:
-            execute_spell(code, globals_)
+            execute_spell(code, globals_, session)
         except SpellError as exc:
             error = str(exc)
         except Exception:
@@ -1626,18 +1655,15 @@ class Arena:
         """
 
         spread = radius * 0.22
-        low_x = BORDER + 8
-        high_x = ARENA_W - BORDER - 8
-        low_y = BORDER + 8
-        high_y = ARENA_H - BORDER - 8
         rocks = (
             (-spread, spread * 0.55, 1),
             (spread * 0.9, -spread * 0.5, 2),
             (0.0, 0.0, 0),
         )
         for offset_x, offset_y, variant in rocks:
-            rock_x = max(low_x, min(high_x, x + offset_x))
-            rock_y = max(low_y, min(high_y, y + offset_y))
+            # Whatever this world's edges are: a dungeon is far bigger than the arena.
+            rock_x = self._clamp_x(x + offset_x, 8)
+            rock_y = self._clamp_y(y + offset_y, 8)
             self.place_meteor(
                 owner,
                 rock_x,

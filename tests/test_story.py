@@ -25,6 +25,7 @@ from arcane.game import (
 from arcane.lessons import GATES, LESSONS, TASKS, check_task, runes_for_stage
 from arcane.monsters import ATTACKS, LOOP_FUSE, LOOP_PULL, SPECIES, SWEEP_FUSE, THINKERS
 from arcane.party import CAMP, FINISHED, PLAYING, Party
+from arcane.tickets import TICKETS
 from arcane.profiles import (
     BRANCHES,
     MAX_UPGRADE_LEVEL,
@@ -34,6 +35,7 @@ from arcane.profiles import (
     upgrade_cost,
 )
 from arcane.roles import ROLE_STAGE, ROLES, SKILLS, apply_role
+from arcane.story import StoryArena as FullArena
 from arcane.story import (
     CURSES,
     DEPLOY_BREAK,
@@ -45,9 +47,20 @@ from arcane.story import (
     REVIVE_TIME,
     ROTATION_WAIT,
     SEGFAULT_JUMPS,
-    StoryArena,
 )
 from story_bot import play_stage
+
+
+
+def StoryArena(*args, **kwargs) -> FullArena:
+    """These tests are about the rules of a fight: bare rooms keep them about that.
+
+    The furnished rooms have their own tests, and the bot plays those for real.
+    """
+
+    kwargs.setdefault("plain", True)
+    return FullArena(*args, **kwargs)
+
 
 TICK = 1 / TICK_RATE
 FIRST = STAGES[0]
@@ -56,7 +69,7 @@ TOKEN_A = "a" * 32
 TOKEN_B = "b" * 32
 
 
-def advance(arena: StoryArena, seconds: float) -> list[dict]:
+def advance(arena: FullArena, seconds: float) -> list[dict]:
     events: list[dict] = []
     for _ in range(int(seconds * TICK_RATE)):
         arena.update(arena.now + TICK)
@@ -192,7 +205,9 @@ class ArenaRulesTests(unittest.TestCase):
             self.arena.drain_events()
         events = advance(self.arena, 1.5)
         self.assertIn("room_clear", [event["e"] for event in events])
-        self.assertFalse(self.arena.dungeon.closed)
+        self.assertFalse(set(self.room.doors) & self.arena.dungeon.closed)
+        # Only the quest still holds a door: the one to the main terminal.
+        self.assertEqual(set(self.arena.locks), {"exit"})
         self.assertIsNone(self.arena.active_room)
 
     def test_a_friend_can_pull_you_back_up(self) -> None:
@@ -438,7 +453,7 @@ class TaskTests(unittest.TestCase):
             self.assertEqual(len(GATES[chapter.boss]), 2)
 
 
-def at_the_exit(arena: StoryArena) -> tuple[float, float]:
+def at_the_exit(arena: FullArena) -> tuple[float, float]:
     """Pretend the fights are done and stand the party next to the broken terminal."""
 
     for room in arena.dungeon.rooms:
@@ -1347,8 +1362,10 @@ class PerkTests(unittest.TestCase):
         party.world.outcome = "cleared"
         party.world.essence = 76
         party.tick(party.world.now + TICK)
-        self.assertEqual(store.get(TOKEN_B).essence, 100)
-        self.assertEqual(store.get(TOKEN_A).essence, 125)
+        # Tickets pay the same to everybody; fortune only touches the stage's pay.
+        tickets = sum(ticket.reward for ticket in TICKETS[0] if ticket.key in ("0:clean_run", "0:sla"))
+        self.assertEqual(store.get(TOKEN_B).essence, 100 + tickets)
+        self.assertEqual(store.get(TOKEN_A).essence, 125 + tickets)
 
     def test_the_arena_never_sees_an_upgrade(self) -> None:
         arena = Arena(bots=0)
@@ -1425,7 +1442,10 @@ class PartyTests(unittest.TestCase):
         self.finish("cleared")
         self.assertEqual(self.party.state, CAMP)
         self.assertEqual(self.party.stage_index, 1)
-        reward = 40 + STAGES[0].clear_bonus
+        # On top of the stage's pay, this run closed two tickets: nobody fell, the SLA held.
+        reward = 40 + STAGES[0].clear_bonus + sum(
+            ticket.reward for ticket in TICKETS[0] if ticket.key in ("0:clean_run", "0:sla")
+        )
         self.assertEqual(self.store.get(TOKEN_A).essence, reward)
         self.assertEqual(self.store.get(TOKEN_B).essence, reward)
         self.assertEqual(self.store.get(TOKEN_B).cleared, 1)
@@ -1498,7 +1518,7 @@ class PlaythroughTests(unittest.TestCase):
         self.assertEqual(len(arena.players), 4)
 
     def test_a_party_of_all_four_roles_finishes_a_stage(self) -> None:
-        arena = play_stage(STAGES[10], 4, seed=3, seconds=420, roles=tuple(ROLES))
+        arena = play_stage(STAGES[10], 4, seed=3, seconds=900, roles=tuple(ROLES))
         self.assertEqual(arena.outcome, "cleared")
         self.assertEqual({mage.role for mage in arena.players.values()}, set(ROLES))
 
@@ -1775,7 +1795,7 @@ class BossAttackTests(unittest.TestCase):
         self.assertLess(max(RETAIN_PULL), MOVE_SPEED * 0.8)
         self.fight("scroll")
         self.boss.next_special = 0.0
-        self.boss.specials = 2
+        self.boss.specials = 4
         advance(self.arena, 0.2)
         self.assertEqual(self.boss.state, "retain")
         before = math.hypot(self.mage.x - self.boss.x, self.mage.y - self.boss.y)

@@ -144,6 +144,46 @@ else:
 
 export const EXAMPLES = [
   {
+    name: "Демон-турель",
+    code: `# Книга рун: пока вы бегаете, этот код стреляет сам
+def turret():
+    foes = enemies()
+    if foes and me().mana > 40:
+        best = foes[0]
+        for e in foes:
+            if e.dist < best.dist:
+                best = e
+        fireball(direction(best.x, best.y))
+
+daemon(turret)
+`,
+  },
+  {
+    name: "Чёрный ход",
+    code: `# Книга рун: прыгнуть вперёд, а через секунду вернуться
+def back():
+    undo()
+
+p = cursor()
+if p and ready("undo"):
+    blink(p.x, p.y)
+    nova()
+    later(1.0, back)
+`,
+  },
+  {
+    name: "Ревьюер не пройдёт",
+    code: `# Код-ревьюер не принимает то, что только что видел
+for e in enemies():
+    if e.kind == "reviewer":
+        angle = direction(e.x, e.y)
+        if e.text == "fire":
+            frostbolt(angle)
+        else:
+            fireball(angle)
+`,
+  },
+  {
     name: "Автоприцел",
     code: `# Ваш код из терминала: бьёт в ближайшего врага
 targets = enemies()
@@ -431,6 +471,14 @@ export const SLOT_RUNES = ["I", "II", "III"];
 /* The spell language as the editor sees it: colours, completion and signatures.
  * Argument strings show the player what to fill in; `element` picks the colour. */
 export const SPELL_API = [
+  { name: "ping", args: "x, y", about: "Книга: считает врагов вокруг точки, загружает комнату", element: "arcane" },
+  { name: "gc", args: "", about: "Книга: притягивает сферы, убирает облака", element: "arcane" },
+  { name: "grep", args: "text", about: "Книга: бьёт всех врагов, в чьём виде есть эта строка", element: "storm" },
+  { name: "undo", args: "", about: "Книга: откат на 3 секунды назад", element: "guard" },
+  { name: "zip_bomb", args: "x, y", about: "Книга: через 1,2 с большой взрыв", element: "fire" },
+  { name: "clone", args: "", about: "Книга: копия мага на 8 секунд", element: "arcane" },
+  { name: "later", args: "seconds, function", about: "Книга: вызвать функцию позже", element: "arcane" },
+  { name: "daemon", args: "function", about: "Книга: функция сама работает 10 секунд", element: "storm" },
   { name: "fireball", args: "angle, speed=1.0", about: "Снаряд, 16 урона", element: "fire" },
   { name: "meteor", args: "x, y, radius=120", about: "Три метеора через 1,15 с", element: "fire" },
   { name: "frostbolt", args: "angle", about: "10 урона и замедление", element: "frost" },
@@ -459,6 +507,18 @@ export const SPELL_API = [
 
 /* What the arena does not have: only the campaign offers these in the editor. */
 export const STORY_ONLY = new Set([
+  "ping",
+  "gc",
+  "grep",
+  "undo",
+  "zip_bomb",
+  "clone",
+  "later",
+  "daemon",
+  "open_door",
+  "lamp",
+  "bridge",
+  "targets",
   "enemies",
   "allies",
   "firewall",
@@ -483,8 +543,12 @@ export const SENSE_API = [
   { name: "aim", args: "", about: "Угол прицела в радианах" },
   { name: "cursor", args: "", about: "Точка под курсором: .x .y .dist" },
   { name: "ready", args: "rune", about: "Хватит ли маны и готова ли руна" },
-  { name: "enemies", args: "", about: "Все враги: .x .y .hp .dist .kind .boss. Под проклятием None", gated: true },
+  { name: "enemies", args: "", about: "Все враги: .x .y .hp .dist .kind .boss .text. Под проклятием None", gated: true },
   { name: "allies", args: "", about: "Вся группа: .x .y .hp .dist .kind .dead. Под проклятием None", gated: true },
+  { name: "open_door", args: "value", about: "Мастерская: открыть замок", gated: true },
+  { name: "lamp", args: "", about: "Мастерская: цвет лампы, \"green\" или \"red\"", gated: true },
+  { name: "bridge", args: "i", about: "Мастерская: положить секцию моста номер i", gated: true },
+  { name: "targets", args: "", about: "Мастерская: список мишеней, .x .y", gated: true },
   { name: "direction", args: "x, y", about: "Угол от мага к точке" },
   { name: "distance", args: "x1, y1, x2, y2", about: "Расстояние между точками" },
   { name: "log", args: "value", about: "Строка в «Печать»" },
@@ -524,6 +588,7 @@ export const FIELD_API = [
   { name: "x", about: "Координата X" },
   { name: "y", about: "Координата Y" },
   { name: "dist", about: "Расстояние до цели" },
+  { name: "text", about: "Текст на цели: у письма это его содержимое" },
   { name: "kind", about: "Вид врага" },
   { name: "boss", about: "Босс ли это" },
   { name: "dead", about: "Пал ли союзник" },

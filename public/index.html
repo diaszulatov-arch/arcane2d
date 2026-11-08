@@ -38,6 +38,7 @@
               <span class="online-label">в сети</span>
               <span class="ping-value" id="pingValue" title="Задержка до арены" hidden></span>
             </div>
+            <button class="icon-button story-only" id="codexToggle" type="button" title="Справочник (K)" aria-label="Открыть справочник">?</button>
             <button class="icon-button" id="soundToggle" type="button" title="Звук" aria-label="Включить или выключить звук">♪</button>
             <button class="icon-button panel-toggle" id="panelToggle" type="button" title="Открыть гримуар" aria-label="Открыть гримуар">
               <span aria-hidden="true">◈</span>
@@ -97,6 +98,7 @@
           <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> заклинание</span>
           <span><kbd>Shift</kbd> перекат <span class="roll-hint" id="rollHint">готов</span></span>
           <span><kbd>Ctrl</kbd>+<kbd>↵</kbd> сотворить</span>
+          <span class="story-only"><kbd>E</kbd> терминал, сундук, пакет</span>
           <span class="story-only"><kbd>L</kbd> журнал рации</span>
         </div>
 
@@ -119,14 +121,46 @@
           </div>
           <p class="boss-shout" id="bossShout" hidden></p>
           <div class="curse-bar" id="curseBar" hidden></div>
+          <div class="event-chip" id="eventChip" role="status" hidden></div>
         </div>
+        <aside class="quest-card range-card" id="rangeCard" aria-label="Полигон" hidden>
+          <p class="quest-tech">ПОЛИГОН</p>
+          <p class="quest-title">Урон в секунду: <span id="rangeDps">0</span></p>
+          <p class="quest-text">Всего: <span id="rangeTotal">0</span>. Выход: встаньте на портал.</p>
+        </aside>
+        <aside class="quest-card" id="questCard" aria-label="Задача этапа" hidden>
+          <p class="quest-tech" id="questTech"></p>
+          <h4 class="quest-title" id="questTitle"></h4>
+          <p class="quest-text" id="questText"></p>
+          <div class="quest-bar" id="questBar" hidden>
+            <div class="quest-fill" id="questFill"></div>
+            <span id="questBarLabel"></span>
+          </div>
+          <div class="quest-finds" id="questFinds"></div>
+          <ul class="folk-list" id="folkList" hidden></ul>
+        </aside>
+        <aside class="code-card" id="codeCard" aria-label="Код на стене" hidden>
+          <p class="quest-tech" id="codeCardTitle"></p>
+          <pre id="codeCardBody"></pre>
+        </aside>
         <button class="comms-toggle" id="commsToggle" type="button" title="Журнал рации (L)">Журнал <kbd>L</kbd></button>
         <div class="party-frames" id="partyFrames" aria-label="Группа"></div>
         <div class="story-comms" id="storyComms" role="status" hidden></div>
         <button class="terminal-prompt" id="terminalPrompt" type="button" hidden></button>
+        <div class="npc-dim" id="npcDim" hidden></div>
+        <div class="npc-talk" id="npcTalk" role="dialog" aria-label="Разговор" hidden>
+          <div class="npc-portrait"><canvas id="npcPortrait" width="32" height="32"></canvas></div>
+          <div class="npc-body">
+            <strong id="npcName"></strong>
+            <p id="npcText"></p>
+            <pre id="npcCode" hidden></pre>
+            <div class="npc-replies" id="npcReplies"></div>
+          </div>
+        </div>
         <div class="intro-card" id="introCard" hidden>
           <strong id="introName"></strong>
           <span id="introHint"></span>
+          <small class="intro-more">Подробнее: <kbd>K</kbd> справочник</small>
         </div>
       </section>
 
@@ -298,6 +332,7 @@
         <div class="terminal-actions">
           <button class="text-button" id="terminalHint" type="button">Подсказка</button>
           <button class="text-button pgt" id="terminalAsk" type="button">Спросить PGT</button>
+          <button class="text-button pgt" id="terminalPgt" type="button" title="Шаг засчитают сразу, но без токенов, а через полминуты PGT подкинет багов" hidden>Принять всё от PGT</button>
           <button class="text-button" id="terminalLog" type="button">Журнал рации</button>
         </div>
       </div>
@@ -352,6 +387,12 @@
           <h3>Группа</h3>
           <ul class="camp-seats" id="campSeats"></ul>
           <button class="enter-button" id="campReady" type="button"><span>Готов</span></button>
+          <div class="camp-extras">
+            <button class="text-button" id="campRange" type="button" title="Манекены и все руны Книги. Ничего не стоит и ничего не приносит.">Полигон</button>
+            <button class="text-button" id="campDuty" type="button"></button>
+            <button class="text-button" id="campDutyEnd" type="button" hidden>Сдать смену</button>
+          </div>
+          <p class="camp-duty-about" id="campDutyAbout" hidden></p>
           <h3>Сложность</h3>
           <div class="camp-difficulty" id="campDifficulty" aria-label="Сложность"></div>
           <p class="camp-difficulty-about" id="campDifficultyAbout"></p>
@@ -366,6 +407,12 @@
             <button class="camp-tab" data-tab="lesson" type="button">Брифинг</button>
             <button class="camp-tab" data-tab="role" type="button" id="roleTab">Роль</button>
             <button class="camp-tab" data-tab="upgrades" type="button">Улучшения</button>
+            <button class="camp-tab" data-tab="book" type="button">Книга рун</button>
+            <button class="camp-tab" data-tab="tickets" type="button">Тикеты</button>
+            <button class="camp-tab" data-tab="crew" type="button">Команда</button>
+            <button class="camp-tab" data-tab="people" type="button">Люди</button>
+            <button class="camp-tab" data-tab="codex" type="button">Справочник</button>
+            <button class="camp-tab" data-tab="relics" type="button">Архив</button>
           </nav>
           <section class="camp-panel camp-story" id="tabStory" data-panel="story"></section>
           <section class="camp-panel lesson" data-panel="lesson" hidden>
@@ -389,9 +436,46 @@
             <p class="upgrade-intro">Токены дают за этапы и починенный код. Каждую ветвь проходите сверху вниз: нижнее улучшение не может обогнать верхнее. Работают только в сюжете.</p>
             <div class="upgrade-tree" id="upgradeTree"></div>
           </section>
+          <section class="camp-panel" data-panel="book" hidden>
+            <p class="upgrade-intro">Уроки учат рунам бесплатно, а эти продаются за токены. Работают только в сюжете, у каждого мага свои. Перед покупкой любую можно попробовать на Полигоне.</p>
+            <div class="book-list" id="bookList"></div>
+          </section>
+          <section class="camp-panel" data-panel="tickets" hidden>
+            <p class="upgrade-intro">Этап пройден, но тикеты по нему ещё открыты. Каждый платит один раз, поэтому возвращаться есть зачем. <strong id="ticketCount"></strong></p>
+            <div class="ticket-board" id="ticketBoard"></div>
+          </section>
+          <section class="camp-panel codex-panel" data-panel="codex" hidden>
+            <div class="codex" id="codexRoot"></div>
+          </section>
+          <section class="camp-panel" data-panel="people" hidden>
+            <p class="upgrade-intro" id="peopleIntro"></p>
+            <div class="people-list" id="peopleList"></div>
+          </section>
+          <section class="camp-panel" data-panel="crew" hidden>
+            <p class="upgrade-intro">Кого вы спасли, те переезжают в штаб и помогают чем могут. Им есть что сказать, и это меняется по ходу дела.</p>
+            <div class="crew-list" id="crewList"></div>
+          </section>
+          <section class="camp-panel" data-panel="relics" hidden>
+            <p class="upgrade-intro">Находки за треснувшими стенами: по одной на каждый обычный этап. На каждой остался коммит: вместе они складываются в историю репозитория. Заметили трещину — стреляйте. <strong id="relicCount"></strong></p>
+            <div class="relic-list" id="relicList"></div>
+          </section>
         </div>
       </div>
     </section>
+  </div>
+
+  <div class="modal-layer" id="codexModal" hidden>
+    <div class="modal-backdrop" data-close-codex></div>
+    <article class="codex-modal" role="dialog" aria-modal="true" aria-labelledby="codexTitle">
+      <header class="api-head">
+        <div>
+          <p>ПОКА ВЫ ЧИТАЕТЕ, БОЙ ИДЁТ</p>
+          <h2 id="codexTitle">Справочник</h2>
+        </div>
+        <button class="icon-button" id="codexClose" type="button" aria-label="Закрыть">×</button>
+      </header>
+      <div class="codex-host" id="codexHost"></div>
+    </article>
   </div>
 
   <div class="modal-layer" id="apiModal" hidden>
@@ -444,6 +528,7 @@
             <dt><code>poison_cloud(x, y, radius=110)</code><span class="cost">30</span></dt><dd>Ядовитое облако на 4,2 сек.: 6 урона каждые 0,75 сек. (до 5 тиков) в радиусе 70–150, дальность 520. Один раз за каст.</dd>
             <dt><code>ward(x, y)</code><span class="cost">15</span></dt><dd>Рунная мина. Максимум две, радиус взрыва 118.</dd>
           </dl>
+          <p class="api-note">В сюжете за токены продаются ещё восемь рун: <code>ping</code>, <code>gc</code>, <code>grep</code>, <code>undo</code>, <code>zip_bomb</code>, <code>clone</code>, <code>later</code> и <code>daemon</code>. Они описаны в штабе на вкладке «Книга рун», а попробовать их можно на Полигоне.</p>
           <p class="api-note"><kbd>Shift</kbd> — бесплатный перекат: 165 единиц, неуязвимость 0,22 сек., перезарядка 1,6 сек. Направление берётся из движения, а если маг стоит — из прицела. Это не руна <code>dash()</code>.</p>
         </section>
 

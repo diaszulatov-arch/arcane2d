@@ -6,12 +6,15 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import io
 import json
 import os
 import struct
 import unittest
+from unittest import mock
 
 from arcane.net import WebSocket
+from arcane.party import Party
 from server import (
     MAX_CHECKS_PER_SECOND,
     MAX_CLIENT_BACKLOG,
@@ -262,7 +265,8 @@ class ServerTestCase(unittest.IsolatedAsyncioTestCase):
                 await self.send_json(writer, {"t": "party_ready", "ready": True})
             started = await self.wait_for_type(reader_a, "stage_start")
             self.assertEqual(started["config"]["mode"], "story")
-            self.assertEqual(started["config"]["runes"], ["fireball"])
+            self.assertIn("fireball", started["config"]["runes"])
+            self.assertNotIn("frostbolt", started["config"]["runes"])
             self.assertTrue(started["you"])
 
             state = await self.wait_for_type(reader_a, "state")
@@ -701,6 +705,65 @@ class NameSanitisingTests(unittest.TestCase):
         self.assertIsNone(clean_name("!"))
         self.assertIsNone(clean_name(42))
         self.assertEqual(len(clean_name("я" * 40)), 16)
+
+
+class OneLoopForEverythingTests(unittest.TestCase):
+    """The arena and every fight share one loop: nothing in one may freeze the others."""
+
+    def setUp(self) -> None:
+        self.app = ArcaneServer(bots=0)
+
+    def test_a_broken_party_does_not_stop_the_next_one(self) -> None:
+        broken = self.app.create_party()
+        self.app.create_party()
+        ticked: list[float] = []
+
+        def tick(party: Party, now: float) -> None:
+            if party is broken:
+                raise ZeroDivisionError
+            ticked.append(now)
+
+        with mock.patch.object(Party, "tick", tick):
+            with contextlib.redirect_stderr(io.StringIO()) as printed:
+                self.app.update_parties(1.0)
+        self.assertEqual(ticked, [1.0])
+        self.assertIn(broken.code, printed.getvalue())
+
+    def test_the_same_crash_is_not_reported_thirty_times_a_second(self) -> None:
+        self.app.create_party()
+
+        def tick(party: Party, now: float) -> None:
+            raise ZeroDivisionError
+
+        with mock.patch.object(Party, "tick", tick):
+            with contextlib.redirect_stderr(io.StringIO()) as printed:
+                for moment in range(30):
+                    self.app.update_parties(float(moment))
+        self.assertEqual(printed.getvalue().count("Ошибка в"), 1)
+
+    def test_fights_go_on_when_the_arena_itself_breaks(self) -> None:
+        async def run() -> tuple[int, int]:
+            self.app.create_party()
+            broke: list[float] = []
+            ticked: list[float] = []
+
+            def update(now: float) -> None:
+                broke.append(now)
+                raise ZeroDivisionError
+
+            self.app.arena.update = update
+            with mock.patch.object(Party, "tick", lambda party, now: ticked.append(now)):
+                task = asyncio.create_task(self.app.game_loop())
+                await asyncio.sleep(0.2)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            return len(broke), len(ticked)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            broke, ticked = asyncio.run(run())
+        self.assertGreater(broke, 2, "the loop kept on ticking")
+        self.assertEqual(ticked, broke, "and took the fights with it")
 
 
 if __name__ == "__main__":

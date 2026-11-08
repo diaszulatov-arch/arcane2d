@@ -114,6 +114,12 @@ const dom = {
   cooldownFill: $("cooldownFill"),
   castButton: $("castButton"),
   apiModal: $("apiModal"),
+  codexModal: $("codexModal"),
+  codexHost: $("codexHost"),
+  codexRoot: $("codexRoot"),
+  codexPanel: document.querySelector('[data-panel="codex"]'),
+  codexToggle: $("codexToggle"),
+  codexClose: $("codexClose"),
   apiClose: $("apiClose"),
   apiDone: $("apiDone"),
   loginApiButton: $("loginApiButton"),
@@ -154,6 +160,10 @@ const client = {
   breakpoints: [],
   role: "",
   story: null,
+  quest: null,
+  terrainState: null,
+  workshop: null,
+  life: null,
   closedDoors: new Set(),
   mode: loadMode(),
   pointer: {
@@ -596,6 +606,10 @@ function handleServerMessage(message) {
       story.fixResult(message);
       break;
     }
+    case "interact_result": {
+      if (message.error) showToast(String(message.error), "error");
+      break;
+    }
     case "roll_result": {
       handleRollResult(message);
       break;
@@ -713,6 +727,11 @@ function handleState(message) {
   client.barriers = Array.isArray(message.barriers) ? message.barriers : [];
   client.breakpoints = Array.isArray(message.breakpoints) ? message.breakpoints : [];
   client.story = message.story || null;
+  client.quest = message.quest || null;
+  client.terrainState = message.terrain || null;
+  client.workshop = message.workshop || null;
+  client.life = message.life || null;
+  client.bossMoves = message.boss_moves || [];
   if (client.story) {
     client.closedDoors = new Set(client.story.doors.map(([x, y]) => `${x},${y}`));
     story.updateHud(message, client.selfId);
@@ -785,10 +804,121 @@ function handleEventFeedback(event) {
       if (near) sound.play("impact");
       break;
     case "fix_done":
+      sound.play(event.pgt ? "error" : "respawn");
+      break;
+    case "folk_done":
+      sound.play(event.status === "passed" ? "respawn" : "error");
+      break;
+    case "quest_item":
+    case "quest_catch":
+    case "plate_on":
+    case "packet_take":
+      sound.play("ward");
+      break;
+    case "zone_on":
+    case "npc_found":
+    case "unit_up":
+      sound.play("shield");
+      break;
+    case "quest_burst":
+      sound.play("poison");
+      break;
+    case "ns_forged":
+      sound.play("error");
+      break;
+    case "quest_note":
+      if (near) sound.play("click");
+      break;
+    case "memory_oom":
+      sound.play("death-near");
+      break;
+    case "memory_free":
       sound.play("respawn");
+      break;
+    case "plate_fail":
+    case "zones_fail":
+      sound.play("error");
+      break;
+    case "quest_step":
+    case "exit_open":
+    case "reveal":
+      if (kind !== "reveal" || near) sound.play(kind === "reveal" ? "click" : "join");
+      break;
+    case "quest_done":
+    case "rest":
+      sound.play("respawn");
+      break;
+    case "loot":
+      sound.play("heal");
+      break;
+    case "unit_down":
+      sound.play("death-near");
+      break;
+    case "deal":
+      sound.play("emp");
+      break;
+    case "heat":
+      sound.play("hurt");
+      break;
+    case "tiles":
+      patchTiles(event.rects || [], String(event.char || "."));
+      sound.play("respawn");
+      break;
+    case "link_jump":
+      if (event.id === selfId) placePrediction(event.x, event.y);
+      if (near) sound.play("dash");
+      break;
+    case "prop_break":
+      if (near) sound.play("impact");
+      break;
+    case "prop_blast":
+      if (near) sound.play("meteor_impact");
+      break;
+    case "surface_shock":
+      if (near) sound.play("lightning");
+      break;
+    case "surface_ice":
+      if (near) sound.play("frost");
+      break;
+    case "surface_burn":
+      if (near) sound.play("fire");
+      break;
+    case "workshop_open":
+    case "relic_found":
+    case "find_taken":
+      sound.play("respawn");
+      break;
+    case "finds_offered":
+    case "event_start":
+      sound.play("join");
+      break;
+    case "gust":
+      sound.play("dash");
       break;
     case "rollback":
       if (event.id === selfId) placePrediction(event.x, event.y);
+      sound.play("respawn");
+      break;
+    case "spell_log":
+      if (event.id === selfId) showDaemonLog(event);
+      break;
+    case "daemon":
+      if (event.id === selfId) {
+        addConsoleEntry(`Демон запущен на ${event.time} с.`, "dim");
+        sound.play("emp_pull");
+      }
+      break;
+    case "daemon_end":
+      if (event.id === selfId) addConsoleEntry("Демон завершил работу.", "dim");
+      break;
+    case "ping":
+      if (event.id === selfId) sound.play("click");
+      break;
+    case "gc":
+    case "grep":
+      if (event.id === selfId) sound.play("emp_pull");
+      break;
+    case "caught":
       sound.play("respawn");
       break;
     case "patch":
@@ -934,6 +1064,15 @@ function handleEventFeedback(event) {
   }
 }
 
+function showDaemonLog(event) {
+  (event.log || []).forEach((line) => addConsoleEntry(String(line), "log"));
+  if (event.error) {
+    addConsoleEntry(String(event.error), "error");
+    const tip = story.clipTip(event.error);
+    if (tip) addConsoleEntry(tip, "dim");
+  }
+}
+
 function handleCastResult(message) {
   client.castPending = false;
   const cooldown = Math.max(0, Number(message.cooldown) || 0);
@@ -950,7 +1089,6 @@ function handleCastResult(message) {
   for (const line of logs) {
     addConsoleEntry(String(line), "log");
   }
-
   if (message.ok) {
     setConsoleStatus("исполнено", "");
     const actions = Number(message.actions) || 0;
@@ -971,6 +1109,8 @@ function handleCastResult(message) {
     // A held button must not keep firing a spell that just failed.
     client.castIntent = null;
     addConsoleEntry(error, "error");
+    const tip = story.clipTip(error);
+    if (tip) addConsoleEntry(tip, "dim");
     setConsoleStatus("ошибка", "error");
     showToast(error, "error");
     sound.play("error");
@@ -1033,6 +1173,8 @@ function handleProfile(message) {
 
 function enterDungeon(message) {
   client.config = { ...DEFAULT_WORLD };
+  // The world's runes are the party's; what a mage bought is theirs alone.
+  message.config.runes = [...new Set([...(message.config.runes || []), ...(message.book || [])])];
   mergeWorldConfig(message.config);
   client.selfId = Number(message.you) || null;
   client.joined = true;
@@ -1043,6 +1185,12 @@ function enterDungeon(message) {
   client.terminals = [];
   client.barriers = [];
   client.breakpoints = [];
+  client.quest = null;
+  client.terrainState = null;
+  client.workshop = null;
+  client.bossMoves = [];
+  client.life = null;
+  client.story = null;
   client.role = String(message.role || "");
   client.projectiles = [];
   client.wards = [];
@@ -1255,6 +1403,7 @@ function updatePrediction(dt) {
   const movement = combinedMovement();
   const dx = Number(movement.right) - Number(movement.left);
   const dy = Number(movement.down) - Number(movement.up);
+  rideBelts(prediction, dt);
   if (!dx && !dy) return;
   const length = Math.hypot(dx, dy) || 1;
   const speed = (Number(me.speed) || Number(client.config.speed) || 238) * (me.slow ? 0.58 : 1);
@@ -1281,6 +1430,34 @@ function updatePrediction(dt) {
     dx: prediction.x - startX,
     dy: prediction.y - startY,
   });
+}
+
+/** A conveyor carries everyone, whether or not they are walking. */
+function rideBelts(prediction, dt) {
+  const belts = client.config.terrain?.belts;
+  if (!belts?.length) return;
+  for (const [x, y, w, h, vx, vy] of belts) {
+    if (prediction.x < x || prediction.x > x + w || prediction.y < y || prediction.y > y + h) continue;
+    const startX = prediction.x;
+    const startY = prediction.y;
+    if (canStand(startX + vx * dt, startY)) prediction.x = startX + vx * dt;
+    if (canStand(prediction.x, startY + vy * dt)) prediction.y = startY + vy * dt;
+    moveLog.push({ at: performance.now(), dx: prediction.x - startX, dy: prediction.y - startY });
+  }
+}
+
+/** A wall gave way or a bridge was laid: the map changes, for walking and for the eye. */
+function patchTiles(rects, char) {
+  const rows = client.config.tiles;
+  if (!rows) return;
+  for (const [x, y, w, h] of rects) {
+    for (let row = y; row < y + h; row += 1) {
+      const line = rows[row];
+      if (line === undefined) continue;
+      rows[row] = line.slice(0, x) + char.repeat(w) + line.slice(x + w);
+    }
+  }
+  client.config.tilesVersion = (client.config.tilesVersion || 0) + 1;
 }
 
 function updateAimFromPointer() {
@@ -1946,6 +2123,25 @@ function closeApiModal() {
   modalReturnFocus = null;
 }
 
+/** The same handbook as in headquarters, carried into the dungeon for a moment. */
+function openCodex() {
+  if (!dom.codexModal.hidden || !client.story) return;
+  clearMovement();
+  client.pointer.inside = false;
+  dom.codexHost.append(dom.codexRoot);
+  dom.codexModal.hidden = false;
+  sound.play("click");
+  story.codex.render();
+  window.setTimeout(() => dom.codexClose.focus(), 0);
+}
+
+function closeCodex() {
+  if (dom.codexModal.hidden) return;
+  dom.codexModal.hidden = true;
+  dom.codexPanel.append(dom.codexRoot);
+  document.activeElement?.blur?.();
+}
+
 function trapModalFocus(event) {
   const focusable = [
     ...dom.apiModal.querySelectorAll(
@@ -1969,6 +2165,14 @@ function setupModal() {
   dom.loginApiButton.addEventListener("click", openApiModal);
   dom.apiClose.addEventListener("click", closeApiModal);
   dom.apiDone.addEventListener("click", closeApiModal);
+  dom.codexToggle.addEventListener("click", () => {
+    if (dom.codexModal.hidden) openCodex();
+    else closeCodex();
+  });
+  dom.codexClose.addEventListener("click", closeCodex);
+  dom.codexModal.addEventListener("click", (event) => {
+    if (event.target instanceof Element && event.target.closest("[data-close-codex]")) closeCodex();
+  });
   dom.apiModal.addEventListener("click", (event) => {
     if (event.target instanceof Element && event.target.matches("[data-close-modal]")) {
       closeApiModal();
@@ -2353,6 +2557,10 @@ function setupKeyboard() {
         closeApiModal();
         return;
       }
+      if (!dom.codexModal.hidden) {
+        closeCodex();
+        return;
+      }
       if (isDrawerLayout() && panelIsOpen()) {
         setPanelOpen(false);
         return;
@@ -2360,11 +2568,38 @@ function setupKeyboard() {
     }
     if (event.defaultPrevented) return;
     if (!dom.apiModal.hidden) return;
+    if (!dom.codexModal.hidden) {
+      if (event.code === "KeyK" && !event.repeat) closeCodex();
+      return;
+    }
     if (isTypingTarget(event.target) || story.terminalTask) return;
     if (!client.joined) return;
+    if (event.code === "KeyK" && !event.repeat && client.story) {
+      openCodex();
+      return;
+    }
 
+    if (story.talkOpen()) {
+      const reply = ["1", "2", "3", "4", "5"].indexOf(event.key);
+      if (reply >= 0 && !event.repeat) {
+        story.chooseReply(reply);
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "Escape") {
+        story.closeTalk();
+        event.preventDefault();
+        return;
+      }
+      // Mid-conversation E never starts the same conversation over.
+      if (event.code === "KeyE") {
+        if (!event.repeat) story.talkKey();
+        event.preventDefault();
+        return;
+      }
+    }
     if (event.code === "KeyE" && !event.repeat && client.story) {
-      if (story.openTerminal()) event.preventDefault();
+      if (story.openTerminal() || story.interact()) event.preventDefault();
       return;
     }
     if (event.code === "KeyL" && !event.repeat && client.story) {
@@ -2477,7 +2712,13 @@ async function fetchWorldConfig() {
 // ------------------------------------------------------------------ animation
 let lastAnimationAt = 0;
 
+const DRAW_ERROR_EVERY = 5000;
+let lastDrawErrorAt = -DRAW_ERROR_EVERY;
+
 function animate(now) {
+  // First of all: whatever throws below, the next frame is already on its way.
+  window.requestAnimationFrame(animate);
+
   const rawDt = lastAnimationAt ? (now - lastAnimationAt) / 1000 : 0.016;
   const dt = clamp(rawDt, 0.001, 0.05);
   lastAnimationAt = now;
@@ -2485,7 +2726,15 @@ function animate(now) {
   updateAimFromPointer();
   updatePrediction(dt);
   runCastIntent(now);
-  renderer.draw(client, now);
+  try {
+    renderer.draw(client, now);
+  } catch (error) {
+    if (now - lastDrawErrorAt > DRAW_ERROR_EVERY) {
+      lastDrawErrorAt = now;
+      console.error("Кадр не отрисован:", error);
+    }
+    renderer.recoverFrame();
+  }
   refreshCooldownUi(now);
 
   if (
@@ -2502,8 +2751,6 @@ function animate(now) {
     }
     client.lastStateAt = now;
   }
-
-  window.requestAnimationFrame(animate);
 }
 
 // ----------------------------------------------------------------------- boot

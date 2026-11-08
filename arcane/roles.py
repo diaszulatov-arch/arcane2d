@@ -288,7 +288,7 @@ class SkillBook:
         """
 
         world = self.world
-        targets = world.targets_for(self.player.id)
+        targets = world.foes_for(self.player.id)
         if value is None:
             x, y = self._cursor()
             return min(

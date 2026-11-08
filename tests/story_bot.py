@@ -25,6 +25,9 @@ SHELTER_BEARINGS = 16
 SHOT_NOTICE = 170.0
 SHOT_WIDTH = 34.0
 SHOT_STEP = 70.0
+# On these steps the quest wants things shot; on the others, it wants mages somewhere.
+PAD_CLEARANCE = 72.0
+SHOOTING_STEPS = frozenset({"hunt", "memory", "bucket", "racks", "inbox"})
 
 
 def spell_for(arena: StoryArena, role: str = "") -> str:
@@ -53,30 +56,41 @@ def spell_for(arena: StoryArena, role: str = "") -> str:
 def open_terminal(arena: StoryArena) -> Terminal | None:
     """A broken terminal that stands in the way right now, if there is one."""
 
-    if arena.gate_boss is not None or arena.dungeon.closed and arena.active_room is None:
-        return next((t for t in arena.terminals if not t.solved), None)
-    if arena.active_room is not None:
+    if arena.active_room is not None and arena.gate_boss is None:
         return None
-    if all(
-        room.index in arena.cleared_rooms
-        for room in arena.dungeon.rooms
-        if room.kind == "combat"
-    ):
-        return next((t for t in arena.terminals if not t.solved), None)
+    quest_open = arena.quest is None or arena.quest.done
+    for terminal in arena.terminals:
+        if terminal.solved:
+            continue
+        if terminal.role == "gate" and arena.gate_boss is None:
+            continue
+        if terminal.role == "portal" and not quest_open:
+            continue
+        return terminal
     return None
 
 
-def walk_goal(arena: StoryArena) -> tuple[float, float]:
-    """What needs doing next: a terminal, an uncleared room, or the portal."""
+def quest_goal(arena: StoryArena, player: Player) -> tuple[float, float] | None:
+    if arena.quest is None or arena.quest.done:
+        return None
+    return arena.quest.objective(player)
+
+
+def walk_goal(arena: StoryArena, player: Player | None = None) -> tuple[float, float]:
+    """What needs doing next: a terminal, the quest, an uncleared room, or the portal."""
 
     terminal = open_terminal(arena)
     if terminal is not None:
         return terminal.x, terminal.y
     if arena.portal_ready:
         return arena.portal
-    for room in arena.dungeon.rooms:
+    if player is not None:
+        goal = quest_goal(arena, player)
+        if goal is not None:
+            return goal
+    for room in arena.dungeon.path:
         if room.kind in ("combat", "boss") and room.index not in arena.cleared_rooms:
-            return room.center
+            return arena.dungeon.open_near(*room.center)
     return arena.portal
 
 
@@ -86,12 +100,22 @@ def next_step(arena: StoryArena, player: Player, goal: tuple[float, float]) -> t
     dungeon = arena.dungeon
     start = (int(player.x // TILE), int(player.y // TILE))
     finish = (int(goal[0] // TILE), int(goal[1] // TILE))
+    # A person walks around a hyperlink on the floor; so does this.
+    pads: set[tuple[int, int]] = set()
+    centres: list[tuple[float, float]] = []
+    if arena.terrain is not None:
+        for x1, y1, x2, y2 in arena.terrain.links:
+            for px, py in ((x1, y1), (x2, y2)):
+                centres.append((px, py))
+                tx, ty = int(px // TILE), int(py // TILE)
+                pads |= {(tx + a, ty + b) for a in (-1, 0, 1) for b in (-1, 0, 1)}
+    pads -= {start, finish}
     came_from: dict[tuple[int, int], tuple[int, int] | None] = {finish: None}
     frontier = deque([finish])
     while frontier and start not in came_from:
         x, y = frontier.popleft()
         for step in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-            if step not in came_from and not dungeon.solid(*step):
+            if step not in came_from and step not in pads and not dungeon.solid(*step):
                 came_from[step] = (x, y)
                 frontier.append(step)
     tile = came_from.get(start)
@@ -105,8 +129,21 @@ def next_step(arena: StoryArena, player: Player, goal: tuple[float, float]) -> t
         point = ((tile[0] + 0.5) * TILE, (tile[1] + 0.5) * TILE)
         if not dungeon.path_clear(player.x, player.y, point[0], point[1], 20.0):
             break
+        if any(_passes_near(player.x, player.y, point, centre) for centre in centres):
+            break
         best = point
     return best
+
+
+def _passes_near(x: float, y: float, point: tuple[float, float], centre: tuple[float, float]) -> bool:
+    """Whether walking straight to ``point`` would clip a hyperlink pad."""
+
+    dx, dy = point[0] - x, point[1] - y
+    length = dx * dx + dy * dy
+    if length == 0:
+        return False
+    along = max(0.0, min(1.0, ((centre[0] - x) * dx + (centre[1] - y) * dy) / length))
+    return math.hypot(x + dx * along - centre[0], y + dy * along - centre[1]) < PAD_CLEARANCE
 
 
 def unsafe(arena: StoryArena, player: Player, x: float, y: float) -> bool:
@@ -204,7 +241,6 @@ def play_stage(
         apply_role(mage, role)
     spells = {mage.id: spell_for(arena, mage.role) for mage in mages}
     now = 1.0
-    goal = walk_goal(arena)
     positions: dict[int, tuple[float, float]] = {}
     for tick in range(int(seconds * TICK_RATE)):
         now += 1 / TICK_RATE
@@ -215,21 +251,37 @@ def play_stage(
             break
         if tick % 6:
             continue
-        goal = walk_goal(arena)
         for mage in mages:
             if mage.dead:
                 continue
-            enemy = min(
-                arena.targets_for(mage.id),
-                key=lambda m: math.hypot(m.x - mage.x, m.y - mage.y),
-                default=None,
+            goal = walk_goal(arena, mage)
+            step = arena.quest.step if arena.quest is not None else None
+            busy = (
+                arena.active_room is None
+                and step is not None
+                and step.kind not in SHOOTING_STEPS
+                and quest_goal(arena, mage) is not None
             )
+            carrying = arena.quest is not None and arena.quest.carrier() == mage.id
+            spell = spells[mage.id]
+            order = arena.quest.bot_shot(mage) if arena.quest is not None else None
+            if order is not None:
+                enemy, wanted = order
+                spell = wanted or spell
+            else:
+                enemy = min(
+                    arena.foes_for(mage.id),
+                    key=lambda m: math.hypot(m.x - mage.x, m.y - mage.y),
+                    default=None,
+                )
             distance = math.inf if enemy is None else math.hypot(enemy.x - mage.x, enemy.y - mage.y)
             near = distance < DANGER_RANGE
             fallen = next((p for p in mages if p.dead), None)
-            clear = enemy is not None and arena.dungeon.path_clear(mage.x, mage.y, enemy.x, enemy.y, 8.0)
+            clear = enemy is not None and arena.dungeon.path_clear(mage.x, mage.y, enemy.x, enemy.y, 8.0, shot=True)
             far = distance > FIRE_RANGE * 0.85
             chase = (enemy.x, enemy.y) if enemy is not None and (far or not clear) else None
+            if carrying or (busy and distance > 360):
+                chase = None
             terminal = open_terminal(arena)
             if terminal is not None and math.hypot(mage.x - terminal.x, mage.y - terminal.y) < 110:
                 if arena.link(mage.id)[0] is not None:
@@ -254,6 +306,6 @@ def play_stage(
                 flight = distance / BOLT_SPEED
                 lead_x = enemy.x + (enemy.x - enemy.last_x) * TICK_RATE * flight
                 lead_y = enemy.y + (enemy.y - enemy.last_y) * TICK_RATE * flight
-                arena.cast(mage.id, spells[mage.id], 0, None, lead_x, lead_y)
+                arena.cast(mage.id, spell, 0, None, lead_x, lead_y)
     return arena
 

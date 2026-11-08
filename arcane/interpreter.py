@@ -58,6 +58,7 @@ class UnitView:
     dist: float
     boss: bool
     dead: bool = False
+    text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1246,9 +1247,47 @@ def call_function(
         raise SpellRuntimeError("Внутренняя ошибка заклинания.") from None
 
 
-def execute_spell(source: str, globals_: Mapping[str, Any]) -> int:
-    """Run one spell and return the number of AST steps consumed."""
+def execute_spell(source: str, globals_: Mapping[str, Any], keeper: Any = None) -> int:
+    """Run one spell and return the number of AST steps consumed.
+
+    ``keeper`` receives the interpreter before anything runs, so a spell can leave
+    a function behind that outlives the cast (see ``call_later``).
+    """
 
     interpreter = Interpreter(source, globals_)
+    if keeper is not None:
+        keeper.interpreter = interpreter
     interpreter.run()
     return interpreter.steps
+
+
+def is_function(value: Any) -> bool:
+    """Whether a spell's value can be called: its own def, or a rune named without brackets."""
+
+    if isinstance(value, _UserFunction):
+        return True
+    return callable(value) and not isinstance(value, (UnitView, OwnView, PointView))
+
+
+def call_later(interpreter: Interpreter, function: Any, args: Iterable[Any]) -> Any:
+    """Call a function a spell kept for later, on the budget of a fresh cast."""
+
+    interpreter.steps = 0
+    interpreter.loop_iterations = 0
+    interpreter.call_depth = 0
+    call_args = list(args)
+    if isinstance(function, _UserFunction):
+        try:
+            return interpreter._call_user_function(function, call_args, {}, ast.Call(ast.Constant(None), [], []))
+        except _BreakSignal:
+            raise SpellRuntimeError("break допустим только внутри цикла.") from None
+        except _ContinueSignal:
+            raise SpellRuntimeError("continue допустим только внутри цикла.") from None
+        except RecursionError:
+            raise SpellRuntimeError("Заклинание ушло в слишком глубокую рекурсию.") from None
+        except (MemoryError, OverflowError):
+            raise SpellRuntimeError("Заклинание потребовало слишком много ресурсов.") from None
+    try:
+        return function(*call_args)
+    except TypeError:
+        raise SpellRuntimeError("Неверное количество или тип аргументов.") from None

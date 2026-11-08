@@ -4,6 +4,7 @@ const TAU = Math.PI * 2;
 // Pixels per tile in the baked floor: about one screen pixel at the game's zoom,
 // and small enough that the largest floor stays well under 30 MB.
 const BAKE = 16;
+const LIFE_LIMIT = 420;
 
 export const THEMES = {
   // Домашние страницы девяностых: бирюзовый фон, серые объёмные кнопки.
@@ -108,72 +109,288 @@ export function themeOf(config) {
   return THEMES[config?.theme] || THEMES.oldweb;
 }
 
-/** Mostly the first two tones, so the floor reads as stone and not a checkerboard. */
-function floorTone(theme, random) {
-  const roll = random();
-  if (roll < 0.42) return theme.floors[0];
-  if (roll < 0.8) return theme.floors[1];
-  return theme.floors[2 + Math.floor(random() * (theme.floors.length - 2))];
+function hexChannels(hex) {
+  const value = parseInt(hex.slice(1), 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
 }
 
-function paintFloorTile(ctx, x, y, theme, random) {
-  ctx.fillStyle = floorTone(theme, random);
-  ctx.fillRect(x, y, BAKE, BAKE);
-  ctx.fillStyle = theme.grout;
-  ctx.fillRect(x, y + BAKE - 1, BAKE, 1);
-  ctx.fillRect(x + BAKE - 1, y, 1, BAKE);
-  ctx.fillStyle = "rgba(255, 255, 255, 0.05)";
-  ctx.fillRect(x, y, BAKE - 1, 1);
-  const specks = Math.floor(random() * 3);
-  for (let index = 0; index < specks; index += 1) {
-    ctx.fillStyle = theme.specks[Math.floor(random() * theme.specks.length)];
-    ctx.globalAlpha = 0.28 + random() * 0.3;
-    ctx.fillRect(x + 2 + Math.floor(random() * 11), y + 2 + Math.floor(random() * 11), 2, 1);
-    ctx.globalAlpha = 1;
+function mix(a, b, amount) {
+  const from = hexChannels(a);
+  const to = hexChannels(b);
+  const part = (index) => Math.round(from[index] + (to[index] - from[index]) * amount);
+  return `rgb(${part(0)}, ${part(1)}, ${part(2)})`;
+}
+
+/** The same place always gets the same dice, so opening a wall does not repaint the room. */
+function tileDice(seed, x, y, salt = 0) {
+  return seededRandom((Math.imul(x, 73856093) ^ Math.imul(y, 19349663) ^ Math.imul(seed, 83492791) ^ salt) >>> 0);
+}
+
+/** Soft blotches several tiles wide: what keeps a floor from looking like a chessboard. */
+function makeNoise(seed) {
+  const corner = (x, y) => tileDice(seed, x, y, 0x51ed)();
+  const ease = (value) => value * value * (3 - 2 * value);
+  return (x, y) => {
+    const left = Math.floor(x);
+    const top = Math.floor(y);
+    const fx = ease(x - left);
+    const fy = ease(y - top);
+    const a = corner(left, top) + (corner(left + 1, top) - corner(left, top)) * fx;
+    const b = corner(left, top + 1) + (corner(left + 1, top + 1) - corner(left, top + 1)) * fx;
+    return a + (b - a) * fy;
+  };
+}
+
+/** A colour from the chapter's floor tones, dark to light, by a value from 0 to 1. */
+function floorRamp(theme, value) {
+  const [mid, light, dark, lightest, darkest] = theme.floors;
+  const ramp = [darkest, dark, mid, light, lightest];
+  const spot = Math.max(0, Math.min(0.999, value)) * (ramp.length - 1);
+  const low = Math.floor(spot);
+  return mix(ramp[low], ramp[low + 1], spot - low);
+}
+
+/** Home pages of the nineties: raised tiles, dotted wallpaper and stray links. */
+function paintOldWebTile(ctx, px, py, theme, dice, tone) {
+  ctx.fillStyle = floorRamp(theme, 0.25 + tone * 0.5);
+  ctx.fillRect(px, py, BAKE, BAKE);
+  ctx.fillStyle = "rgba(255, 255, 255, 0.09)";
+  ctx.fillRect(px, py, BAKE - 1, 1);
+  ctx.fillRect(px, py, 1, BAKE - 1);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.2)";
+  ctx.fillRect(px, py + BAKE - 1, BAKE, 1);
+  ctx.fillRect(px + BAKE - 1, py, 1, BAKE);
+  ctx.fillStyle = "rgba(255, 255, 255, 0.07)";
+  ctx.fillRect(px + 4, py + 4, 1, 1);
+  ctx.fillRect(px + 11, py + 11, 1, 1);
+  const roll = dice();
+  if (roll < 0.05) {
+    ctx.fillStyle = "rgba(255, 217, 61, 0.7)";
+    ctx.fillRect(px + 7, py + 5, 1, 5);
+    ctx.fillRect(px + 5, py + 7, 5, 1);
+  } else if (roll < 0.09) {
+    // A link nobody has clicked since 1999.
+    ctx.fillStyle = "rgba(150, 200, 255, 0.4)";
+    ctx.fillRect(px + 3, py + 6, 9, 2);
+    ctx.fillRect(px + 3, py + 9, 9, 1);
   }
 }
 
-/** One signature of each chapter, scattered over the floor after it is laid. */
-function paintFloorDecor(ctx, x, y, theme, kind, random) {
-  const px = x + 2 + Math.floor(random() * 9);
-  const py = y + 2 + Math.floor(random() * 9);
-  if (kind === "oldweb") {
-    // The tiled stars every home page had.
-    ctx.fillStyle = "#ffd93d";
-    ctx.fillRect(px + 1, py, 1, 3);
-    ctx.fillRect(px, py + 1, 3, 1);
-  } else if (kind === "feed") {
-    ctx.fillStyle = "#ff6b9e";
-    ctx.fillRect(px, py, 2, 2);
-    ctx.fillRect(px + 3, py, 2, 2);
-    ctx.fillRect(px, py + 2, 5, 1);
-    ctx.fillRect(px + 1, py + 3, 3, 1);
-    ctx.fillRect(px + 2, py + 4, 1, 1);
-  } else if (kind === "cloud") {
-    ctx.fillStyle = "rgba(240, 248, 255, 0.7)";
-    ctx.fillRect(px, py + 1, 7, 2);
-    ctx.fillRect(px + 1, py, 4, 1);
-  } else if (kind === "datacenter") {
-    // Perforated raised-floor tiles.
-    ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
-    for (let row = 0; row < 3; row += 1) {
-      for (let column = 0; column < 3; column += 1) {
-        ctx.fillRect(x + 3 + column * 4, y + 3 + row * 4, 2, 2);
+/** The Feed underfoot: endless posts, each with an avatar, some words and a heart. */
+function paintFeedTile(ctx, x, y, px, py, theme, dice, tone) {
+  const column = Math.floor(x / 5);
+  const across = ((x % 5) + 5) % 5;
+  const down = ((((y + column * 2) % 4) + 4) % 4);
+  ctx.fillStyle = floorRamp(theme, 0.3 + tone * 0.28);
+  ctx.fillRect(px, py, BAKE, BAKE);
+  ctx.fillStyle = "rgba(255, 255, 255, 0.05)";
+  if (down === 0) ctx.fillRect(px, py, BAKE, 1);
+  if (across === 0) ctx.fillRect(px, py, 1, BAKE);
+  ctx.fillStyle = "rgba(4, 4, 14, 0.55)";
+  if (down === 3) ctx.fillRect(px, py + BAKE - 2, BAKE, 2);
+  if (across === 4) ctx.fillRect(px + BAKE - 2, py, 2, BAKE);
+  if (down === 0 && across === 0) {
+    ctx.fillStyle = "rgba(127, 159, 255, 0.28)";
+    ctx.fillRect(px + 4, py + 4, 7, 7);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.18)";
+    ctx.fillRect(px + 6, py + 5, 3, 3);
+  } else if (down === 0 && across === 1) {
+    ctx.fillStyle = "rgba(205, 210, 245, 0.24)";
+    ctx.fillRect(px, py + 5, BAKE - 2, 2);
+  } else if (down === 1 || down === 2) {
+    ctx.fillStyle = "rgba(205, 210, 245, 0.11)";
+    const long = across < 4 ? BAKE : 6 + Math.floor(dice() * 8);
+    ctx.fillRect(px, py + 4, long, 2);
+    ctx.fillRect(px, py + 10, across < 4 ? BAKE : 4, 2);
+  } else if (down === 3 && across === 0) {
+    ctx.fillStyle = "rgba(255, 107, 158, 0.42)";
+    ctx.fillRect(px + 4, py + 4, 2, 2);
+    ctx.fillRect(px + 7, py + 4, 2, 2);
+    ctx.fillRect(px + 4, py + 6, 5, 1);
+    ctx.fillRect(px + 5, py + 7, 3, 1);
+    ctx.fillRect(px + 6, py + 8, 1, 1);
+  } else if (down === 3 && across === 1) {
+    ctx.fillStyle = "rgba(255, 107, 158, 0.3)";
+    ctx.fillRect(px, py + 5, 6, 2);
+  }
+}
+
+/** Standing on a cloud: no tiles at all, only soft banks of white. */
+function paintCloudTile(ctx, px, py, theme, wide, fine) {
+  const step = 4;
+  for (let row = 0; row < BAKE; row += step) {
+    for (let col = 0; col < BAKE; col += step) {
+      const big = wide((px + col) / 70, (py + row) / 70);
+      const small = fine((px + col) / 22, (py + row) / 22);
+      const value = big * 0.72 + small * 0.28;
+      ctx.fillStyle = floorRamp(theme, value * 0.85);
+      ctx.fillRect(px + col, py + row, step, step);
+      if (value > 0.6) {
+        ctx.fillStyle = `rgba(255, 255, 255, ${Math.min(0.34, (value - 0.6) * 1.5)})`;
+        ctx.fillRect(px + col, py + row, step, step);
       }
     }
-  } else {
-    // Circuit traces running through black glass.
-    ctx.fillStyle = "#ff4f6a";
-    ctx.fillRect(px, py, 6, 1);
-    ctx.fillRect(px + 5, py, 1, 4);
-    ctx.fillRect(px + 5, py + 3, 3, 1);
   }
 }
 
-function paintWallFace(ctx, x, y, theme, kind, random) {
+/** Raised floor: panels two tiles wide, some of them perforated, all of them screwed down. */
+function paintRackFloorTile(ctx, x, y, px, py, theme, seed) {
+  const panelX = Math.floor(x / 2);
+  const panelY = Math.floor(y / 2);
+  const panel = tileDice(seed, panelX, panelY, 0xbeef);
+  const across = ((x % 2) + 2) % 2;
+  const down = ((y % 2) + 2) % 2;
+  ctx.fillStyle = floorRamp(theme, 0.3 + panel() * 0.32);
+  ctx.fillRect(px, py, BAKE, BAKE);
+  const vented = panel() < 0.3;
+  if (vented) {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+    for (let row = 2; row < BAKE; row += 4) {
+      for (let col = 2; col < BAKE; col += 4) ctx.fillRect(px + col, py + row, 2, 2);
+    }
+  }
+  ctx.fillStyle = "rgba(255, 255, 255, 0.07)";
+  if (down === 0) ctx.fillRect(px, py, BAKE, 1);
+  if (across === 0) ctx.fillRect(px, py, 1, BAKE);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+  if (down === 1) ctx.fillRect(px, py + BAKE - 1, BAKE, 1);
+  if (across === 1) ctx.fillRect(px + BAKE - 1, py, 1, BAKE);
+  ctx.fillStyle = "rgba(180, 190, 200, 0.4)";
+  ctx.fillRect(across === 0 ? px + 2 : px + BAKE - 4, down === 0 ? py + 2 : py + BAKE - 4, 2, 2);
+}
+
+/** Black glass with something moving behind it. */
+function paintCoreTile(ctx, x, y, px, py, theme, tone) {
+  ctx.fillStyle = floorRamp(theme, tone * 0.5);
+  ctx.fillRect(px, py, BAKE, BAKE);
+  const sheen = (((x + y) % 9) + 9) % 9;
+  if (sheen < 2) {
+    ctx.fillStyle = "rgba(255, 200, 215, 0.035)";
+    ctx.fillRect(px, py, BAKE, BAKE);
+  }
+  ctx.fillStyle = "rgba(255, 79, 106, 0.1)";
+  if (((x % 3) + 3) % 3 === 0) ctx.fillRect(px, py, 1, BAKE);
+  if (((y % 3) + 3) % 3 === 0) ctx.fillRect(px, py, BAKE, 1);
+}
+
+/** Traces run from room to room under the glass, turning only at right angles. */
+function paintCoreTraces(ctx, config, open, seed, life) {
+  const rows = config.tiles;
+  const dice = tileDice(seed, 7, 11, 0xc0de);
+  const count = Math.round((rows.length * rows[0].length) / 70);
+  for (let trace = 0; trace < count; trace += 1) {
+    let x = Math.floor(dice() * rows[0].length);
+    let y = Math.floor(dice() * rows.length);
+    if (!open(x, y)) continue;
+    let px = x * BAKE + 8;
+    let py = y * BAKE + 8;
+    let horizontal = dice() < 0.5;
+    for (let leg = 0; leg < 4; leg += 1) {
+      const sign = dice() < 0.5 ? -1 : 1;
+      const length = 1 + Math.floor(dice() * 4);
+      for (let step = 0; step < length; step += 1) {
+        const nx = x + (horizontal ? sign : 0);
+        const ny = y + (horizontal ? 0 : sign);
+        if (!open(nx, ny)) break;
+        ctx.fillStyle = "rgba(255, 79, 106, 0.07)";
+        if (horizontal) ctx.fillRect(Math.min(px, px + sign * BAKE), py - 1, BAKE, 3);
+        else ctx.fillRect(px - 1, Math.min(py, py + sign * BAKE), 3, BAKE);
+        ctx.fillStyle = "rgba(255, 110, 135, 0.24)";
+        if (horizontal) ctx.fillRect(Math.min(px, px + sign * BAKE), py, BAKE, 1);
+        else ctx.fillRect(px, Math.min(py, py + sign * BAKE), 1, BAKE);
+        x = nx;
+        y = ny;
+        px += horizontal ? sign * BAKE : 0;
+        py += horizontal ? 0 : sign * BAKE;
+      }
+      ctx.fillStyle = "rgba(255, 143, 160, 0.42)";
+      ctx.fillRect(px - 1, py - 1, 3, 3);
+      if (life.length < LIFE_LIMIT) {
+        life.push({ x: px - 1, y: py - 1, w: 3, h: 3, color: "#ff8fa0", phase: dice() * TAU, speed: 1.5 + dice() * 2 });
+      }
+      horizontal = !horizontal;
+    }
+  }
+}
+
+function dot(ctx, x, y, size, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x - size / 2), Math.round(y - size / 2), size, size);
+}
+
+function ring(ctx, cx, cy, rx, ry, color, size = 2, dash = 0) {
+  const steps = Math.max(24, Math.round((rx + ry) * 1.6));
+  for (let step = 0; step < steps; step += 1) {
+    if (dash && step % (dash * 2) >= dash) continue;
+    const angle = (step / steps) * TAU;
+    dot(ctx, cx + Math.cos(angle) * rx, cy + Math.sin(angle) * ry, size, color);
+  }
+}
+
+/** Something on the floor of each big room, so that no two look like the same hall. */
+function paintEmblem(ctx, kind, room, dice) {
+  const cx = (room.x + room.w / 2) * BAKE;
+  const cy = (room.y + room.h / 2) * BAKE;
+  const radius = Math.min(room.w, room.h) * BAKE * 0.3;
+  if (kind === "oldweb") {
+    // The spinning globe from every "best viewed in" badge.
+    const color = "rgba(255, 233, 150, 0.15)";
+    ring(ctx, cx, cy, radius, radius, color);
+    ring(ctx, cx, cy, radius * 0.5, radius, color);
+    for (const height of [-0.5, 0, 0.5]) {
+      const half = radius * Math.sqrt(1 - height * height);
+      for (let across = -half; across <= half; across += 3) dot(ctx, cx + across, cy + height * radius, 2, color);
+    }
+    for (let down = -radius; down <= radius; down += 3) dot(ctx, cx, cy + down, 2, color);
+  } else if (kind === "feed") {
+    const color = "rgba(255, 107, 158, 0.2)";
+    for (let step = 0; step < 150; step += 1) {
+      const angle = (step / 150) * TAU;
+      const hx = 16 * Math.sin(angle) ** 3;
+      const hy = -(13 * Math.cos(angle) - 5 * Math.cos(2 * angle) - 2 * Math.cos(3 * angle) - Math.cos(4 * angle));
+      dot(ctx, cx + (hx * radius) / 16, cy + (hy * radius) / 16, 3, color);
+    }
+  } else if (kind === "cloud") {
+    const color = "rgba(255, 255, 255, 0.24)";
+    ring(ctx, cx, cy, radius, radius, color, 2, 4);
+    ring(ctx, cx, cy, radius * 0.66, radius * 0.66, color, 2);
+    for (let ray = 0; ray < 12; ray += 1) {
+      const angle = (ray / 12) * TAU;
+      for (let reach = 0.74; reach < 0.94; reach += 0.05) {
+        dot(ctx, cx + Math.cos(angle) * radius * reach, cy + Math.sin(angle) * radius * reach, 2, color);
+      }
+    }
+  } else if (kind === "datacenter") {
+    // Keep out: the square around whatever used to stand here.
+    const left = cx - radius;
+    const top = cy - radius * 0.72;
+    const wide = radius * 2;
+    const tall = radius * 1.44;
+    const band = 5;
+    const stripe = (x, y, along) => {
+      ctx.fillStyle = Math.floor((x + y) / 6) % 2 ? "rgba(255, 200, 60, 0.26)" : "rgba(0, 0, 0, 0.24)";
+      ctx.fillRect(x, y, along ? 2 : band, along ? band : 2);
+    };
+    for (let x = left; x < left + wide; x += 2) {
+      stripe(x, top, true);
+      stripe(x, top + tall - band, true);
+    }
+    for (let y = top; y < top + tall; y += 2) {
+      stripe(left, y, false);
+      stripe(left + wide - band, y, false);
+    }
+  } else {
+    const color = "rgba(255, 79, 106, 0.15)";
+    ring(ctx, cx, cy, radius, radius * 0.56, color);
+    ring(ctx, cx, cy, radius * 0.42, radius * 0.42, color);
+    ring(ctx, cx, cy, radius * (dice() < 0.5 ? 0.14 : 0.18), radius * 0.36, "rgba(255, 140, 160, 0.26)", 3);
+  }
+}
+
+function paintWallFace(ctx, x, y, theme, kind, dice, life) {
   if (kind === "oldweb") {
     // Raised grey panels, the look of every button in 1997.
-    ctx.fillStyle = theme.wallFace[Math.floor(random() * theme.wallFace.length)];
+    ctx.fillStyle = theme.wallFace[Math.floor(dice() * theme.wallFace.length)];
     ctx.fillRect(x, y, BAKE, BAKE);
     ctx.fillStyle = "#f4f4f8";
     ctx.fillRect(x, y, BAKE - 1, 1);
@@ -181,56 +398,201 @@ function paintWallFace(ctx, x, y, theme, kind, random) {
     ctx.fillStyle = "#55555f";
     ctx.fillRect(x, y + BAKE - 1, BAKE, 1);
     ctx.fillRect(x + BAKE - 1, y, 1, BAKE);
-    return;
-  }
-  if (kind === "datacenter") {
-    // Rack fronts with a row of status lights.
-    ctx.fillStyle = theme.wallFace[Math.floor(random() * theme.wallFace.length)];
+    if (dice() < 0.12) {
+      ctx.fillStyle = "#2f6fe0";
+      ctx.fillRect(x + 3, y + 5, 10, 2);
+      ctx.fillRect(x + 3, y + 8, 7, 1);
+    }
+  } else if (kind === "datacenter") {
+    // Rack fronts with rows of status lights.
+    ctx.fillStyle = theme.wallFace[Math.floor(dice() * theme.wallFace.length)];
     ctx.fillRect(x, y, BAKE, BAKE);
     ctx.fillStyle = theme.wallRim;
     ctx.fillRect(x, y, BAKE, 1);
     for (let row = 0; row < 3; row += 1) {
       ctx.fillStyle = "#0c0e10";
       ctx.fillRect(x + 1, y + 2 + row * 5, BAKE - 2, 4);
-      ctx.fillStyle = random() > 0.2 ? "#4fe08a" : "#ffae5c";
-      ctx.fillRect(x + 2 + Math.floor(random() * 10), y + 3 + row * 5, 2, 1);
+      ctx.fillStyle = "#1f2428";
+      ctx.fillRect(x + 8, y + 3 + row * 5, 6, 2);
+      const ledX = x + 2 + Math.floor(dice() * 4);
+      const ledY = y + 3 + row * 5;
+      const color = dice() > 0.22 ? "#4fe08a" : "#ffae5c";
+      ctx.fillStyle = color;
+      ctx.fillRect(ledX, ledY, 2, 1);
+      if (life.length < LIFE_LIMIT && dice() < 0.5) {
+        life.push({ x: ledX, y: ledY, w: 2, h: 1, color: "#e8ffe8", phase: dice() * TAU, speed: 2 + dice() * 7 });
+      }
     }
-    return;
-  }
-  for (let row = 0; row < 3; row += 1) {
-    const top = y + row * 5 + 1;
-    const offset = row % 2 ? -4 : 0;
-    for (let column = -1; column < 3; column += 1) {
-      const left = x + column * 8 + offset;
-      ctx.fillStyle = theme.wallFace[Math.floor(random() * theme.wallFace.length)];
-      ctx.fillRect(Math.max(x, left), top, Math.min(7, x + BAKE - Math.max(x, left)), 4);
+  } else if (kind === "cloud") {
+    // Packed cloud rather than bricks.
+    ctx.fillStyle = theme.wallFace[1];
+    ctx.fillRect(x, y, BAKE, BAKE);
+    for (let puff = 0; puff < 4; puff += 1) {
+      ctx.fillStyle = theme.wallFace[Math.floor(dice() * theme.wallFace.length)];
+      const size = 5 + Math.floor(dice() * 5);
+      ctx.fillRect(x + Math.floor(dice() * (BAKE - size)), y + 2 + Math.floor(dice() * (BAKE - size - 2)), size, size - 1);
+    }
+    ctx.fillStyle = theme.wallRim;
+    ctx.fillRect(x, y, BAKE, 1);
+  } else {
+    for (let row = 0; row < 3; row += 1) {
+      const top = y + row * 5 + 1;
+      const offset = row % 2 ? -4 : 0;
+      for (let column = -1; column < 3; column += 1) {
+        const left = x + column * 8 + offset;
+        ctx.fillStyle = theme.wallFace[Math.floor(dice() * theme.wallFace.length)];
+        ctx.fillRect(Math.max(x, left), top, Math.min(7, x + BAKE - Math.max(x, left)), 4);
+      }
+    }
+    ctx.fillStyle = theme.wallRim;
+    ctx.fillRect(x, y, BAKE, 1);
+    if (life.length < LIFE_LIMIT && dice() < 0.1) {
+      ctx.fillStyle = theme.accent;
+      ctx.fillRect(x + 7, y + 5, 2, 6);
+      life.push({ x: x + 7, y: y + 5, w: 2, h: 6, color: theme.accent, phase: dice() * TAU, speed: 1 + dice() * 2 });
     }
   }
-  ctx.fillStyle = theme.wallRim;
-  ctx.fillRect(x, y, BAKE, 1);
+  // The foot of the wall is in its own shadow, which is what makes it stand up.
+  ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
+  ctx.fillRect(x, y + BAKE - 5, BAKE, 5);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+  ctx.fillRect(x, y + BAKE - 2, BAKE, 2);
 }
 
-function paintPillar(ctx, x, y, theme, random) {
+function paintPillar(ctx, x, y, theme, dice) {
   const size = BAKE * 2;
   ctx.fillStyle = "rgba(0, 0, 0, 0.4)";
   ctx.fillRect(x + 2, y + 6, size, size - 2);
   ctx.fillStyle = theme.pillarFace;
   ctx.fillRect(x, y + 8, size, size - 8);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+  ctx.fillRect(x + size - 7, y + 10, 7, size - 10);
+  ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
+  ctx.fillRect(x, y + 10, 4, size - 10);
   ctx.fillStyle = theme.pillarTop;
   ctx.fillRect(x, y - 2, size, 12);
-  ctx.fillStyle = "rgba(255, 255, 255, 0.22)";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.28)";
   ctx.fillRect(x, y - 2, size, 1);
   ctx.fillRect(x, y - 2, 1, 12);
   ctx.fillStyle = "rgba(0, 0, 0, 0.3)";
   ctx.fillRect(x, y + size - 3, size, 3);
   ctx.fillStyle = theme.accent;
-  ctx.globalAlpha = 0.5 + random() * 0.3;
+  ctx.globalAlpha = 0.55 + dice() * 0.3;
   ctx.fillRect(x + size / 2 - 1, y + 14, 2, 8);
   ctx.fillRect(x + size / 2 - 4, y + 17, 8, 2);
   ctx.globalAlpha = 1;
 }
 
-/** The whole floor baked once per dungeon; it never changes during a run. */
+/** Each chapter has its own idea of what is under the floor. */
+function paintPit(ctx, x, y, kind, dice, depth, noise) {
+  const px = x * BAKE;
+  const py = y * BAKE;
+  const fade = Math.min(1, depth / 3);
+  if (kind === "cloud") {
+    // Sky, a long way down, with weather of its own.
+    for (let row = 0; row < BAKE; row += 4) {
+      const lower = Math.min(1, (depth * BAKE + row) / (BAKE * 3));
+      for (let col = 0; col < BAKE; col += 4) {
+        const dither = (Math.floor((px + col) / 4) + Math.floor((py + row) / 4)) % 2 ? 0.03 : 0;
+        ctx.fillStyle = mix("#28507f", "#6ea6e0", Math.min(1, lower + dither));
+        ctx.fillRect(px + col, py + row, 4, 4);
+        const value = noise((px + col) / 30, (py + row) / 18);
+        if (value > 0.56) {
+          const white = Math.min(0.9, (value - 0.56) * 3.4) * (0.3 + lower * 0.7);
+          ctx.fillStyle = `rgba(250, 252, 255, ${white})`;
+          ctx.fillRect(px + col, py + row, 4, 4);
+        }
+      }
+    }
+  } else if (kind === "feed") {
+    // The posts carry on down there, getting harder to read.
+    ctx.fillStyle = "#07070f";
+    ctx.fillRect(px, py, BAKE, BAKE);
+    ctx.fillStyle = `rgba(90, 80, 170, ${0.2 - fade * 0.12})`;
+    ctx.fillRect(px + 1, py + 2, BAKE - 2, 5);
+    ctx.fillRect(px + 1, py + 9, BAKE - 2, 5);
+    if (dice() < 0.1) {
+      ctx.fillStyle = "rgba(255, 107, 158, 0.4)";
+      ctx.fillRect(px + 6, py + 5, 3, 3);
+    }
+  } else if (kind === "datacenter") {
+    // Under the raised floor: bundles of cable and the odd forgotten light.
+    ctx.fillStyle = "#06080a";
+    ctx.fillRect(px, py, BAKE, BAKE);
+    const colors = ["#2a5fa0", "#a08a2a", "#2a8a5a", "#70707c"];
+    for (let line = 0; line < 3; line += 1) {
+      ctx.fillStyle = colors[Math.floor(noise(y * 0.7 + line * 5, line + 2) * colors.length)];
+      ctx.globalAlpha = 0.5 - fade * 0.2;
+      ctx.fillRect(px, py + 3 + line * 4, BAKE, 2);
+      ctx.globalAlpha = 1;
+    }
+  } else if (kind === "core") {
+    // Whatever PGT runs on, and it is warm.
+    const heat = noise(px / 40, py / 40);
+    ctx.fillStyle = mix("#0c0204", "#4a0c18", heat * (0.4 + fade * 0.6));
+    ctx.fillRect(px, py, BAKE, BAKE);
+    if (dice() < 0.25) {
+      ctx.fillStyle = "rgba(255, 110, 90, 0.5)";
+      ctx.fillRect(px + Math.floor(dice() * 13), py + Math.floor(dice() * 13), 2, 2);
+    }
+  } else {
+    // Off the edge of the page.
+    ctx.fillStyle = "#050814";
+    ctx.fillRect(px, py, BAKE, BAKE);
+    if (dice() < 0.32) {
+      ctx.fillStyle = dice() < 0.2 ? "rgba(255, 233, 150, 0.8)" : "rgba(180, 210, 255, 0.6)";
+      ctx.fillRect(px + Math.floor(dice() * (BAKE - 2)), py + Math.floor(dice() * (BAKE - 2)), 1, 1);
+    }
+  }
+  if (depth === 0) {
+    // The edge of the floor above, and its shadow across the drop.
+    ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
+    ctx.fillRect(px, py, BAKE, 3);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.3)";
+    ctx.fillRect(px, py + 3, BAKE, 5);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.14)";
+    ctx.fillRect(px, py + 8, BAKE, 8);
+  }
+}
+
+/** Soft dark where the floor meets anything taller than it. */
+function paintContactShadows(ctx, width, height, open) {
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!open(x, y)) continue;
+      const px = x * BAKE;
+      const py = y * BAKE;
+      if (!open(x, y - 1)) {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.36)";
+        ctx.fillRect(px, py, BAKE, 4);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+        ctx.fillRect(px, py + 4, BAKE, 4);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.1)";
+        ctx.fillRect(px, py + 8, BAKE, 5);
+      }
+      if (!open(x, y + 1)) {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.24)";
+        ctx.fillRect(px, py + BAKE - 2, BAKE, 2);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.1)";
+        ctx.fillRect(px, py + BAKE - 5, BAKE, 3);
+      }
+      if (!open(x - 1, y)) {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.26)";
+        ctx.fillRect(px, py, 2, BAKE);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.12)";
+        ctx.fillRect(px + 2, py, 3, BAKE);
+      }
+      if (!open(x + 1, y)) {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.26)";
+        ctx.fillRect(px + BAKE - 2, py, 2, BAKE);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.12)";
+        ctx.fillRect(px + BAKE - 5, py, 3, BAKE);
+      }
+    }
+  }
+}
+
+/** The whole floor baked once per dungeon; it changes only when a wall gives way. */
 export function buildDungeonCanvas(config) {
   const rows = config?.tiles || [];
   const height = rows.length;
@@ -242,26 +604,55 @@ export function buildDungeonCanvas(config) {
   if (!ctx) return canvas;
   const theme = themeOf(config);
   const kind = config.theme || "oldweb";
-  const random = seededRandom(Number(config.map_id) || 1);
+  const seed = Number(config.map_id) || 1;
   const open = (x, y) => rows[y]?.[x] === "." || rows[y]?.[x] === "o";
+  const pit = (x, y) => rows[y]?.[x] === "_";
+  const wide = makeNoise(seed);
+  const fine = makeNoise(seed + 1);
+  const life = [];
 
   ctx.fillStyle = theme.wallTop;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  // First the floor, everywhere there is one.
   const pillars = [];
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
+      if (!open(x, y)) continue;
       const px = x * BAKE;
       const py = y * BAKE;
-      const tile = rows[y][x];
-      if (tile === "." || tile === "o") {
-        paintFloorTile(ctx, px, py, theme, random);
-        if (random() < 0.05) paintFloorDecor(ctx, px, py, theme, kind, random);
-        if (tile === "o" && rows[y][x - 1] !== "o" && rows[y - 1]?.[x] !== "o") {
-          pillars.push([px, py]);
-        }
-      } else if (open(x, y + 1)) {
-        paintWallFace(ctx, px, py, theme, kind, random);
+      const dice = tileDice(seed, x, y);
+      const tone = wide(x / 5, y / 5);
+      if (kind === "feed") paintFeedTile(ctx, x, y, px, py, theme, dice, tone);
+      else if (kind === "cloud") paintCloudTile(ctx, px, py, theme, wide, fine);
+      else if (kind === "datacenter") paintRackFloorTile(ctx, x, y, px, py, theme, seed);
+      else if (kind === "core") paintCoreTile(ctx, x, y, px, py, theme, tone);
+      else paintOldWebTile(ctx, px, py, theme, dice, tone);
+      if (rows[y][x] === "o" && rows[y][x - 1] !== "o" && rows[y - 1]?.[x] !== "o") pillars.push([px, py]);
+    }
+  }
+  // Then what is painted on it, which the walls below are free to cut off.
+  if (kind === "core") paintCoreTraces(ctx, config, open, seed, life);
+  (config.rooms || []).forEach((room, index) => {
+    if (Math.min(room.w, room.h) >= 8) paintEmblem(ctx, kind, room, tileDice(seed, index, 3, 0xe11));
+  });
+  // Then everything that is not floor.
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (open(x, y)) continue;
+      const px = x * BAKE;
+      const py = y * BAKE;
+      const dice = tileDice(seed, x, y, 0x77);
+      if (pit(x, y)) {
+        let depth = 0;
+        while (depth < 3 && pit(x, y - depth - 1)) depth += 1;
+        paintPit(ctx, x, y, kind, dice, depth, wide);
+        continue;
+      }
+      ctx.fillStyle = theme.wallTop;
+      ctx.fillRect(px, py, BAKE, BAKE);
+      if (open(x, y + 1) || pit(x, y + 1)) {
+        paintWallFace(ctx, px, py, theme, kind, dice, life);
       } else if (open(x, y - 1) || open(x - 1, y) || open(x + 1, y)) {
         ctx.fillStyle = theme.wallRim;
         ctx.globalAlpha = 0.55;
@@ -272,23 +663,29 @@ export function buildDungeonCanvas(config) {
       }
     }
   }
-
-  // Walls throw a soft shadow onto the floor they stand on.
-  for (let y = 1; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (open(x, y) && !open(x, y - 1)) {
-        ctx.fillStyle = "rgba(0, 0, 0, 0.3)";
-        ctx.fillRect(x * BAKE, y * BAKE, BAKE, 6);
-        ctx.fillStyle = "rgba(0, 0, 0, 0.16)";
-        ctx.fillRect(x * BAKE, y * BAKE + 6, BAKE, 5);
-      }
-    }
-  }
-  for (const [x, y] of pillars) paintPillar(ctx, x, y, theme, random);
+  paintContactShadows(ctx, width, height, open);
+  for (const [x, y] of pillars) paintPillar(ctx, x, y, theme, tileDice(seed, x, y, 0x99));
+  canvas.life = life;
   return canvas;
 }
 
-/** A tiny map of the floor: one pixel per tile, recoloured for the corner of the screen. */
+/** The little that moves in a baked floor: status lights, pulses in the traces. */
+export function drawFloorLife(ctx, life, scale, view, now) {
+  if (!life?.length) return;
+  const t = now / 1000;
+  for (const spark of life) {
+    const x = spark.x * scale;
+    const y = spark.y * scale;
+    if (x < view.left || x > view.right || y < view.top || y > view.bottom) continue;
+    const glow = Math.sin(t * spark.speed + spark.phase);
+    if (glow < 0.15) continue;
+    ctx.globalAlpha = glow * 0.85;
+    ctx.fillStyle = spark.color;
+    ctx.fillRect(x, y, spark.w * scale, spark.h * scale);
+  }
+  ctx.globalAlpha = 1;
+}
+
 export function buildMinimap(config) {
   const rows = config?.tiles || [];
   const canvas = document.createElement("canvas");
@@ -604,49 +1001,111 @@ export function drawPickups(ctx, pickups, now) {
   }
 }
 
-const SNOW = Array.from({ length: 70 }, (_, index) => {
+const MOTES = Array.from({ length: 64 }, (_, index) => {
   const random = seededRandom(index * 97 + 13);
-  return { x: random(), y: random(), speed: 0.3 + random() * 0.7, phase: random() * TAU };
+  return { x: random(), y: random(), speed: 0.3 + random() * 0.7, phase: random() * TAU, depth: 0.25 + random() * 0.75 };
 });
+const CLOUD_COUNT = 9;
+let cloudSprites = null;
 
-/** Screen-space weather: it hangs in front of everything and costs almost nothing. */
-export function drawWeather(ctx, config, width, height, now) {
+/** Lumps of white at a low resolution: scaled up, they read as pixel-art cloud. */
+function bakeClouds() {
+  return Array.from({ length: 3 }, (_, index) => {
+    const random = seededRandom(index * 41 + 5);
+    const canvas = document.createElement("canvas");
+    canvas.width = 64;
+    canvas.height = 22;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return canvas;
+    const lump = (fill, drop) => {
+      ctx.fillStyle = fill;
+      for (let puff = 0; puff < 7; puff += 1) {
+        const size = 6 + Math.floor(puff === 3 ? 12 : random() * 8);
+        const x = 4 + (puff / 6) * 44 + Math.floor(random() * 3);
+        const y = 18 - size + drop;
+        ctx.fillRect(x, y, size + 3, size);
+      }
+    };
+    lump("#b8cde4", 2);
+    lump("#ffffff", 0);
+    return canvas;
+  });
+}
+
+/**
+ * Weather hangs above the room and below the fog, so a room nobody has loaded yet
+ * has none. It leans a little against the camera, as anything between it and us would.
+ */
+export function drawWeather(ctx, config, width, height, now, camera = null) {
   const kind = themeOf(config).weather;
   const t = now / 1000;
+  const panX = (camera?.x || 0) * 0.00025;
+  const panY = (camera?.y || 0) * 0.00025;
+  const wrap = (value) => ((value % 1) + 1) % 1;
   ctx.save();
-  for (const flake of SNOW) {
-    let x = flake.x;
-    let y = flake.y;
-    let wide = 2;
-    let tall = 2;
-    if (kind === "hearts") {
-      x = flake.x + Math.sin(t * 0.5 + flake.phase) * 0.02;
-      y = flake.y - t * 0.05 * flake.speed + 4;
-      ctx.fillStyle = "rgba(255, 107, 158, 0.42)";
-      wide = 3;
-      tall = 3;
-    } else if (kind === "clouds") {
-      x = flake.x + t * 0.008 * flake.speed;
-      ctx.fillStyle = "rgba(240, 248, 255, 0.12)";
-      wide = 70;
-      tall = 18;
-    } else if (kind === "binary") {
-      y = flake.y + t * 0.16 * flake.speed;
-      ctx.fillStyle = "rgba(79, 224, 138, 0.3)";
-      wide = 2;
-      tall = 7;
-    } else if (kind === "glitch") {
-      const slot = Math.floor(t * 3 + flake.phase * 4);
-      x = (flake.x * 7.3 * (slot % 5 + 1)) % 1;
-      y = (flake.y * 5.1 * (slot % 7 + 1)) % 1;
-      ctx.fillStyle = slot % 3 ? "rgba(255, 79, 106, 0.28)" : "rgba(255, 255, 255, 0.1)";
-      wide = 26;
-      tall = 2;
-    } else {
-      x = flake.x + t * 0.004 * flake.speed;
-      ctx.fillStyle = `rgba(255, 217, 61, ${0.14 + Math.max(0, Math.sin(t * 2 + flake.phase)) * 0.4})`;
+  if (kind === "clouds") {
+    cloudSprites ??= bakeClouds();
+    ctx.imageSmoothingEnabled = false;
+    for (let index = 0; index < CLOUD_COUNT; index += 1) {
+      const mote = MOTES[index];
+      const scale = 2.4 + mote.depth * 2.6;
+      const sprite = cloudSprites[index % cloudSprites.length];
+      const spanX = width + sprite.width * scale * 2;
+      const x = wrap(mote.x + t * 0.006 * mote.speed - panX * mote.depth) * spanX - sprite.width * scale;
+      const y = wrap(mote.y - panY * mote.depth) * height;
+      ctx.globalAlpha = 0.05 + mote.depth * 0.09;
+      ctx.drawImage(sprite, x, y, sprite.width * scale, sprite.height * scale);
     }
-    ctx.fillRect(((x % 1) + 1) % 1 * width, ((y % 1) + 1) % 1 * height, wide, tall);
+    ctx.restore();
+    return;
+  }
+  for (const mote of MOTES) {
+    const px = (value) => wrap(value - panX * mote.depth) * width;
+    const py = (value) => wrap(value - panY * mote.depth) * height;
+    if (kind === "hearts") {
+      const x = px(mote.x + Math.sin(t * 0.5 + mote.phase) * 0.02);
+      const y = py(mote.y - t * 0.03 * mote.speed);
+      const size = mote.depth > 0.6 ? 2 : 1;
+      ctx.globalAlpha = 0.2 + mote.depth * 0.32;
+      ctx.fillStyle = "#ff6b9e";
+      ctx.fillRect(x, y, size * 2, size * 2);
+      ctx.fillRect(x + size * 3, y, size * 2, size * 2);
+      ctx.fillRect(x, y + size * 2, size * 5, size);
+      ctx.fillRect(x + size, y + size * 3, size * 3, size);
+      ctx.fillRect(x + size * 2, y + size * 4, size, size);
+    } else if (kind === "binary") {
+      // Warm dust going up from the racks, and the odd spark.
+      const x = px(mote.x + Math.sin(t * 0.7 + mote.phase) * 0.012);
+      const y = py(mote.y - t * 0.05 * mote.speed);
+      const spark = mote.phase > 5.2;
+      ctx.globalAlpha = spark ? 0.65 + Math.sin(t * 7 + mote.phase) * 0.3 : 0.1 + mote.depth * 0.14;
+      ctx.fillStyle = spark ? "#ffae5c" : "#c8d4cc";
+      ctx.fillRect(x, y, spark ? 2 : 3, spark ? 2 : 3);
+    } else if (kind === "glitch") {
+      // Embers, and now and then the picture slips.
+      const x = px(mote.x + Math.sin(t * 0.9 + mote.phase) * 0.01);
+      const y = py(mote.y - t * 0.07 * mote.speed);
+      ctx.globalAlpha = 0.25 + mote.depth * 0.4;
+      ctx.fillStyle = "#ff4f6a";
+      ctx.fillRect(x, y, 2, 2);
+      const slot = Math.floor(t * 2.2 + mote.phase * 5);
+      if (slot % 23 === 0) {
+        ctx.globalAlpha = 0.07;
+        ctx.fillStyle = slot % 2 ? "#ff4f6a" : "#ffffff";
+        ctx.fillRect(0, py(mote.x * 3 + slot * 0.37), width, 2 + mote.depth * 2);
+      }
+    } else {
+      // Twinkling stars, the kind that came with the wallpaper.
+      const x = px(mote.x + t * 0.003 * mote.speed);
+      const y = py(mote.y);
+      const twinkle = Math.max(0, Math.sin(t * (1 + mote.speed * 1.4) + mote.phase));
+      if (twinkle <= 0.05) continue;
+      ctx.globalAlpha = twinkle * (0.3 + mote.depth * 0.45);
+      ctx.fillStyle = "#ffe9a8";
+      const arm = twinkle > 0.7 ? 3 : 1;
+      ctx.fillRect(x - arm, y, arm * 2 + 1, 1);
+      ctx.fillRect(x, y - arm, 1, arm * 2 + 1);
+    }
   }
   ctx.restore();
 }
@@ -766,8 +1225,100 @@ const SPRITES = {
   },
 };
 
+// Quest creatures: each belongs to one stage's problem.
+Object.assign(SPRITES, {
+  worker: {
+    colors: { g: "#7fe0a8", d: "#3a9a68", k: "#0c1a12", w: "#ffffff" },
+    art: ["...g....", "...gg...", "..gggggg", ".gggwwgg", ".ggwkwgg", "gggwwggg", "gggggggg", "dggggggg", ".ddggggg", "..d..d.g", "..d...d."],
+  },
+  leak: {
+    colors: { a: "#5fd0ff", b: "#2f8ab8", c: "#bff0ff", k: "#06202c" },
+    art: ["....aaaa", "..aaaaaa", ".aacaaaa", ".acaaaaa", "aaaakkaa", "aaaakkaa", "aaaaaaaa", "aaaaaaab", ".aaaaabb", ".baaaabb", "..bbbbbb", "...b.b.b"],
+  },
+  phish: {
+    colors: { a: "#d9a441", b: "#8a5a2a", c: "#5a3a18", w: "#ffffff", r: "#ff5a4f", k: "#1a0c08" },
+    art: ["bbbbbbbb", "baaaaaaa", "bkkkkkkk", "bwkwkwkw", "bkkrkkkk", "bwkwkwkw", "bkkkkkkk", "baaaaaaa", "bbbbbbbb", "bbbbaacc", ".cc....c"],
+  },
+});
+
+Object.assign(SPRITES, {
+  ratebot: {
+    colors: { a: "#c86bff", b: "#7a3aa8", k: "#14081e", r: "#ff5a4f" },
+    art: ["....b...", "...aaaaa", "..aaaaaa", "..akkaaa", "..arkaaa", "..aaaaaa", "...bbbbb", "....b..b"],
+  },
+  hotrack: {
+    colors: { a: "#4a3a30", b: "#2c2320", g: "#ffae5c", o: "#ff7a3c", r: "#ff5a4f" },
+    art: SPRITES.rack.art,
+  },
+  failtest: {
+    colors: { r: "#ff4f6a", k: "#1a0a10" },
+    art: ["rrkkkkkk", "krrkkkkk", "kkrrkkkk", "kkkrrkkk", "kkkkrrkk", "kkkkkrrr", "kkkkkrrr", "kkkkrrkk", "kkkrrkkk", "kkrrkkkk", "krrkkkkk", "rrkkkkkk"],
+  },
+  letter: {
+    colors: { w: "#f4f2fa", g: "#a9a6b8" },
+    art: ["wwwwwwww", "gwwwwwww", "wgwwwwww", "wwgwwwww", "wwwgwwww", "wwwwgwww", "wwwwwggg", "wwwwwwww", "wwwwwwww"],
+  },
+});
+
+Object.assign(SPRITES, {
+  flashintro: {
+    colors: { k: "#1a1208", r: "#e8402f", o: "#ff9a2f", w: "#f4f4fa", g: "#7a7a88" },
+    art: [
+      "gggggggggggg", "gkkkkkkkkkkk", "gkkkkrrkkkkk", "gkkkrrrrkkkk", "gkkkrroorkkk", "gkkrrkkoorkk",
+      "gkkrrkkkrrkk", "gkkkrrkkrrkk", "gkkkkrrrrkkk", "gkkkkkrrkkkk", "gkkkkkkkkkkk", "ggggggggggggg",
+      "gwwwwwwwwkkk", "gooooowwwkkk", "ggggggggggggg",
+    ],
+  },
+  influencer: {
+    colors: { s: "#f2c9a0", h: "#ff6b9e", k: "#1a0a14", w: "#ffffff", p: "#c23d78", y: "#ffd93d" },
+    art: [
+      "...yy..hhhh.", "...yy.hhhhhh", "......hhhhhh", ".....hhsssss", ".....hsksksk", ".....hssssss",
+      ".....hssswww", "......ssssss", "....pppppppp", "...ppppppppp", "..ppwppppppp", "..ppppppppps", "...ppppppps", "...pppppppp", "...pp....pp",
+    ],
+  },
+  follower: {
+    colors: { a: "#ffb3cf", b: "#d97ba0", k: "#3a0f22" },
+    art: ["...aaaa", "..aaaaa", ".aakaak", ".aaaaaa", "..aaaaa", "...bbbb", "..bbbbb", "..bb.bb"],
+  },
+  duplicate: {
+    colors: { a: "#9fd4ff", b: "#5f9fd8", w: "#eef6ff", k: "#12283c" },
+    art: [
+      ".....bbbbbbb", "....bwwwwwwb", "...bbwwwwwwb", "..aaaaaaaaab", "..awwwwwwwab", "..awkkwkkwab",
+      "..awwwwwwwab", "..awkkkkkwab", "..awwwwwwwab", "..awkkwkkwab", "..awwwwwwwab", "..aaaaaaaaab", "...bbbbbbbbb",
+    ],
+  },
+  hotserver: {
+    colors: { a: "#4a3a30", b: "#2c2320", o: "#ff7a3c", y: "#ffd27a", r: "#ff4f3a" },
+    art: [
+      "...y..o..y..", "..o..yy..o..", "..aaaaaaaaaa", "..abbbbbbbba", "..abrrbbyyba", "..abbbbbbbba",
+      "..aaaaaaaaaa", "..abbbbbbbba", "..aboobboora", "..abbbbbbbba", "..aaaaaaaaaa", "..abbbbbbbba",
+      "..abyybbrrba", "..abbbbbbbba", "..aaaaaaaaaa", "..bb......bb",
+    ],
+  },
+  reviewer: {
+    colors: { s: "#e6c9a0", h: "#3a3a4a", k: "#10101a", w: "#ffffff", y: "#ffe07a", c: "#2a2a3a" },
+    art: [
+      "......hhhhhh", ".....hhhhhhh", ".....hssssss", ".....kkkskkk", ".....kwkkkwk", ".....hsssssk",
+      ".....hsskkss", "......ssssss", "....cccccccc", "...ccccyyccc", "..cccccyyccc", "..ss.ccccccc", "..yy.ccccccc", "..yy.cccccc.", ".....cc..cc.",
+    ],
+  },
+  clone: {
+    colors: { a: "#9fe8ff", b: "#5fb8d8", w: "#f0fcff", k: "#123040" },
+    art: ["....aaa.", "...aaaa.", "..aaaaaa", ".bbbbbbb", "....wwww", "....wkwk", "....wwww", "..aaaaaa", ".aaaaaaa", ".aaaaaaa", "..aaaaaa", "..aa..aa"],
+  },
+  dummy: {
+    colors: { a: "#c9b48a", b: "#8f7c58", r: "#e8402f", w: "#f4f2e8" },
+    art: ["....aaaa", "...aaaaa", "...aaaaa", "....aaaa", "bbb.bbbb", "bbbbaaaa", "...aaaaa", "...awwww", "...awrrw", "...awwww", "...aaaaa", "....bbbb", "....bbbb", "...bbbbb"],
+  },
+  dummy_walker: {
+    colors: { a: "#8ac9b4", b: "#588f7c", r: "#e8402f", w: "#f4f2e8", k: "#333333" },
+    art: ["....aaaa", "...aaaaa", "...aaaaa", "....aaaa", "bbb.bbbb", "bbbbaaaa", "...aaaaa", "...awwww", "...awrrw", "...awwww", "...aaaaa", "....bbbb", "...kkkkk", "..k.k.k."],
+  },
+});
+
 // Her copies must not be told apart by eye: that is what enemies() is for.
 SPRITES.nullecho = SPRITES.nullqueen;
+SPRITES.dupe = SPRITES.duplicate;
 
 const spriteCache = new Map();
 
@@ -797,7 +1348,16 @@ function bakeSprite(kind) {
       flashCtx.fillRect(half * 2 - 1 - x, y, 1, 1);
     }
   });
-  const sprite = { canvas, flash, width: canvas.width, height: canvas.height };
+  // A dark rim all round, so that nobody gets lost against a busy floor.
+  const outline = document.createElement("canvas");
+  outline.width = canvas.width + 2;
+  outline.height = canvas.height + 2;
+  const outlineCtx = outline.getContext("2d");
+  for (const [x, y] of [[0, 1], [2, 1], [1, 0], [1, 2]]) outlineCtx.drawImage(flash, x, y);
+  outlineCtx.globalCompositeOperation = "source-in";
+  outlineCtx.fillStyle = "#07060c";
+  outlineCtx.fillRect(0, 0, outline.width, outline.height);
+  const sprite = { canvas, flash, outline, width: canvas.width, height: canvas.height };
   spriteCache.set(kind, sprite);
   return sprite;
 }
@@ -806,9 +1366,36 @@ function spriteFor(kind) {
   return spriteCache.get(kind) || bakeSprite(kind);
 }
 
+/** What a creature is made of, for the bits that fly off when it goes. */
+export function spriteColors(kind) {
+  return Object.values((SPRITES[kind] || SPRITES.popup).colors);
+}
+
 export function hasSprite(kind) {
   return Boolean(SPRITES[kind]);
 }
+
+/** A creature for the handbook, in a square; someone not yet met is only an outline. */
+export function paintSprite(canvas, kind, locked = false) {
+  const sprite = spriteFor(kind);
+  const size = Math.max(sprite.width, sprite.height) + 2;
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.imageSmoothingEnabled = false;
+  const x = Math.floor((size - sprite.width) / 2);
+  const y = Math.floor((size - sprite.height) / 2);
+  ctx.drawImage(locked ? sprite.flash : sprite.canvas, x, y);
+  if (locked) {
+    ctx.globalCompositeOperation = "source-in";
+    ctx.fillStyle = "#2a2d3a";
+    ctx.fillRect(0, 0, size, size);
+    ctx.globalCompositeOperation = "source-over";
+  }
+}
+
+const ARRIVAL_TIME = 550;
 
 /** Draw one monster at its feet. `visual` carries the smoothed position and flashes. */
 /** The bubble a boss hides in while its bug stands unrepaired. */
@@ -829,6 +1416,29 @@ function drawGateShield(ctx, radius, t) {
   ctx.globalAlpha = 1;
 }
 
+const ELITE_AURA = {
+  legacy: "#c9a26b",
+  hotfix: "#7fe0a8",
+  fork: "#b18cff",
+  prod: "#ff7a5a",
+  async: "#6fd3ff",
+  deprecated: "#ffd86b",
+};
+
+/** An elite is the same bug with a ring around it: the ring is how you notice in a crowd. */
+function drawEliteAura(ctx, kind, radius, t) {
+  ctx.save();
+  ctx.globalAlpha = 0.55 + Math.sin(t * 5) * 0.2;
+  ctx.strokeStyle = ELITE_AURA[kind] || "#ffffff";
+  ctx.lineWidth = 2.5;
+  ctx.setLineDash([radius * 0.5, radius * 0.3]);
+  ctx.lineDashOffset = -t * 30;
+  ctx.beginPath();
+  ctx.arc(0, -radius * 0.2, radius * 1.45, 0, TAU);
+  ctx.stroke();
+  ctx.restore();
+}
+
 export function drawMonster(ctx, visual, now) {
   const data = visual.data;
   const radius = Number(data.r) || 18;
@@ -838,30 +1448,74 @@ export function drawMonster(ctx, visual, now) {
   const width = sprite.width * scale;
   const height = sprite.height * scale;
   const state = data.state;
-  const bob = Math.sin(t * 7 + data.id) * 2;
+  const walking = (visual.pace || 0) > 14 && state !== "dash";
+  const beat = t * 9 + data.id;
+  const hop = walking ? Math.abs(Math.sin(beat)) * radius * 0.2 : 0;
+  // Breathing when still, and a little give every time it lands.
+  const squash = walking ? 1 - Math.abs(Math.cos(beat)) * 0.07 : 1 + Math.sin(t * 2.6 + data.id) * 0.025;
+  const lean = Math.max(-0.18, Math.min(0.18, (visual.dirX || 0) / 560));
   const shaking = state === "aim" || state === "windup" || state === "slam" || state === "deploy";
   const jitter = shaking ? Math.sin(t * 60) * 2 : 0;
   const stretch = state === "dash" ? 1.14 : 1;
   const flip = Math.cos(Number(data.aim) || 0) < 0 ? -1 : 1;
+  const feet = radius * 0.86;
+  const age = (now - (visual.born ?? now)) / ARRIVAL_TIME;
+  const arriving = Boolean(data.arriving) && age < 1;
 
   ctx.save();
   ctx.translate(visual.x + jitter, visual.y);
-  ctx.fillStyle = "rgba(0, 0, 0, 0.4)";
+  if (radius >= 34) {
+    // Something this big lights the floor it stands on.
+    const pulse = 0.2 + Math.sin(t * 2.4) * 0.06;
+    const glow = ctx.createRadialGradient(0, feet * 0.8, 2, 0, feet * 0.8, radius * 2.1);
+    glow.addColorStop(0, `rgba(255, 90, 110, ${pulse})`);
+    glow.addColorStop(1, "rgba(255, 90, 110, 0)");
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.ellipse(0, feet * 0.8, radius * 2.1, radius * 1.2, 0, 0, TAU);
+    ctx.fill();
+  }
+  ctx.fillStyle = `rgba(0, 0, 0, ${0.42 - (hop / (radius * 0.2 + 1)) * 0.12})`;
   ctx.beginPath();
-  ctx.ellipse(0, radius * 0.72, radius * 0.95, radius * 0.38, 0, 0, TAU);
+  ctx.ellipse(0, radius * 0.72, radius * (0.95 - hop * 0.008), radius * 0.36, 0, 0, TAU);
   ctx.fill();
 
-  if (data.arriving) ctx.globalAlpha = 0.4 + Math.sin(t * 30) * 0.2;
-  ctx.scale(flip, 1);
+  ctx.save();
+  ctx.translate(0, feet - hop);
+  ctx.rotate(lean);
+  ctx.scale(flip * (stretch + (1 - squash) * 0.6), squash);
   ctx.imageSmoothingEnabled = false;
-  const left = (-width * stretch) / 2;
-  const top = radius * 0.86 - height + (state === "dash" ? 0 : bob * 0.5);
-  ctx.drawImage(sprite.canvas, left, top, width * stretch, height);
-  const flashing = Math.max(visual.hurt * 3.4, shaking ? 0.35 : 0, state === "dizzy" ? 0.25 : 0);
-  if (flashing > 0) {
-    ctx.globalAlpha = Math.min(0.9, flashing);
-    ctx.drawImage(sprite.flash, left, top, width * stretch, height);
+  const left = -width / 2;
+  const top = -height;
+  if (arriving) {
+    // It loads from the feet up, like everything else on this network.
+    const shown = Math.max(1, Math.ceil(sprite.height * Math.max(0.04, age)));
+    const part = (shown / sprite.height) * height;
+    ctx.drawImage(sprite.canvas, 0, sprite.height - shown, sprite.width, shown, left, -part, width, part);
+    ctx.fillStyle = "#9ff0c0";
+    ctx.globalAlpha = 0.8 * (1 - age);
+    ctx.fillRect(left - 3, -part - 2, width + 6, 3);
+    ctx.globalAlpha = 1;
+  } else {
+    ctx.drawImage(
+      sprite.outline,
+      left - scale,
+      top - scale,
+      (sprite.width + 2) * scale,
+      (sprite.height + 2) * scale,
+    );
+    ctx.drawImage(sprite.canvas, left, top, width, height);
+    const flashing = Math.max(visual.hurt * 3.4, shaking ? 0.35 : 0, state === "dizzy" ? 0.25 : 0);
+    if (flashing > 0) {
+      ctx.globalAlpha = Math.min(0.9, flashing);
+      ctx.drawImage(sprite.flash, left, top, width, height);
+      ctx.globalAlpha = 1;
+    }
   }
+  ctx.restore();
+
+  ctx.scale(flip, 1);
+  if (data.elite) drawEliteAura(ctx, data.elite, radius, t);
   if (data.shielded) drawGateShield(ctx, radius, t);
   drawRoleMarks(ctx, data, radius, t);
   ctx.restore();

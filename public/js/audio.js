@@ -1,5 +1,16 @@
 /* Tiny procedural soundscape built with the Web Audio API. No assets needed. */
 
+const BLIP_GAP = 62;
+const BLIP_TIME = 0.06;
+const BLIP_LEVEL = 0.1;
+const BLIP_TONE = 2600;
+const SOFT_GAP = 95;
+const SOFT_TIME = 0.24;
+const SOFT_RISE = 0.016;
+const SOFT_TAIL = 0.002;
+const SOFT_LEVEL = 0.15;
+const SOFT_SCALE = [0, 2, 4, 7, 9];
+
 export class SoundEngine {
   constructor(enabled = true) {
     this.enabled = enabled;
@@ -108,6 +119,59 @@ export class SoundEngine {
     envelope.connect(this.master);
     source.start(start);
     source.stop(start + duration);
+  }
+
+  /** Someone talking, one syllable at a time: letters come faster than a voice would. */
+  blip(frequency, volume = 1) {
+    if (!this.enabled) return;
+    const ctx = this.ensure();
+    if (!ctx || ctx.state !== "running") return;
+    if (this.throttle("blip", BLIP_GAP)) return;
+    const now = ctx.currentTime;
+    const pitch = frequency * (0.94 + Math.random() * 0.12);
+    const level = BLIP_LEVEL * volume;
+    const osc = ctx.createOscillator();
+    const filter = ctx.createBiquadFilter();
+    const envelope = ctx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(pitch, now);
+    osc.frequency.exponentialRampToValueAtTime(pitch * 0.84, now + BLIP_TIME);
+    filter.type = "lowpass";
+    filter.frequency.value = BLIP_TONE;
+    envelope.gain.setValueAtTime(0.0001, now);
+    envelope.gain.linearRampToValueAtTime(level, now + 0.005);
+    envelope.gain.setValueAtTime(level, now + BLIP_TIME * 0.45);
+    envelope.gain.exponentialRampToValueAtTime(0.0005, now + BLIP_TIME);
+    osc.connect(filter);
+    filter.connect(envelope);
+    envelope.connect(this.master);
+    osc.start(now);
+    osc.stop(now + BLIP_TIME + 0.01);
+  }
+
+  /**
+   * A gentler voice: one pure note that swells and fades, with no edge to it at all.
+   * The notes wander along a pentatonic scale, where no two of them can clash.
+   */
+  softBlip(frequency, volume = 1) {
+    if (!this.enabled) return;
+    const ctx = this.ensure();
+    if (!ctx || ctx.state !== "running") return;
+    if (this.throttle("blip", SOFT_GAP)) return;
+    const step = Math.random() < 0.5 ? -1 : 1;
+    this.softNote = Math.max(0, Math.min(SOFT_SCALE.length - 1, (this.softNote ?? 2) + step));
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const envelope = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = frequency * 2 ** (SOFT_SCALE[this.softNote] / 12);
+    envelope.gain.setValueAtTime(0.0001, now);
+    envelope.gain.linearRampToValueAtTime(SOFT_LEVEL * volume, now + SOFT_RISE);
+    envelope.gain.exponentialRampToValueAtTime(SOFT_TAIL, now + SOFT_TIME);
+    osc.connect(envelope);
+    envelope.connect(this.master);
+    osc.start(now);
+    osc.stop(now + SOFT_TIME + 0.01);
   }
 
   play(name) {
