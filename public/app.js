@@ -732,6 +732,7 @@ function handleState(message) {
   client.workshop = message.workshop || null;
   client.life = message.life || null;
   client.bossMoves = message.boss_moves || [];
+  client.fields = message.fields || [];
   if (client.story) {
     client.closedDoors = new Set(client.story.doors.map(([x, y]) => `${x},${y}`));
     story.updateHud(message, client.selfId);
@@ -1189,6 +1190,7 @@ function enterDungeon(message) {
   client.terrainState = null;
   client.workshop = null;
   client.bossMoves = [];
+  client.fields = [];
   client.life = null;
   client.story = null;
   client.role = String(message.role || "");

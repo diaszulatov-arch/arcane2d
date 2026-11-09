@@ -94,7 +94,9 @@ const kinds = [
   ...new Set([...handler.matchAll(/event\.kind === "([a-z_]+)"/g)].map((match) => match[1])),
 ];
 
-const { config, snapshot } = JSON.parse(readFileSync(0, "utf8"));
+const { config, snapshot, monsters: foeEntries = [], fields: foeFields = [] } = JSON.parse(readFileSync(0, "utf8"));
+const { drawCapsShot, drawFields, drawFoeMarks } = await import("../public/js/foe-art.js");
+const { drawMonster, paintSprite } = await import("../public/js/dungeon-art.js");
 const me = snapshot.players[0];
 const point = (x, y) => Object.assign([x, y], { x, y });
 
@@ -209,6 +211,31 @@ for (const quality of ["2", "1", "0"]) {
   }
 }
 
+// Every new creature as the server really reports it, and what it leaves on the floor.
+const visuals = new Map(
+  foeEntries.map((data, index) => [data.id + index * 1000, { data, x: data.x, y: data.y, hurt: 0, pace: 20, born: 0 }]),
+);
+const canvas = fakeCanvas();
+const ctx = canvas.getContext();
+for (const age of AGES) {
+  now += 400;
+  for (const visual of visuals.values()) {
+    attempt(`draw ${visual.data.kind}`, () => drawMonster(ctx, visual, now));
+    attempt(`sprite ${visual.data.kind}`, () => paintSprite(fakeCanvas(), visual.data.kind));
+    attempt(`locked ${visual.data.kind}`, () => paintSprite(fakeCanvas(), visual.data.kind, true));
+  }
+  attempt("the marks", () => drawFoeMarks(ctx, visuals, now));
+  attempt("the floor", () => drawFields(ctx, foeFields.map((field) => ({ ...field, ttl: age })), now));
+  attempt("a capital letter", () => drawCapsShot(ctx, { x: 1, y: 2, data: { radius: 24 } }, "#ff7a5a"));
+  frames += 1;
+}
+
 console.log(
-  JSON.stringify({ frames, events: names.length, failures: Object.fromEntries(failures) }),
+  JSON.stringify({
+    frames,
+    events: names.length,
+    foes: visuals.size,
+    field_kinds: new Set(foeFields.map((field) => field.k)).size,
+    failures: Object.fromEntries(failures),
+  }),
 );

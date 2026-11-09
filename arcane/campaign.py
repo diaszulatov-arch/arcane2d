@@ -98,13 +98,14 @@ class Stage:
     roster: tuple[str, ...]
     quest: str = ""
     mini: str = ""
+    fresh: tuple[str, ...] = ()
 
     @property
     def layout(self) -> list[str]:
         """The rooms on the way through. The quest room is where the problem sits."""
 
         if self.is_boss:
-            return ["start", "boss"]
+            return ["start", *["combat"] * self.combat_rooms, "boss"]
         middle = ["quest"] if self.quest else []
         return ["start", *["combat"] * self.combat_rooms, *middle, "exit"]
 
@@ -499,11 +500,39 @@ CHAPTERS: tuple[Chapter, ...] = (
 )
 
 
+# Who is new on each stage: its mini-boss, unless the chapter already has one there,
+# and two bugs of its own. They stay on their stage, so that every stage is different.
+BOSS_HALLWAYS = 1
+STAGE_FOES: tuple[tuple[str, str, str], ...] = (
+    ("marquee", "visits", "construction"),
+    ("", "deadlock", "sqlinject"),
+    ("vim", "necroposter", "capslock"),
+    ("eof", "semicolon", "quotemark"),
+    ("hype", "autoplay", "shorts"),
+    ("", "dushnila", "firstcomment"),
+    ("spinner", "alsolike", "bubble"),
+    ("bell", "readmore", "whiletrue"),
+    ("quota", "noext", "zipbomb"),
+    ("", "deletedfile", "container"),
+    ("ours", "conflict", "lag"),
+    ("devnull", "nan", "dangling"),
+    ("chiller", "condensate", "wire"),
+    ("", "zombie", "forkbomb"),
+    ("ups", "nightalert", "surge"),
+    ("btree", "offbyone", "reverse"),
+    ("debugmode", "warning", "traceback"),
+    ("", "flaky", "reflection"),
+    ("taberror", "prince", "captcha"),
+    ("context", "vibecoder", "promptinject"),
+)
+
+
 def _build_stages() -> tuple[Stage, ...]:
     stages: list[Stage] = []
     for chapter_index, chapter in enumerate(CHAPTERS):
         for position in range(BOSS_STAGE):
             is_boss = position == BOSS_STAGE - 1
+            mini, *fresh = STAGE_FOES[len(stages)]
             stages.append(
                 Stage(
                     index=len(stages),
@@ -513,10 +542,11 @@ def _build_stages() -> tuple[Stage, ...]:
                     title=chapter.stages[position],
                     chat=chapter.chats[position],
                     is_boss=is_boss,
-                    combat_rooms=0 if is_boss else DUNGEON_ROOMS[position],
-                    roster=chapter.roster[min(position, 2)],
+                    combat_rooms=BOSS_HALLWAYS if is_boss else DUNGEON_ROOMS[position],
+                    roster=(*chapter.roster[min(position, 2)], *fresh),
                     quest="" if is_boss else chapter.quests[position],
-                    mini=chapter.mini if position == MINI_BOSS_POSITION else "",
+                    mini=mini or (chapter.mini if position == MINI_BOSS_POSITION else ""),
+                    fresh=tuple(fresh),
                 )
             )
     return tuple(stages)

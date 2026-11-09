@@ -439,12 +439,15 @@ class MiniBossTests(unittest.TestCase):
         boss.spawned_at = 0.0
         return arena, mage, boss
 
-    def test_every_chapter_has_one_on_its_second_stage(self) -> None:
+    def test_every_stage_has_one(self) -> None:
         for chapter in CHAPTERS:
             self.assertIn(chapter.mini, SPECIES)
             self.assertTrue(SPECIES[chapter.mini].boss)
         for stage in STAGES:
-            self.assertEqual(bool(stage.mini), stage.number == 2)
+            self.assertIn(stage.mini, SPECIES)
+            self.assertTrue(SPECIES[stage.mini].boss)
+            if stage.number == 2:
+                self.assertEqual(stage.mini, stage.chapter.mini)
 
     def test_it_comes_in_the_last_wave_of_the_last_fight(self) -> None:
         arena, mage = make(1, plain=False, seed=4)

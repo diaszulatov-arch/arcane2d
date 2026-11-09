@@ -37,6 +37,37 @@ ROLES = {
     "runner": "Бежит к своей цели",
     "still": "Стоит на месте",
     "patrol": "Ходит по рельсам",
+    "counter": "Стоит и считает",
+    "construction": "Портит пол",
+    "deadlock": "Ходят парой",
+    "necroposter": "Поднимает убитых",
+    "stringer": "Оставляет жгучую строку",
+    "autoplay": "Бьёт вблизи",
+    "shorts": "Затягивает",
+    "dushnila": "Не даёт копить ману",
+    "firstcomment": "Ускоряет остальных",
+    "bubble": "Прячется под куполом",
+    "whiletrue": "Бегает по кругу",
+    "deleted": "Бесплотный",
+    "container": "Открывается по расписанию",
+    "conflict": "Две копии",
+    "lag": "Откатывается назад",
+    "dangling": "Бьёт с задержкой",
+    "condensate": "Оставляет лужи",
+    "wire": "Тянет провод",
+    "zombie": "Встаёт снова",
+    "forkbomb": "Размножается",
+    "nightalert": "Ускоряет остальных",
+    "surge": "Бьёт током",
+    "offbyone": "Бьёт мимо цели",
+    "reverse": "Всё наоборот",
+    "warning": "Растёт, пока жив",
+    "traceback": "Цепочка вызовов",
+    "flaky": "То уязвим, то нет",
+    "reflection": "Зеркало",
+    "prince": "Рассыпает монеты",
+    "captcha": "Только вручную",
+    "vibecoder": "Лечит своих",
 }
 
 # Which boss can do what. The test checks that no attack has been left out.
@@ -51,10 +82,35 @@ BOSS_MOVES: dict[str, tuple[str, ...]] = {
     "duplicate": ("duplicate",),
     "hotserver": ("overheat",),
     "reviewer": ("changes",),
+    "marquee": ("marquee",),
+    "vim": ("holywar",),
+    "eof": ("eof",),
+    "hype": ("hype",),
+    "spinner": ("spinner",),
+    "bell": ("bell",),
+    "quota": ("quota",),
+    "ours": ("merge",),
+    "devnull": ("devnull",),
+    "chiller": ("chiller",),
+    "ups": ("ups",),
+    "btree": ("btree",),
+    "debugmode": ("debug",),
+    "taberror": ("taberror",),
+    "context": ("context",),
     "leak": ("oom",),
 }
 # Who comes with whom: helpers open together with their master.
-RETINUE: dict[str, str] = {"follower": "influencer", "dupe": "duplicate", "nullecho": "nullqueen"}
+RETINUE: dict[str, str] = {
+    "follower": "influencer",
+    "dupe": "duplicate",
+    "nullecho": "nullqueen",
+    "comma": "semicolon",
+    "emacs": "vim",
+    "theirs": "ours",
+    "btree_branch": "btree",
+    "btree_leaf": "btree",
+    "logline": "debugmode",
+}
 # Creatures that belong to one stage's problem rather than to a chapter's roster.
 QUEST_CREATURES: dict[str, str] = {
     "worker": "nginx",
@@ -279,10 +335,8 @@ def _boss_groups(first: dict[str, Stage]) -> list[dict[str, Any]]:
         },
         {
             "title": "Мини-боссы",
-            "note": "По одному на втором этапе каждой главы.",
-            "entries": [
-                _creature(SPECIES[chapter.mini], first[chapter.mini], "mini") for chapter in CHAPTERS
-            ],
+            "note": "По одному на каждом этапе. Иногда приходят на помощь боссу своей главы.",
+            "entries": [_creature(SPECIES[stage.mini], first[stage.mini], "mini") for stage in STAGES],
         },
         {
             "title": "Свита",

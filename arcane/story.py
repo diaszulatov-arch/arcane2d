@@ -31,6 +31,7 @@ from .game import (
     SPELL_COSTS,
 )
 from .lessons import GATES, LESSONS, Task, check_task, runes_for_stage
+from . import foes
 from .monsters import ATTACKS, SPECIES, Monster, Species, cool_down, first_strike_delay, think
 from .boss_moves import MOVES, ROTATION, BossMove, ReturnNone
 from .folk import StageFolk
@@ -125,7 +126,8 @@ FLOW_REFRESH = 0.3
 ROUTE_REFRESH = 0.16
 RECURSION_DEPTH = 2
 RECURSION_SCALE = (1.0, 0.72, 0.5)
-CURSES = {"syntax": 2.5, "null": 5.0, "mirror": 4.0}
+CURSES = {"syntax": 2.5, "null": 5.0, "mirror": 4.0, "drop": 3.0, "inject": 6.0}
+DROP_ERROR = "DROP TABLE: инъекция стёрла эту руну на 3 секунды. Остальные работают."
 SYNTAX_ERROR = "SyntaxError: Скобка сломала ваш синтаксис, заклинания не компилируются."
 DEPLOY_TIME = 6.5
 DEPLOY_EVERY = 24.0
@@ -199,6 +201,7 @@ class Pickup:
     kind: str
     x: float
     y: float
+    until: float = 0.0
 
 
 ALL_COSTS = {**SPELL_COSTS, **SKILL_COSTS, **BOOK_COSTS}
@@ -286,6 +289,14 @@ class StoryArena(Arena):
         self.portal_ready = False
         self.portal_held = 0.0
         self.boss_max_hp = 0.0
+        self.fields: list[foes.Field] = []
+        self.fallen: list[tuple[str, float, float]] = []
+        self.fresh_left = list(stage.fresh)
+        self.escort_at = 0.0
+        self.escorts_left = 0
+        self.boxes: dict[tuple[int, int], Any] = {}
+        self.last_slot: dict[int, int] = {}
+        self.dropped_slot: dict[int, int] = {}
         self.flow: dict[tuple[int, int], int] = {}
         self.flow_at = 0.0
         self.terminals: list[Terminal] = []
@@ -609,16 +620,25 @@ class StoryArena(Arena):
                 return [m for m in hostile if m.hacked_until <= now]
             mages: list[Player] = [p for p in self.players.values() if not p.dead]
             units: list[Player] = list(self.quest.targets()) if self.quest is not None else []
-            return mages + units + [m for m in hostile if m.hacked_until > now]
+            rival = foes.rival_of(self, owner) if owner is not None else None
+            return mages + units + [m for m in hostile if m.hacked_until > now or m is rival]
         props: list[Player] = list(self.terrain.props.values()) if self.terrain is not None else []
         return [
             monster
             for monster in self.monsters.values()
-            if not monster.dead and monster.spawned_at <= now and monster.hacked_until <= now
+            if not monster.dead
+            and monster.spawned_at <= now
+            and monster.hacked_until <= now
+            and not foes.intangible(self, monster)
         ] + props
 
     def describe_target(self, target: Player) -> tuple[str, bool]:
         return target.species.key, target.species.boss
+
+    def reported_distance(self, target: Player, player: Player) -> float | None:
+        if isinstance(target, Monster) and target.species.key == foes.NAN_KEY:
+            return None
+        return super().reported_distance(target, player)
 
     def actor(self, actor_id: int) -> Player | None:
         if actor_id >= MONSTER_ID_BASE:
@@ -820,7 +840,7 @@ class StoryArena(Arena):
             if self.terrain is not None:
                 self.terrain.prop_hit(target, source, kind)
             return 0.0
-        if isinstance(target, Monster) and source is not None and self._mini_refuses(target, kind, hit_x, hit_y):
+        if isinstance(target, Monster) and source is not None and self._mini_refuses(target, kind, source, hit_x, hit_y):
             return 0.0
         if isinstance(target, Monster) and target.returning_until > self.now and source is not None:
             for move in self.boss_moves:
@@ -848,11 +868,20 @@ class StoryArena(Arena):
             amount *= (1 - target.perks.armor) * self.difficulty.damage * self.monster_bite
             if self._covered_by_sudo(target):
                 amount *= SUDO_SHARE
-        return super().damage(
+        if source is not None and source.id < MONSTER_ID_BASE:
+            foes.water_shock(self, kind, hit_x, hit_y, source)
+        dealt = super().damage(
             target=target, amount=amount, source=source, kind=kind, hit_x=hit_x, hit_y=hit_y
         )
+        if isinstance(target, Monster):
+            foes.was_hit(self, target, dealt, kind)
+        elif dealt > 0 and isinstance(source, Monster):
+            foes.landed(self, target, source)
+        return dealt
 
-    def _mini_refuses(self, monster: Monster, kind: str, hit_x: float, hit_y: float) -> bool:
+    def _mini_refuses(
+        self, monster: Monster, kind: str, source: Player, hit_x: float, hit_y: float
+    ) -> bool:
         """The house rules of mini-bosses. True if the hit does nothing at all."""
 
         key = monster.species.key
@@ -866,7 +895,7 @@ class StoryArena(Arena):
             monster.text = kind
         elif key == "hotserver" and kind == "frost":
             cool_down(self, monster)
-        return False
+        return foes.refuses(self, monster, kind, source, hit_x, hit_y)
 
     def _boosted_damage(
         self, monster: Monster, amount: float, source: Player | None, hit_x: float, hit_y: float
@@ -910,7 +939,7 @@ class StoryArena(Arena):
             amount *= DIZZY_BONUS
         if monster.marked_until > self.now:
             amount *= MARK_BONUS
-        return amount
+        return foes.shape(monster, amount, source)
 
     def _kill(self, target: Player, killer: Player | None, kind: str = "") -> None:
         if isinstance(target, QuestUnit):
@@ -930,7 +959,7 @@ class StoryArena(Arena):
             target.curses.clear()
             self.linked.pop(target.id, None)
             return
-        if target.dead:
+        if target.dead or foes.survives(self, target, killer, kind):
             return
         target.dead = True
         target.hp = 0.0
@@ -974,6 +1003,7 @@ class StoryArena(Arena):
                     generation=target.generation + 1,
                     scale=RECURSION_SCALE[target.generation + 1],
                 )
+        foes.died(self, target, killer)
         if self.quest is not None:
             self.quest.monster_died(target)
         if self.folk is not None:
@@ -986,8 +1016,8 @@ class StoryArena(Arena):
         elif roll < 0.34:
             self._add_pickup("mana", monster.x, monster.y)
 
-    def _add_pickup(self, kind: str, x: float, y: float) -> None:
-        self.pickups.append(Pickup(self._next_pickup_id, kind, x, y))
+    def _add_pickup(self, kind: str, x: float, y: float, until: float = 0.0) -> None:
+        self.pickups.append(Pickup(self._next_pickup_id, kind, x, y, until))
         self._next_pickup_id += 1
 
     # -------------------------------------------------- verbs monsters can use
@@ -1000,6 +1030,7 @@ class StoryArena(Arena):
         generation: int = 0,
         scale: float = 1.0,
         minion: bool = False,
+        escort: bool = False,
     ) -> Monster | None:
         if len(self.monsters) >= MAX_MONSTERS:
             return None
@@ -1009,6 +1040,8 @@ class StoryArena(Arena):
         hp *= 1 + DUTY_TOUGHNESS * self.duty
         if species.on_death == "recurse":
             hp *= self.pgt_boost
+        if escort:
+            hp *= foes.ESCORT_HP
         monster = Monster(
             id=self._next_monster_id,
             name=species.title,
@@ -1022,13 +1055,14 @@ class StoryArena(Arena):
             generation=generation,
             minion=minion,
             origin=self.active_room.center if self.active_room else (x, y),
+            escort=escort,
         )
         self._next_monster_id += 1
         monster.spawned_at = self.now + 0.55
         monster.next_attack = self.now + first_strike_delay(species, self.rng)
         monster.next_special = self.now + 6.0
         self.monsters[monster.id] = monster
-        if species.boss and generation == 0:
+        if species.boss and generation == 0 and not escort:
             self.boss_max_hp = self._expected_boss_hp(species, hp)
             if species.on_death == "recurse":
                 self.deploy_at = self.now + DEPLOY_FIRST
@@ -1071,7 +1105,7 @@ class StoryArena(Arena):
             if self.can_stand(x, y, species.radius):
                 child = self.spawn_monster(
                     key, x, y, generation=generation, scale=scale,
-                    minion=generation == 0,
+                    minion=generation == 0, escort=monster.escort,
                 )
                 if child is not None:
                     # A hacked process forks hacked children.
@@ -1104,7 +1138,7 @@ class StoryArena(Arena):
         angle: float,
         *,
         speed: float | None = None,
-        life: float = 2.6,
+        life: float | None = None,
     ) -> None:
         """A monster's shot from anywhere: bosses can open fire from across a room."""
 
@@ -1121,8 +1155,8 @@ class StoryArena(Arena):
                 angle=angle,
                 speed=speed or species.shot_speed,
                 damage=species.shot_damage,
-                radius=7.0,
-                life=life,
+                radius=species.shot_radius,
+                life=species.shot_life if life is None else life,
                 color=species.color,
                 slow_until=self.now + 1.5 if species.slows else 0.0,
                 mana_burn=species.mana_burn,
@@ -1575,13 +1609,23 @@ class StoryArena(Arena):
         if player is not None and not player.dead:
             if self.cursed(player, "syntax"):
                 return {"ok": False, "error": SYNTAX_ERROR}
+            if self.cursed(player, "drop") and self.dropped_slot.get(player_id) == slot:
+                return {"ok": False, "error": DROP_ERROR}
+            self.last_slot[player_id] = slot
             if self.cursed(player, "mirror"):
                 # The aim is "corrected"; what enemies() reports stays true.
                 aim = None if aim is None else aim + math.pi
                 if target_x is not None and target_y is not None:
                     target_x = 2 * player.x - target_x
                     target_y = 2 * player.y - target_y
+            if self.cursed(player, "inject"):
+                # Ignore all previous instructions: this one spell goes wherever it likes.
+                player.curses.pop("inject", None)
+                aim = self.rng.random() * math.tau
+                target_x, target_y = None, None
         result = super().cast(player_id, code, slot, aim, target_x, target_y)
+        if player is not None and result.get("ok"):
+            foes.mirror_cast(self, player)
         # "runes" is there only if the code really ran, so a cooldown is not a bug.
         if "runes" in result:
             self.stats.runes.update(result["runes"])
@@ -1693,7 +1737,7 @@ class StoryArena(Arena):
         if not self.gates_left or self.gate_boss is not None:
             return
         for boss in self.monsters.values():
-            if not boss.species.boss or boss.generation:
+            if boss.species.key != self.stage.chapter.boss or boss.generation:
                 continue
             threshold = GATE_THRESHOLDS[len(GATE_THRESHOLDS) - len(self.gates_left)]
             if boss.hp <= boss.max_hp * threshold:
@@ -1953,6 +1997,7 @@ class StoryArena(Arena):
         self._update_trickle(now)
         self._watch_gates()
         self._update_monsters(now, dt)
+        foes.update(self, now, dt)
         self._update_hazards(now)
         self._update_pickups(dt)
         self._update_revives(dt)
@@ -2121,9 +2166,10 @@ class StoryArena(Arena):
         if room.kind == "boss":
             x, y = room.center
             self.spawn_monster(self.stage.chapter.boss, x, y - 100)
+            foes.expect_escorts(self)
             return
         if room is self.mini_room and self.wave >= self._waves_in(room):
-            x, y = self.dungeon.open_near(*room.center, SPECIES[self.stage.mini].radius)
+            x, y = foes.mini_spot(self, room, self.stage.mini)
             self.spawn_monster(self.stage.mini, x, y)
             return
         budget = self._wave_budget()
@@ -2131,7 +2177,13 @@ class StoryArena(Arena):
         roster = [SPECIES[key] for key in self.stage.roster]
         cheapest = min(species.cost for species in roster)
         while budget >= cheapest:
-            species = self.rng.choice([s for s in roster if s.cost <= budget])
+            # This stage's own bugs are met first; after that they take their chances.
+            species = next(
+                (SPECIES[key] for key in self.fresh_left if SPECIES[key].cost <= budget),
+                None,
+            ) or self.rng.choice([s for s in roster if s.cost <= budget])
+            if species.key in self.fresh_left:
+                self.fresh_left.remove(species.key)
             budget -= species.cost
             for _ in range(species.pack):
                 monster = self._spawn_in_room(room, species)
@@ -2149,6 +2201,7 @@ class StoryArena(Arena):
 
     def _clear_room(self, room: Room) -> None:
         self.cleared_rooms.add(room.index)
+        foes.room_cleared(self)
         self.active_room = None
         self.unlock("fight")
         x, y = self.dungeon.open_near(*room.center, 20.0)
@@ -2278,6 +2331,8 @@ class StoryArena(Arena):
         remaining: list[Pickup] = []
         living = [player for player in self.players.values() if not player.dead]
         for pickup in self.pickups:
+            if pickup.until and self.now >= pickup.until:
+                continue
             nearest = min(
                 living,
                 key=lambda p: math.hypot(p.x - pickup.x, p.y - pickup.y),
@@ -2290,7 +2345,8 @@ class StoryArena(Arena):
             if distance <= PICKUP_REACH:
                 self._collect(pickup, nearest)
                 continue
-            if distance <= PICKUP_PULL + nearest.perks.pickup_reach:
+            # A coin does not come to you: that would be the one honest thing about it.
+            if pickup.kind != foes.COIN and distance <= PICKUP_PULL + nearest.perks.pickup_reach:
                 step = 300.0 * dt / distance
                 pickup.x += (nearest.x - pickup.x) * step
                 pickup.y += (nearest.y - pickup.y) * step
@@ -2300,6 +2356,9 @@ class StoryArena(Arena):
     def _collect(self, pickup: Pickup, player: Player) -> None:
         if pickup.kind == "hp":
             player.hp = min(player.max_hp, player.hp + PICKUP_HEAL * player.perks.pickups)
+        elif pickup.kind == foes.COIN:
+            foes.coin_taken(self, player, pickup)
+            return
         else:
             player.mana = min(player.max_mana, player.mana + PICKUP_MANA * player.perks.pickups)
         self.emit(
@@ -2469,6 +2528,8 @@ class StoryArena(Arena):
             "slow": monster.slow_until > now,
             "stun": monster.stun_until > now,
             "text": monster.text,
+            "escort": monster.escort,
+            "marks": monster.marks,
         }
         entry.update({key: value for key, value in flags.items() if value})
         return entry
@@ -2540,7 +2601,11 @@ class StoryArena(Arena):
             }
             for zone in self.breakpoints
         ]
-        bosses = [monster for monster in self.monsters.values() if monster.species.boss]
+        bosses = [
+            monster for monster in self.monsters.values() if monster.species.boss and not monster.escort
+        ]
+        if self.fields:
+            state["fields"] = [field.view(self.now) for field in self.fields]
         state["terminals"] = [
             {
                 "id": terminal.id,

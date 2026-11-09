@@ -2,6 +2,7 @@
 
 import { ROLE_TITLES } from "./content.js";
 import { drawBossMoves } from "./boss-art.js";
+import { drawCapsShot, drawFields, drawFoeMarks } from "./foe-art.js";
 import { drawMage, mageGhost } from "./mage-art.js";
 import {
   blastFrame,
@@ -84,6 +85,7 @@ const MINIMAP_HEIGHT = 120;
 // Blasts open on the floor and mages stand over them, so a fight never hides them.
 const GROUND_EFFECTS = new Set(["scorch"]);
 const SCORCH_LIMIT = 14;
+const BIG_SHOT = 16;
 const SAVE_DEPTH = 64;
 const ROLE_BANDS = { admin: "#ffd93d", hacker: "#7fffb0", devops: "#6fd6ff", tester: "#e08cff" };
 const QUALITY_FULL = 2;
@@ -181,7 +183,7 @@ function wrapText(ctx, text, maxWidth, maxLines = 3) {
   return lines;
 }
 
-const CURSE_LABELS = { syntax: "SyntaxError", null: "None", mirror: "АВТОКОРРЕКЦИЯ" };
+const CURSE_LABELS = { syntax: "SyntaxError", null: "None", mirror: "АВТОКОРРЕКЦИЯ", drop: "DROP TABLE", inject: "Инъекция" };
 
 const ELITE_COLORS = {
   legacy: "#c9a26b",
@@ -1833,7 +1835,11 @@ export class ArenaRenderer {
 
     // What gives light off: magic stays at full brightness on top of the room.
     applyCamera(worldCtx);
-    if (dungeon) drawBossMoves(worldCtx, client.bossMoves, this.visualMonsters, now);
+    if (dungeon) {
+      drawFields(worldCtx, client.fields, now);
+      drawBossMoves(worldCtx, client.bossMoves, this.visualMonsters, now);
+      drawFoeMarks(worldCtx, this.visualMonsters, now);
+    }
     drawHazards(worldCtx, client.hazards, now);
     this.drawWards(worldCtx, client, now, zoom);
     this.drawEmps(worldCtx, client, now, zoom);
@@ -2598,7 +2604,12 @@ export class ArenaRenderer {
       const projectile = visual.data;
       ctx.globalCompositeOperation = "lighter";
       if (projectile.kind === "orb") {
-        this.drawOrb(ctx, visual, projectile.color, t);
+        if (projectile.radius >= BIG_SHOT) {
+          ctx.globalCompositeOperation = "source-over";
+          drawCapsShot(ctx, visual, projectile.color);
+        } else {
+          this.drawOrb(ctx, visual, projectile.color, t);
+        }
         continue;
       }
       const isFrost = projectile.kind === "frost";

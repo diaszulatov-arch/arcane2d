@@ -42,6 +42,8 @@ def sprites() -> set[str]:
     source = (PUBLIC / "dungeon-art.js").read_text(encoding="utf-8")
     block = source[source.index("const SPRITES = {"):source.index("function bakeSprite")]
     names = set(re.findall(r"^  (\w+): \{$", block, re.MULTILINE))
+    foes = (PUBLIC / "foe-sprites.js").read_text(encoding="utf-8")
+    names |= set(re.findall(r"^  (\w+): \{$", foes, re.MULTILINE))
     return names | set(re.findall(r"^SPRITES\.(\w+) = ", block, re.MULTILINE))
 
 

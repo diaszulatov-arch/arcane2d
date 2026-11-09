@@ -11,6 +11,7 @@ from collections import deque
 
 from arcane.campaign import Stage
 from arcane.dungeon import TILE
+from arcane.foes import open_to
 from arcane.game import TICK_RATE, Player
 from arcane.profiles import Profile
 from arcane.roles import ROLES, apply_role
@@ -51,6 +52,30 @@ def spell_for(arena: StoryArena, role: str = "") -> str:
     if "frostbolt" in known:
         lines.append("if me().mana >= 30:\n    frostbolt(aim())")
     return "\n".join(lines) + "\n"
+
+
+PLAIN_BOLT = "if me().mana >= 11:\n    fireball(aim())\n"
+
+
+def best_target(arena: StoryArena, mage: Player) -> Player | None:
+    """The nearest enemy a hit would actually land on, as anyone would soon work out."""
+
+    near = lambda m: math.hypot(m.x - mage.x, m.y - mage.y)
+    enemies = arena.foes_for(mage.id)
+    awake = [m for m in enemies if m.invuln_until <= arena.now and open_to(arena, m, mage)]
+    return min(awake or enemies, key=near, default=None)
+
+
+def where_it_opens(arena: StoryArena, enemy: Player, mage: Player) -> tuple[float, float] | None:
+    """Some can only be hurt from a certain spot: under the dome, inside the frame."""
+
+    if enemy is None or open_to(arena, enemy, mage):
+        return None
+    if enemy.species.key == "bubble":
+        return enemy.x, enemy.y
+    if enemy.species.key == "context":
+        return enemy.memo.x, enemy.memo.y
+    return None
 
 
 def open_terminal(arena: StoryArena) -> Terminal | None:
@@ -269,11 +294,10 @@ def play_stage(
                 enemy, wanted = order
                 spell = wanted or spell
             else:
-                enemy = min(
-                    arena.foes_for(mage.id),
-                    key=lambda m: math.hypot(m.x - mage.x, m.y - mage.y),
-                    default=None,
-                )
+                enemy = best_target(arena, mage)
+                # TabError punishes changing runes, and this spell has several.
+                if enemy is not None and enemy.species.key == "taberror":
+                    spell = PLAIN_BOLT
             distance = math.inf if enemy is None else math.hypot(enemy.x - mage.x, enemy.y - mage.y)
             near = distance < DANGER_RANGE
             fallen = next((p for p in mages if p.dead), None)
@@ -282,6 +306,7 @@ def play_stage(
             chase = (enemy.x, enemy.y) if enemy is not None and (far or not clear) else None
             if carrying or (busy and distance > 360):
                 chase = None
+            chase = where_it_opens(arena, enemy, mage) or chase
             terminal = open_terminal(arena)
             if terminal is not None and math.hypot(mage.x - terminal.x, mage.y - terminal.y) < 110:
                 if arena.link(mage.id)[0] is not None:

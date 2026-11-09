@@ -56,6 +56,8 @@ METEOR_COLOR = "#ff7b45"
 METEOR_DELAY = 1.15
 METEOR_RADIUS = 120.0
 METEOR_RANGE = 620.0
+# How long a spell counts as aimed by code rather than by hand, once it has asked enemies().
+AUTO_AIM_WINDOW = 1.5
 METEOR_DAMAGE = 42.0
 METEOR_COUNT = 3
 METEOR_PUSH = 30.0
@@ -187,6 +189,7 @@ class Player:
     invuln_until: float = 0.0
     last_damage_at: float = -100.0
     last_cast_at: float = -100.0
+    auto_until: float = 0.0
     cast_ready_at: float = 0.0
     roll_ready_at: float = 0.0
     dead: bool = False
@@ -452,6 +455,7 @@ class SpellSession:
 
         if self._jammed():
             return None
+        self.player.auto_until = self.arena.now + AUTO_AIM_WINDOW
         views = []
         for other in self.arena.foes_for(self.player.id):
             kind, boss = self.arena.describe_target(other)
@@ -478,7 +482,7 @@ class SpellSession:
             y=round(other.y, 2),
             hp=round(other.hp, 1),
             max_hp=other.max_hp,
-            dist=round(math.hypot(other.x - player.x, other.y - player.y), 2),
+            dist=self.arena.reported_distance(other, player),
             boss=boss,
             dead=other.dead,
             text=getattr(other, "text", ""),
@@ -1182,6 +1186,11 @@ class Arena:
         """What ``enemies()`` reports about a target: its kind and whether it is a boss."""
 
         return "mage", False
+
+    def reported_distance(self, target: Player, player: Player) -> float | None:
+        """What ``e.dist`` says about a target."""
+
+        return round(math.hypot(target.x - player.x, target.y - player.y), 2)
 
     def radar_jammed(self, player: Player) -> bool:
         """Whether a dungeon curse has turned this mage's lookups into None."""
@@ -2409,6 +2418,7 @@ class Arena:
                 "y": round(projectile.y, 1),
                 "angle": round(projectile.angle, 3),
                 "speed": round(projectile.speed),
+                "radius": projectile.radius,
                 "color": projectile.color,
             }
             for projectile in self.projectiles

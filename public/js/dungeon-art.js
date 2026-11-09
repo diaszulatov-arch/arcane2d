@@ -1,5 +1,7 @@
 /* The five chapters as pictures: tiles, weather, doors, portals and the bestiary. */
 
+import { FOE_SPRITES } from "./foe-sprites.js";
+
 const TAU = Math.PI * 2;
 // Pixels per tile in the baked floor: about one screen pixel at the game's zoom,
 // and small enough that the largest floor stays well under 30 MB.
@@ -988,7 +990,7 @@ export function drawPickups(ctx, pickups, now) {
   if (!pickups?.length) return;
   const t = now / 1000;
   for (const pickup of pickups) {
-    const color = pickup.kind === "hp" ? "#ff6b7a" : "#6fa8ff";
+    const color = pickup.kind === "hp" ? "#ff6b7a" : pickup.kind === "coin" ? "#ffd24a" : "#6fa8ff";
     const bob = Math.sin(t * 4 + pickup.id) * 3;
     ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
     ctx.fillRect(pickup.x - 7, pickup.y + 8, 14, 4);
@@ -1319,6 +1321,7 @@ Object.assign(SPRITES, {
 // Her copies must not be told apart by eye: that is what enemies() is for.
 SPRITES.nullecho = SPRITES.nullqueen;
 SPRITES.dupe = SPRITES.duplicate;
+Object.assign(SPRITES, FOE_SPRITES);
 
 const spriteCache = new Map();
 
@@ -1482,9 +1485,10 @@ export function drawMonster(ctx, visual, now) {
 
   ctx.save();
   ctx.translate(0, feet - hop);
-  ctx.rotate(lean);
+  ctx.rotate(data.marks?.down ? flip * 1.35 : lean);
   ctx.scale(flip * (stretch + (1 - squash) * 0.6), squash);
   ctx.imageSmoothingEnabled = false;
+  if (data.marks?.ghost) ctx.globalAlpha = 0.38;
   const left = -width / 2;
   const top = -height;
   if (arriving) {

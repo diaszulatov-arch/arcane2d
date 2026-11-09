@@ -88,6 +88,8 @@ const CURSE_TEXT = {
   syntax: "SyntaxError: заклинания не компилируются",
   null: "None: enemies(), allies() и cursor() пусты",
   mirror: "Автокоррекция: прицел перевёрнут",
+  drop: "DROP TABLE: эта руна стёрта, бейте другой",
+  inject: "Промпт-инъекция: следующий каст улетит куда угодно",
 };
 
 function element(tag, className, text) {

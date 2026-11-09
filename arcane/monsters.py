@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .boss_moves import autocomplete
 from .game import PLAYER_RADIUS, Player
@@ -46,6 +46,8 @@ class Species:
     boss: bool = False
     heavy: bool = False
     pack: int = 1
+    shot_radius: float = 7.0
+    shot_life: float = 2.6
 
 
 @dataclass(slots=True)
@@ -84,6 +86,13 @@ class Monster(Player):
     pace: float = 1.0
     returning_until: float = 0.0
     tricks: int = 0
+    link: int = 0
+    charge: float = 0.0
+    count: int = 0
+    hurry_until: float = 0.0
+    escort: bool = False
+    marks: dict[str, Any] | None = None
+    memo: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +477,7 @@ _species(
     ),
 )
 
+HURRY = 1.35
 FLEE_NOTICE = 430.0
 RUNNER_ARRIVES = 48.0
 LEAK_GROW_EVERY = 3.5
@@ -486,7 +496,8 @@ def _distance(monster: Monster, target: Player) -> float:
 def _speed(monster: Monster, world: "StoryArena") -> float:
     species = monster.species
     slowed = monster.slow_until > world.now
-    return species.speed * (0.58 if slowed else 1.0) * world.monster_pace * monster.pace
+    hurried = HURRY if monster.hurry_until > world.now else 1.0
+    return species.speed * (0.58 if slowed else 1.0) * hurried * world.monster_pace * monster.pace
 
 
 def _step(monster: Monster, world: "StoryArena", angle: float, speed: float, dt: float) -> None:
@@ -1449,3 +1460,7 @@ def first_strike_delay(species: Species, rng: random.Random) -> float:
     """So a freshly spawned room does not fire one synchronised volley."""
 
     return rng.uniform(0.6, 1.6) if species.boss else rng.uniform(0.8, species.interval + 0.6)
+
+
+# The second half of the bestiary adds itself to the tables above.
+from . import foes  # noqa: E402,F401
